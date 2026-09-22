@@ -866,10 +866,10 @@ function bind() {
     hideMenu();
     hideSettingsMenu();
   });
-  $("table-scroll").addEventListener("scroll", () => {
+  document.querySelector(".table-card").addEventListener("scroll", () => {
     hideMenu();
     hideSettingsMenu();
-  });
+  }, true);
   document.querySelectorAll("[data-sort]").forEach((button) => {
     button.addEventListener("click", () => {
       const column = button.getAttribute("data-sort");

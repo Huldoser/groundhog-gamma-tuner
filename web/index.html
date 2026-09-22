@@ -61,25 +61,27 @@
 
     <main class="workspace">
       <section class="card table-card">
-        <div id="table-scroll" class="table-scroll">
-          <table>
-            <thead>
-              <tr>
-                <th class="left" aria-sort="none"><button type="button" class="sort" data-sort="name">Name</button></th>
-                <th aria-sort="none" title="Frequency and core voltage"><button type="button" class="sort" data-sort="freq">Clock</button></th>
-                <th aria-sort="none" title="ASIC and VR temperature"><button type="button" class="sort" data-sort="asic">Temp</button></th>
-                <th aria-sort="none" title="1-minute hashrate. Efficiency underneath, lower is better"><button type="button" class="sort" data-sort="hash">Hash</button></th>
-                <th aria-sort="none" title="Power and input voltage"><button type="button" class="sort" data-sort="watts">Power</button></th>
-                <th aria-sort="descending" title="All-time best difficulty, then this session"><button type="button" class="sort" data-sort="best">Best</button></th>
-                <th aria-sort="none" title="Accepted and rejected shares, then error"><button type="button" class="sort" data-sort="shares">Shares</button></th>
-                <th aria-sort="none" title="Uptime"><button type="button" class="sort" data-sort="up">Up</button></th>
-                <th aria-sort="none"><button type="button" class="sort" data-sort="phase">Phase</button></th>
-                <th class="left" aria-sort="none"><button type="button" class="sort" data-sort="setpoint">Setpoint</button></th>
-              </tr>
-            </thead>
-            <tbody id="miner-body"></tbody>
-          </table>
-          <p id="empty" class="empty">No miners yet. Scan the network.</p>
+        <div class="table-x">
+          <div id="table-scroll" class="table-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th class="left" aria-sort="none"><button type="button" class="sort" data-sort="name">Name</button></th>
+                  <th aria-sort="none" title="Frequency and core voltage"><button type="button" class="sort" data-sort="freq">Clock</button></th>
+                  <th aria-sort="none" title="ASIC and VR temperature"><button type="button" class="sort" data-sort="asic">Temp</button></th>
+                  <th aria-sort="none" title="1-minute hashrate. Efficiency underneath, lower is better"><button type="button" class="sort" data-sort="hash">Hash</button></th>
+                  <th aria-sort="none" title="Power and input voltage"><button type="button" class="sort" data-sort="watts">Power</button></th>
+                  <th aria-sort="descending" title="All-time best difficulty, then this session"><button type="button" class="sort" data-sort="best">Best</button></th>
+                  <th aria-sort="none" title="Accepted and rejected shares, then error"><button type="button" class="sort" data-sort="shares">Shares</button></th>
+                  <th aria-sort="none" title="Uptime"><button type="button" class="sort" data-sort="up">Up</button></th>
+                  <th aria-sort="none"><button type="button" class="sort" data-sort="phase">Phase</button></th>
+                  <th class="left" aria-sort="none"><button type="button" class="sort" data-sort="setpoint">Setpoint</button></th>
+                </tr>
+              </thead>
+              <tbody id="miner-body"></tbody>
+            </table>
+            <p id="empty" class="empty">No miners yet. Scan the network.</p>
+          </div>
         </div>
       </section>
 
