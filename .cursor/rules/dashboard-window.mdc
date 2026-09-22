@@ -1,0 +1,31 @@
+---
+description: pywebview window bridge and the plain local page
+globs: dashboard.py,web/**
+alwaysApply: false
+---
+
+# Dashboard window
+
+The window loads an absolute path to `web/index.html` with `js_api=DashboardApi`. A relative `url` makes pywebview start its own server.
+
+A new page action is a public method on `DashboardApi` plus a call through `api()` in `web/app.js`. Method names stay public; pywebview skips `_` names. The page polls `get_snapshot`.
+
+The page is `web/index.html`, `web/app.css`, and `web/app.js`. Keep it plain: no npm, framework, bundler, or extra listener.
+
+```python
+# BAD
+webview.create_window("Groundhog Gamma Tuner", url="web/index.html")
+
+# GOOD
+page = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web", "index.html")
+webview.create_window(
+    "Groundhog Gamma Tuner",
+    url=page,
+    js_api=DashboardApi(self),
+)
+```
+
+```javascript
+const bridge = api();
+if (bridge) bridge.start_autotuner();
+```

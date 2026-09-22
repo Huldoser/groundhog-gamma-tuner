@@ -13,22 +13,18 @@
         <h1 class="brand-title">
           <img class="logo" src="logo.png" alt="Groundhog Gamma Tuner">
         </h1>
-        <span id="status-pill" class="pill idle">Idle</span>
+      </div>
+      <div class="status">
+        <span id="status-pill" class="pill idle" aria-live="polite">Idle</span>
         <span id="updated" class="updated">Updated --:--:--</span>
       </div>
-      <div class="toolbar">
-        <div class="group">
+      <div class="commands">
+        <button type="button" id="run" class="accent" data-action="start" aria-busy="false">Start Autotuner</button>
+        <div class="toolbar">
           <button type="button" id="scan-open" class="quiet">Scan Network</button>
         </div>
-        <div class="group group-run">
-          <div class="pair">
-            <button type="button" id="start" class="accent">Start Autotuner</button>
-            <button type="button" id="stop" class="quiet" disabled>Stop Autotuner</button>
-          </div>
-        </div>
-      </div>
-      <div class="header-tools">
-        <button type="button" id="fullscreen" class="icon-button" aria-label="Fullscreen" title="Fullscreen">
+        <div class="header-tools">
+          <button type="button" id="fullscreen" class="icon-button" aria-label="Fullscreen" title="Fullscreen">
           <svg class="icon-expand" viewBox="0 0 24 24" aria-hidden="true">
             <polyline points="15 3 21 3 21 9"></polyline>
             <polyline points="9 21 3 21 3 15"></polyline>
@@ -41,13 +37,14 @@
             <line x1="14" y1="10" x2="21" y2="3"></line>
             <line x1="3" y1="21" x2="10" y2="14"></line>
           </svg>
-        </button>
-        <button type="button" id="settings-open" class="icon-button" aria-label="Settings" title="Settings" aria-haspopup="menu" aria-expanded="false">
+          </button>
+          <button type="button" id="settings-open" class="icon-button" aria-label="Settings" title="Settings" aria-haspopup="menu" aria-expanded="false">
           <svg viewBox="0 0 24 24" aria-hidden="true">
             <circle cx="12" cy="12" r="3"></circle>
             <path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9c.3.6.9 1 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"></path>
           </svg>
-        </button>
+          </button>
+        </div>
       </div>
     </header>
 
@@ -57,6 +54,10 @@
       </span>
       <span class="pool unknown" data-pool="stratum.ckpool.org" title="Checking">stratum.ckpool.org</span>
       <span class="pool unknown" data-pool="public-pool.io" title="Checking">public-pool.io</span>
+      <div id="summary" class="summary" hidden>
+        <span id="fleet"></span>
+        <span id="odds"></span>
+      </div>
     </div>
 
     <main class="workspace">
@@ -80,9 +81,25 @@
               </thead>
               <tbody id="miner-body"></tbody>
             </table>
-            <p id="empty" class="empty">No miners yet. Scan the network.</p>
+            <p id="empty" class="empty">
+              <span>No miners yet. Scan the network.</span>
+              <span class="empty-actions">
+                <button type="button" id="empty-scan" class="accent">Scan Network</button>
+              </span>
+            </p>
           </div>
         </div>
+      </section>
+
+      <section id="detail" class="card detail-card" hidden>
+        <div class="detail-head">
+          <h2 id="detail-title">Miner</h2>
+          <div class="detail-actions">
+            <button type="button" id="detail-restart" class="quiet">Restart</button>
+            <button type="button" id="detail-remove" class="quiet menu-danger">Remove</button>
+          </div>
+        </div>
+        <div id="detail-facts" class="detail-facts"></div>
       </section>
 
       <section class="card log-card">
@@ -141,17 +158,19 @@
       <h2>Global Settings</h2>
       <fieldset>
         <legend>Steps</legend>
-        <p class="hint">How far each step moves, and how often the tuner checks the miner.</p>
+        <p class="hint">How far each step moves, how often the tuner checks, and how long it holds at the ceiling before saving the setpoint.</p>
         <label>Voltage step (mV) <input id="voltage_step" inputmode="numeric"></label>
         <label>Frequency step (MHz) <input id="frequency_step" inputmode="numeric"></label>
         <label>Monitor interval (sec) <input id="monitor_interval" inputmode="numeric"></label>
         <label>Tune interval (sec) <input id="refresh_interval" inputmode="numeric"></label>
+        <label>Ceiling soak (sec) <input id="ceiling_soak_seconds" inputmode="numeric"></label>
       </fieldset>
       <fieldset>
         <legend>Temperature</legend>
-        <p class="hint">Copied onto a miner when it is added.</p>
+        <p class="hint">The ASIC cap is copied onto a miner when it is added. Tolerances apply to every miner.</p>
         <label>Default max ASIC temp (°C) <input id="default_target_temp" inputmode="numeric"></label>
         <label>Temp tolerance (°C) <input id="temp_tolerance" inputmode="numeric"></label>
+        <label>VR temp tolerance (°C) <input id="vr_temp_tolerance" inputmode="numeric"></label>
       </fieldset>
       <fieldset>
         <legend>Flatline</legend>
@@ -178,12 +197,14 @@
           <p class="hint">Limits for the selected miner.</p>
           <label class="check"><input id="tune-enabled" type="checkbox"> Tune this miner</label>
           <h4>Frequency</h4>
+          <p class="hint">Min is 350–1100 MHz. 350 is the lowest BM1370 preset in AxeOS v2.15.1.</p>
           <div class="trio">
             <label>Min <input id="tune-min_freq" inputmode="numeric"></label>
             <label>Start <input id="tune-start_freq" inputmode="numeric"></label>
             <label>Max <input id="tune-max_freq" inputmode="numeric"></label>
           </div>
           <h4>Voltage</h4>
+          <p class="hint">Min stays 1000–1400 mV. 1000 is the lowest BM1370 voltage preset. Voltage is lowered only after frequency is already at its minimum.</p>
           <div class="trio">
             <label>Min <input id="tune-min_volt" inputmode="numeric"></label>
             <label>Start <input id="tune-start_volt" inputmode="numeric"></label>
@@ -195,6 +216,7 @@
           <label>VR temp (°C) <input id="tune-max_vr_temp" inputmode="decimal"></label>
           <label>Input voltage (V) <input id="tune-min_input_voltage" inputmode="decimal"></label>
           <label>Error % <input id="tune-max_error_percentage" inputmode="decimal"></label>
+          <label>Droop (mV) <input id="tune-max_droop_mv" inputmode="numeric"></label>
         </div>
       </div>
       <p id="tuner-error" class="form-error"></p>

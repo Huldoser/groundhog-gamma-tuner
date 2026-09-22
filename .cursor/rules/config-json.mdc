@@ -1,0 +1,22 @@
+---
+description: Atomic locked writes for config.json
+globs: config.py
+alwaysApply: false
+---
+
+# Config file
+
+Writes go through `save_config` / `_write_config`: hold `_config_lock`, write a temp file in the same directory, then `os.replace` onto `config.json`.
+
+A `JSONDecodeError` keeps `_last_good_config`. `_drop_daily_reset` removes `daily_reset_enabled` and `daily_reset_time` on load and save.
+
+New rows come from `new_miner_record` after `is_gamma_601`. `config.json` stays gitignored.
+
+```python
+# BAD
+with open("config.json", "w") as file:
+    json.dump(config, file)
+
+# GOOD
+save_config(config)
+```

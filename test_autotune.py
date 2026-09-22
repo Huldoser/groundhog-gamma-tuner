@@ -231,6 +231,25 @@ class DecisionTests(unittest.TestCase):
         self.assertEqual((frequency, voltage), (400, 1000))
         self.assertIn("minimum", reason)
 
+    def test_overheat_at_350_holds_voltage_and_steps_frequency_onto_that_floor(self):
+        stepped_frequency, stepped_voltage, stepped_reason = autotune.decide_adjustment(**_limits(
+            current_frequency=355,
+            current_voltage=1100,
+            min_freq=350,
+            temp=61,
+            max_temp=60,
+        ))
+        self.assertEqual((stepped_frequency, stepped_voltage), (350, 1100))
+        self.assertIn("frequency", stepped_reason)
+        held_frequency, held_voltage, held_reason = autotune.decide_adjustment(**_limits(
+            current_frequency=350,
+            current_voltage=1000,
+            min_freq=350,
+            temp=75,
+        ))
+        self.assertEqual((held_frequency, held_voltage), (350, 1000))
+        self.assertIn("minimum", held_reason)
+
     def test_high_error_raises_voltage_without_passing_max(self):
         frequency, voltage, reason = autotune.decide_adjustment(**_limits(
             current_frequency=500,
@@ -1927,7 +1946,7 @@ class SessionTests(unittest.TestCase):
             "min_volt": 900,
             "max_volt": 1200,
         })
-        self.assertEqual(clamped["min_freq"], 400)
+        self.assertEqual(clamped["min_freq"], 350)
         self.assertEqual(clamped["max_freq"], 500)
         self.assertEqual(clamped["min_volt"], 1000)
         self.assertEqual(clamped["max_volt"], 1200)
@@ -1977,7 +1996,7 @@ class SessionTests(unittest.TestCase):
             )
             thread.join(2)
         self.assertFalse(thread.is_alive())
-        self.assertEqual(calls[0], (400, 1100))
+        self.assertEqual(calls[0], (350, 1100))
         self.assertFalse(any("reversed" in message for message in logs))
 
     def test_saved_setpoint_above_the_cap_is_clamped(self):
@@ -2191,7 +2210,7 @@ class InstallAndConfigTests(unittest.TestCase):
             "min_volt": 900,
             "max_volt": 1600,
         })
-        self.assertEqual(clamped["min_freq"], 400)
+        self.assertEqual(clamped["min_freq"], 350)
         self.assertEqual(clamped["max_freq"], 1100)
         self.assertEqual(clamped["min_volt"], 1000)
         self.assertEqual(clamped["max_volt"], 1400)
@@ -2339,10 +2358,24 @@ class InstallAndConfigTests(unittest.TestCase):
             "tag": "idle",
             "up_seconds": None,
             "mv_alert": False,
+            "asic_level": "",
+            "vr_level": "",
+            "error_alert": False,
+            "watts_alert": False,
+            "vin_alert": False,
             "name_title": "",
+            "firmware_update": "",
             "mv_title": "",
             "hash_title": "",
             "shares_title": "",
+            "reason": "",
+            "pool": "",
+            "fallback": False,
+            "wifi": "",
+            "wifi_weak": False,
+            "power_fault": False,
+            "overheat": False,
+            "best_exact": None,
         })
         self.assertEqual(row_state_tag("hold", "60", "1.00%", 66, 2), "hold")
         self.assertEqual(row_state_tag("climb", "60", "1", 66, 2), "climb")
@@ -2350,6 +2383,8 @@ class InstallAndConfigTests(unittest.TestCase):
         self.assertEqual(row_state_tag("climb", "70", "1", 66, 2), "alert")
         self.assertEqual(row_state_tag("hold", "60", "3%", 66, 2), "alert")
         self.assertEqual(row_state_tag("offline", "40", "0", 66, 2), "alert")
+        self.assertEqual(row_state_tag("stopped", "60", "1", 66, 2), "idle")
+        self.assertEqual(row_state_tag("stopped", "70", "1", 66, 2), "alert")
         self.assertEqual(row_state_tag("-", "-", "-", None, None), "idle")
 
     def test_log_replaces_longer_ip_before_shorter_prefix(self):
@@ -2425,12 +2460,40 @@ class InstallAndConfigTests(unittest.TestCase):
         self.assertIn("Groundhog Gamma Tuner", html)
         self.assertIn('id="settings-menu"', html)
         self.assertIn('id="scan-open"', html)
+        brand = html.split('class="brand"', 1)[1].split('class="status"', 1)[0]
+        self.assertNotIn('id="run"', brand)
+        self.assertNotIn('id="status-pill"', brand)
+        status = html.split('class="status"', 1)[1].split('class="commands"', 1)[0]
+        self.assertIn('id="status-pill"', status)
+        self.assertIn('id="updated"', status)
+        self.assertIn('aria-live="polite"', status)
+        commands = html.split('class="commands"', 1)[1].split("</header>", 1)[0]
+        self.assertLess(commands.find('id="run"'), commands.find('id="scan-open"'))
+        toolbar = commands.split('class="toolbar"', 1)[1].split('class="header-tools"', 1)[0]
+        self.assertNotIn('id="run"', toolbar)
+        self.assertNotIn('class="group"', html)
+        self.assertNotIn('id="start"', html)
+        self.assertNotIn('id="stop"', html)
+        self.assertNotIn("start_label", script)
+        self.assertIn("Stopping…", script)
         self.assertIn('id="network-diff"', html)
         self.assertIn("stratum.ckpool.org", html)
         self.assertIn("public-pool.io", html)
         self.assertNotIn('id="add-menu"', html)
+        self.assertNotIn('id="add-open"', html)
         self.assertNotIn("Add Miner", html)
+        self.assertNotIn("Add by IP", html)
         self.assertNotIn("add_miner_address", script)
+        self.assertNotIn('id="detail-chart"', html)
+        self.assertNotIn('id="detail-csv"', html)
+        self.assertNotIn("save_history_csv", script)
+        self.assertIn('id="detail"', html)
+        self.assertIn('id="detail-restart"', html)
+        self.assertIn('id="fleet"', html)
+        self.assertIn('id="odds"', html)
+        self.assertIn("max_droop_mv", html)
+        self.assertIn("vr_temp_tolerance", html)
+        self.assertIn("ceiling_soak_seconds", html)
         self.assertNotIn('id="row-actions"', html)
         self.assertIn('classList.toggle("fullscreen"', script)
         self.assertIn("body.fullscreen .toolbar", styles)
@@ -2460,7 +2523,7 @@ class InstallAndConfigTests(unittest.TestCase):
     def test_parse_autotuner_value_clamps_frequency_and_voltage(self):
         from dashboard import parse_autotuner_value
 
-        self.assertEqual(parse_autotuner_value("min_freq", "50"), 400)
+        self.assertEqual(parse_autotuner_value("min_freq", "50"), 350)
         self.assertEqual(parse_autotuner_value("max_freq", "2000"), 1100)
         self.assertEqual(parse_autotuner_value("start_freq", "700"), 700)
         self.assertEqual(parse_autotuner_value("min_volt", "900"), 1000)

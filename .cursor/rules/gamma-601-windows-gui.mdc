@@ -9,9 +9,9 @@ This repo tunes a custom Bitaxe Gamma 601 (ASIC BM1370, board version 601) on a 
 
 - Run it with `python main.py`. That opens the local dashboard window (pywebview / Edge WebView2).
 - The window process must be 64-bit Python. pywebview’s .NET helper does not load in the ARM64 build.
-- Install dependencies from `requirements.txt`. The window needs the WebView2 runtime that ships with Windows 11.
+- Install dependencies from `requirements.txt`. Keep those packages on the current PyPI releases with a `>=` floor. The window needs the WebView2 runtime that ships with Windows 11.
 - Keep the live `is_gamma_601` check. Do not tune any other board.
 - Official AxeOS only, firmware v2.15.1 and older. Do not add fallbacks for newer firmware, unofficial forks, or older response shapes.
-- A network scan or manual add may save only a Gamma 601. Set the row type from the board (`BM1370 601`).
+- A network scan may save only a Gamma 601. Set the row type from the board (`BM1370 601`).
 - Do not add Docker, a network web server, Flask, or Linux, macOS, or Raspberry Pi launch paths. The page is a local file inside the window.
 - A different device type is a later rewrite, not a new branch in this code.

@@ -927,11 +927,11 @@ def monitor_and_adjust(bitaxe_ip, bitaxe_type, interval, log_callback,
             f"{bitaxe_ip} -> Missing AutoTuner settings ({', '.join(missing)}). Skipping tuning.",
             "error",
         )
-        _publish_status(bitaxe_ip, phase="skipped")
+        _publish_status(bitaxe_ip, phase="skipped", reason="missing settings")
         return
     if limits["min_freq"] > limits["max_freq"] or limits["min_volt"] > limits["max_volt"]:
         log_callback(f"{bitaxe_ip} -> AutoTuner limits are reversed. Skipping tuning.", "error")
-        _publish_status(bitaxe_ip, phase="skipped")
+        _publish_status(bitaxe_ip, phase="skipped", reason="limits reversed")
         return
     limits = clamp_limits(limits)
 
@@ -961,14 +961,14 @@ def monitor_and_adjust(bitaxe_ip, bitaxe_type, interval, log_callback,
             f"{bitaxe_ip} -> Skipping tuning. This tuner only runs on a Bitaxe Gamma 601 (BM1370).",
             "error",
         )
-        _publish_status(bitaxe_ip, phase="skipped")
+        _publish_status(bitaxe_ip, phase="skipped", reason="not a gamma 601")
         return
     if not _reports_error_percentage(info):
         log_callback(
             f"{bitaxe_ip} -> Skipping tuning. Firmware did not report errorPercentage.",
             "error",
         )
-        _publish_status(bitaxe_ip, phase="skipped")
+        _publish_status(bitaxe_ip, phase="skipped", reason="no error percentage")
         return
 
     record = _miner_record(bitaxe_ip)
@@ -1038,7 +1038,7 @@ def monitor_and_adjust(bitaxe_ip, bitaxe_type, interval, log_callback,
     last_accepted = None
     last_rejected = None
     last_reasons = None
-    _publish_status(bitaxe_ip, phase=phase, wall_type=limit_wall)
+    _publish_status(bitaxe_ip, phase=phase, wall_type=limit_wall, reason="")
 
     while not event.is_set():
         try:
@@ -1315,6 +1315,7 @@ def monitor_and_adjust(bitaxe_ip, bitaxe_type, interval, log_callback,
                         phase=phase,
                         wall_type=limit_wall,
                         error_percentage=error_percentage,
+                        reason="holding for good hashrate",
                     )
                     if _wait(event, interval):
                         break
@@ -1362,6 +1363,13 @@ def monitor_and_adjust(bitaxe_ip, bitaxe_type, interval, log_callback,
                                 f"{bitaxe_ip} -> Miner rejected the change. Setpoint left unchanged.",
                                 "warning",
                             )
+                        _publish_status(
+                            bitaxe_ip,
+                            phase=phase,
+                            wall_type=limit_wall,
+                            error_percentage=error_percentage,
+                            reason="increase voltage",
+                        )
                         if _wait(event, interval):
                             break
                         continue
@@ -1410,11 +1418,15 @@ def monitor_and_adjust(bitaxe_ip, bitaxe_type, interval, log_callback,
                         else:
                             hash_ceiling = back_frequency
                             limit_wall = wall_type_from_reason("step frequency down after good hashrate")
+                        retreat_reason = (
+                            "restore voltage" if kind == "trim" else "step frequency down after good hashrate"
+                        )
                         _publish_status(
                             bitaxe_ip,
                             phase=phase,
                             wall_type=limit_wall,
                             error_percentage=error_percentage,
+                            reason=retreat_reason,
                         )
                     if _wait(event, interval):
                         break
@@ -1516,6 +1528,13 @@ def monitor_and_adjust(bitaxe_ip, bitaxe_type, interval, log_callback,
                 reason = "holding for good hashrate"
 
             if reason == "holding at zero hashrate":
+                _publish_status(
+                    bitaxe_ip,
+                    phase=phase,
+                    wall_type=limit_wall,
+                    error_percentage=error_percentage,
+                    reason=reason,
+                )
                 if not zero_restarted:
                     log_callback(
                         f"{bitaxe_ip} -> Hashrate is 0 GH/s after settle. Restarting...",
@@ -1546,7 +1565,7 @@ def monitor_and_adjust(bitaxe_ip, bitaxe_type, interval, log_callback,
                 phase = "trim"
                 trim_good_voltage = confirmed[1]
                 log_callback(f"{bitaxe_ip} -> Frequency ceiling. Trimming voltage.", "info")
-                _publish_status(bitaxe_ip, phase=phase)
+                _publish_status(bitaxe_ip, phase=phase, reason="frequency ceiling")
                 if _wait(event, interval):
                     break
                 continue
@@ -1575,7 +1594,13 @@ def monitor_and_adjust(bitaxe_ip, bitaxe_type, interval, log_callback,
             if wall == "thermal":
                 thermal_hold = True
             log_callback(f"{bitaxe_ip} -> {reason}.", "info")
-            _publish_status(bitaxe_ip, phase=phase, wall_type=limit_wall, error_percentage=error_percentage)
+            _publish_status(
+                bitaxe_ip,
+                phase=phase,
+                wall_type=limit_wall,
+                error_percentage=error_percentage,
+                reason=reason,
+            )
 
             if not _same_setpoint((new_frequency, new_voltage), confirmed):
                 applied_settings = set_system_settings(bitaxe_ip, new_voltage, new_frequency)

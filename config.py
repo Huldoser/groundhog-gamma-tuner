@@ -12,7 +12,11 @@ _config_lock = threading.RLock()
 _last_good_config = None
 
 # Gamma 601 hard range. The UI and the tuner both stay inside this.
-HARD_MIN_FREQ = 400
+# 350 MHz is the lowest BM1370 clock in the AxeOS v2.15.1 preset list (Gamma Duo).
+# The Gamma list itself starts at 400. The API will store a lower number; this app will not.
+# Voltage stays at 1000 mV, the lowest BM1370 voltage preset. The tuner sheds voltage
+# only after frequency is already at its floor, so a lower voltage is not used to settle a weak chip.
+HARD_MIN_FREQ = 350
 HARD_MAX_FREQ = 1100
 HARD_MIN_VOLT = 1000
 HARD_MAX_VOLT = 1400
