@@ -3,10 +3,12 @@ const TUNER_FIELDS = [
   "min_freq", "start_freq", "max_freq",
   "min_volt", "start_volt", "max_volt",
   "max_temp", "max_watts", "max_vr_temp", "min_input_voltage", "max_error_percentage",
+  "max_droop_mv",
 ];
 const GLOBAL_FIELDS = [
   "voltage_step", "frequency_step", "monitor_interval", "refresh_interval",
-  "default_target_temp", "temp_tolerance", "flatline_hashrate_repeat_count",
+  "default_target_temp", "temp_tolerance", "vr_temp_tolerance", "ceiling_soak_seconds",
+  "flatline_hashrate_repeat_count",
 ];
 const FALLBACK_PROMPT = "Set every miner to the Gamma 601 stock clocks (525 MHz / 1150 mV) and forget the saved setpoint?\n\nThe next Start Autotuner will climb or step down from there.";
 
@@ -30,9 +32,6 @@ let lastSnapshot = {
   controls: {
     status: "idle",
     status_label: "Idle",
-    start_enabled: true,
-    start_label: "Start Autotuner",
-    stop_enabled: false,
     reset_enabled: true,
     scan_enabled: true,
   },
@@ -134,18 +133,33 @@ function toggleSettingsMenu() {
   else hideSettingsMenu();
 }
 
+let runBusy = false;
+
 function applyControls(controls) {
+  controls = controls || {};
+  const status = controls.status || "idle";
   const pill = $("status-pill");
   pill.textContent = controls.status_label || "Idle";
-  pill.className = `pill ${controls.status || "idle"}`;
+  pill.className = `pill ${status}`;
   $("updated").textContent = `Updated ${lastSnapshot.updated || "--:--:--"}`;
-  const start = $("start");
-  start.disabled = !controls.start_enabled;
-  start.textContent = controls.start_label || "Start Autotuner";
-  start.classList.toggle("is-running", controls.start_label === "Autotuner Running");
-  $("stop").disabled = !controls.stop_enabled;
+  const run = $("run");
+  if (status === "running" || status === "stopping") {
+    run.textContent = status === "stopping" ? "Stopping…" : "Stop Autotuner";
+    run.className = status === "stopping" ? "danger is-busy" : "danger";
+    run.dataset.action = "stop";
+  } else {
+    run.textContent = "Start Autotuner";
+    run.className = "accent";
+    run.dataset.action = "start";
+  }
+  const actionable = status === "idle" || status === "running";
+  run.disabled = runBusy || !actionable;
+  if (runBusy) run.classList.add("is-busy");
+  const busy = runBusy || status === "stopping";
+  run.setAttribute("aria-busy", busy ? "true" : "false");
   $("reset").disabled = !controls.reset_enabled;
   $("scan-open").disabled = !controls.scan_enabled;
+  if ($("empty-scan")) $("empty-scan").disabled = !controls.scan_enabled;
 }
 
 let tableKey = "";
@@ -220,12 +234,12 @@ function addLine(cell, text, className) {
   cell.appendChild(line);
 }
 
-function addNote(cell, text, note, className) {
+function addNote(cell, text, note, className, noteClass) {
   const line = document.createElement("span");
   line.className = className ? `line ${className}` : "line";
   line.append(document.createTextNode(`${text} `));
   const label = document.createElement("span");
-  label.className = "note";
+  label.className = noteClass ? `note ${noteClass}` : "note";
   label.textContent = note;
   line.append(label);
   cell.appendChild(line);
@@ -235,23 +249,47 @@ function setTitle(cell, title) {
   if (title) cell.title = title;
 }
 
+function firmwareTitle(miner) {
+  const running = String(miner.name_title || "").trim();
+  if (!shown(miner.firmware_update)) return running;
+  const available = `Stable firmware ${miner.firmware_update} is available`;
+  return running ? `${running}\n${available}` : available;
+}
+
+function levelClass(level, quiet) {
+  if (level === "warn" || level === "bad") return level;
+  return quiet ? "muted" : "";
+}
+
+const PHASE_TAGS = new Set(["hold", "climb", "trim", "alert"]);
+
 function renderCell(miner, column) {
   const cell = document.createElement("td");
   if (column === "name") {
     cell.className = "left";
     if (!shown(miner.name) && !shown(miner.ip)) cell.textContent = "-";
     else {
-      if (shown(miner.name)) addLine(cell, miner.name);
+      const update = shown(miner.firmware_update) ? miner.firmware_update : "";
+      if (shown(miner.name) && miner.wifi_weak && shown(miner.wifi)) {
+        addNote(cell, miner.name, `${miner.wifi} dBm`, "", "bad");
+        if (update) addLine(cell, update, "warn");
+      } else if (shown(miner.name) && update) {
+        addNote(cell, miner.name, update, "", "warn");
+      } else if (shown(miner.name)) addLine(cell, miner.name);
+      else if (update) addLine(cell, update, "warn");
       if (shown(miner.ip)) addLine(cell, miner.ip, "muted");
+      if (shown(miner.pool)) {
+        addLine(cell, miner.fallback ? `${miner.pool} fallback` : miner.pool, "muted");
+      }
     }
-    setTitle(cell, miner.name_title);
+    setTitle(cell, firmwareTitle(miner));
     return cell;
   }
   if (column === "freq") {
     if (!shown(miner.freq) && !shown(miner.mv)) cell.textContent = "-";
     else {
       if (shown(miner.freq)) addLine(cell, `${miner.freq} MHz`);
-      if (shown(miner.mv)) addLine(cell, `${miner.mv} mV`, miner.mv_alert ? "droop" : "");
+      if (shown(miner.mv)) addLine(cell, `${miner.mv} mV`, miner.mv_alert ? "droop" : "muted");
     }
     setTitle(cell, miner.mv_title);
     return cell;
@@ -259,8 +297,8 @@ function renderCell(miner, column) {
   if (column === "asic") {
     if (!shown(miner.asic) && !shown(miner.vr)) cell.textContent = "-";
     else {
-      if (shown(miner.asic)) addNote(cell, `${miner.asic}°C`, "asic");
-      if (shown(miner.vr)) addNote(cell, `${miner.vr}°C`, "vr");
+      if (shown(miner.asic)) addNote(cell, `${miner.asic}°C`, "asic", levelClass(miner.asic_level, false));
+      if (shown(miner.vr)) addNote(cell, `${miner.vr}°C`, "vr", levelClass(miner.vr_level, true));
     }
     return cell;
   }
@@ -276,8 +314,8 @@ function renderCell(miner, column) {
   if (column === "watts") {
     if (!shown(miner.watts) && !shown(miner.vin)) cell.textContent = "-";
     else {
-      if (shown(miner.watts)) addLine(cell, `${miner.watts} W`);
-      if (shown(miner.vin)) addLine(cell, `${miner.vin} V`, "muted");
+      if (shown(miner.watts)) addLine(cell, `${miner.watts} W`, miner.watts_alert ? "bad" : "");
+      if (shown(miner.vin)) addLine(cell, `${miner.vin} V`, miner.vin_alert ? "bad" : "muted");
     }
     return cell;
   }
@@ -285,7 +323,7 @@ function renderCell(miner, column) {
     if (!shown(miner.best) && !shown(miner.session)) cell.textContent = "-";
     else {
       if (shown(miner.best)) addLine(cell, miner.best);
-      if (shown(miner.session)) addNote(cell, miner.session, "session");
+      if (shown(miner.session)) addNote(cell, miner.session, "session", "muted");
     }
     const titles = [];
     if (miner.best_title) titles.push(miner.best_title);
@@ -297,13 +335,28 @@ function renderCell(miner, column) {
     if (!shown(miner.shares) && !shown(miner.error)) cell.textContent = "-";
     else {
       if (shown(miner.shares)) addLine(cell, miner.shares);
-      if (shown(miner.error)) addLine(cell, miner.error, "muted");
+      if (shown(miner.error)) addLine(cell, miner.error, miner.error_alert ? "bad" : "muted");
     }
     setTitle(cell, miner.shares_title);
     return cell;
   }
-  if (column === "setpoint") cell.className = "left";
-  if (column === "phase") cell.className = "phase";
+  if (column === "phase") {
+    cell.className = "phase";
+    const value = miner.phase;
+    if (!shown(value)) {
+      cell.textContent = "-";
+      return cell;
+    }
+    const pill = document.createElement("span");
+    const tag = PHASE_TAGS.has(miner.tag) ? miner.tag : "idle";
+    pill.className = `phase-pill ${tag}`;
+    pill.textContent = value;
+    cell.appendChild(pill);
+    if (shown(miner.reason)) addLine(cell, miner.reason, "muted reason");
+    return cell;
+  }
+  if (column === "setpoint") cell.className = "left quiet";
+  if (column === "up") cell.className = "quiet";
   const value = miner[column];
   cell.textContent = value == null || value === "" ? "-" : value;
   return cell;
@@ -393,6 +446,110 @@ function renderNetwork(network) {
   });
 }
 
+function addStat(parent, label, value, tone, title, unit) {
+  const item = document.createElement("span");
+  item.className = tone ? `stat ${tone}` : "stat";
+  if (title) item.title = title;
+  if (shown(label)) {
+    const name = document.createElement("span");
+    name.className = "stat-label";
+    name.textContent = label;
+    item.appendChild(name);
+  }
+  const figure = document.createElement("strong");
+  figure.textContent = value;
+  item.appendChild(figure);
+  if (shown(unit)) item.append(document.createTextNode(unit));
+  parent.appendChild(item);
+}
+
+function renderFleet(fleet, odds, miners) {
+  const strip = $("summary");
+  const fleetEl = $("fleet");
+  const oddsEl = $("odds");
+  if (!fleetEl || !oddsEl) return;
+  if (!miners || !miners.length || !fleet) {
+    if (strip) strip.hidden = true;
+    fleetEl.hidden = true;
+    fleetEl.replaceChildren();
+    oddsEl.hidden = true;
+    oddsEl.replaceChildren();
+    return;
+  }
+  fleetEl.replaceChildren();
+  addStat(fleetEl, "Online", String(fleet.online));
+  if (fleet.offline) addStat(fleetEl, "Offline", String(fleet.offline), "offline");
+  if (shown(fleet.hash)) addStat(fleetEl, "Hash", `${fleet.hash} GH/s`);
+  if (shown(fleet.watts)) addStat(fleetEl, "Power", `${fleet.watts} W`);
+  if (shown(fleet.jth)) addStat(fleetEl, "", fleet.jth, "", "", "J/TH");
+  if (fleet.climb) addStat(fleetEl, "Climbing", String(fleet.climb), "climb");
+  if (fleet.hold) addStat(fleetEl, "Holding", String(fleet.hold), "hold");
+  if (fleet.trim) addStat(fleetEl, "Trimming", String(fleet.trim), "trim");
+  fleetEl.hidden = false;
+  oddsEl.replaceChildren();
+  const today = odds && odds.today;
+  if (shown(today)) {
+    const suffix = " today";
+    if (String(today).endsWith(suffix)) addStat(oddsEl, "Today", String(today).slice(0, -suffix.length));
+    else addStat(oddsEl, "", today);
+  }
+  const best = odds && odds.best;
+  const match = typeof best === "string" && best.match(/^Best share is (.+) of the network$/);
+  if (match) addStat(oddsEl, "Best", match[1], "", best);
+  else if (shown(best)) addStat(oddsEl, "Best", best);
+  oddsEl.hidden = oddsEl.childElementCount === 0;
+  if (strip) strip.hidden = false;
+}
+
+function factLine(parent, label, text, note) {
+  if (!shown(text) && !shown(note)) return;
+  const item = document.createElement("span");
+  const name = document.createElement("span");
+  name.className = "fact-label";
+  name.textContent = label;
+  item.append(name);
+  if (shown(text)) item.append(document.createTextNode(` ${text}`));
+  if (shown(note)) {
+    const mark = document.createElement("span");
+    mark.className = "note warn";
+    mark.textContent = note;
+    item.append(document.createTextNode(" "), mark);
+  }
+  parent.appendChild(item);
+}
+
+function joinedTitle(text) {
+  return String(text || "").split("\n").map((line) => line.trim()).filter(Boolean).join(" · ");
+}
+
+function renderDetail(miners) {
+  const card = $("detail");
+  if (!card) return;
+  const miner = (miners || []).find((row) => row.ip === selectedIp);
+  if (!miner) {
+    card.hidden = true;
+    return;
+  }
+  card.hidden = false;
+  $("detail-title").textContent = shown(miner.name) ? miner.name : miner.ip;
+  const facts = $("detail-facts");
+  facts.replaceChildren();
+  factLine(
+    facts,
+    "Firmware",
+    miner.name_title,
+    shown(miner.firmware_update) ? `${miner.firmware_update} available` : "",
+  );
+  factLine(facts, "Hash", joinedTitle(miner.hash_title));
+  factLine(facts, "Core", miner.mv_title);
+  factLine(facts, "Shares", joinedTitle(miner.shares_title));
+  if (shown(miner.pool)) {
+    factLine(facts, "Pool", miner.fallback ? `${miner.pool} fallback` : miner.pool);
+  }
+  if (shown(miner.wifi)) factLine(facts, "WiFi", `${miner.wifi} dBm`);
+  if (shown(miner.reason)) factLine(facts, "Decision", miner.reason);
+}
+
 function applySnapshot(snapshot) {
   lastSnapshot = snapshot;
   applyControls(snapshot.controls || lastSnapshot.controls);
@@ -403,6 +560,12 @@ function applySnapshot(snapshot) {
   appendLog(snapshot.log || []);
   syncScan(snapshot.scan);
   renderNetwork(snapshot.network);
+  renderFleet(snapshot.fleet, snapshot.odds, snapshot.miners || []);
+  renderDetail(snapshot.miners || []);
+}
+
+function windowFocused() {
+  return document.visibilityState === "visible" && document.hasFocus();
 }
 
 async function poll() {
@@ -410,7 +573,7 @@ async function poll() {
   if (!bridge || polling) return;
   polling = true;
   try {
-    const snapshot = await bridge.get_snapshot(logCursor);
+    const snapshot = await bridge.get_snapshot(logCursor, windowFocused());
     if (snapshot && snapshot.miners) applySnapshot(snapshot);
   } catch (_error) {
     // Keep the last good screen. The next poll tries again.
@@ -426,19 +589,28 @@ function requireSelection(message) {
   return null;
 }
 
-async function onStart() {
+async function onRun() {
   const bridge = api();
-  if (!bridge) return;
-  const result = await bridge.start_autotuner();
-  if (result && result.notice) showNotice(result.notice);
-  poll();
-}
-
-async function onStop() {
-  const bridge = api();
-  if (!bridge) return;
-  await bridge.stop_autotuner();
-  poll();
+  const run = $("run");
+  if (!bridge || runBusy || run.disabled) return;
+  const action = run.dataset.action || "start";
+  runBusy = true;
+  applyControls(lastSnapshot.controls);
+  try {
+    if (action === "stop") {
+      await bridge.stop_autotuner();
+    } else {
+      const result = await bridge.start_autotuner();
+      if (result && result.notice) showNotice(result.notice);
+    }
+    const snapshot = await bridge.get_snapshot(logCursor, windowFocused());
+    if (snapshot && snapshot.miners) applySnapshot(snapshot);
+  } catch (_error) {
+    // The next poll reconciles the button with the tuner.
+  } finally {
+    runBusy = false;
+    applyControls(lastSnapshot.controls);
+  }
 }
 
 async function onReset() {
@@ -460,6 +632,9 @@ async function onReset() {
 function openScan() {
   setFormError("scan-error", "");
   if (!scanWasRunning) $("scan-progress").textContent = "";
+  const range = lastSnapshot.scan_range || {};
+  if (!$("scan-start-ip").value.trim() && range.start) $("scan-start-ip").value = range.start;
+  if (!$("scan-end-ip").value.trim() && range.end) $("scan-end-ip").value = range.end;
   openModal("scan");
 }
 
@@ -762,8 +937,10 @@ function bind() {
   $("fullscreen").addEventListener("click", () => setFullscreen(!fullscreen));
   $("settings-open").addEventListener("click", toggleSettingsMenu);
   $("scan-open").addEventListener("click", openScan);
-  $("start").addEventListener("click", onStart);
-  $("stop").addEventListener("click", onStop);
+  $("empty-scan").addEventListener("click", openScan);
+  $("detail-restart").addEventListener("click", restartSelected);
+  $("detail-remove").addEventListener("click", removeSelected);
+  $("run").addEventListener("click", onRun);
   $("scan-form").addEventListener("submit", submitScan);
   $("scan-cancel").addEventListener("click", closeScan);
   $("edit-form").addEventListener("submit", submitEdit);
@@ -810,6 +987,7 @@ function bind() {
     if (!row) return;
     selectedIp = row.dataset.ip;
     renderTable(lastSnapshot.miners || []);
+    renderDetail(lastSnapshot.miners || []);
   });
   $("miner-body").addEventListener("dblclick", (event) => {
     const row = event.target.closest("tr");
@@ -824,6 +1002,7 @@ function bind() {
     event.preventDefault();
     selectedIp = row.dataset.ip;
     renderTable(lastSnapshot.miners || []);
+    renderDetail(lastSnapshot.miners || []);
     showRowMenu(event);
   });
 

@@ -30,6 +30,8 @@ Operating targets are about 65°C on the chip and 85°C on the regulator. The tu
 
 AxeOS will still emergency-stop at 75°C on the ASIC or 105°C on the regulator, then restart about 100 MHz and 100 mV lower. These limits stay under that, so the tuner remains the controller. Core voltage stays at or below 1300 mV.
 
+Frequency can step down to 350 MHz. That is the lowest BM1370 clock in the AxeOS v2.15.1 preset list (the Gamma Duo list; the Gamma list starts at 400). A Min frequency typed under 350 is saved as 350. Core voltage stays at or above 1000 mV, the lowest BM1370 voltage preset. The tuner lowers voltage only after frequency is already at its minimum, so a weak chip is settled with a lower clock, not a lower voltage. A saved miner keeps its Min frequency until that field is changed. Miners already saved at 400 MHz stay there.
+
 Those targets match this cooling and this power supply. Another board, a stock cooler, or a smaller supply needs its own limits.
 
 ## Requirements
@@ -50,7 +52,7 @@ py -0p
 Use the `python.exe` whose folder is not `Python313-arm64`:
 
 ```bat
-"%LocalAppData%\Programs\Python\Python313\python.exe" -m pip install -r requirements.txt
+"%LocalAppData%\Programs\Python\Python313\python.exe" -m pip install -U -r requirements.txt
 ```
 
 ## Run

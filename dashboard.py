@@ -9,9 +9,11 @@ import os
 import platform
 import re
 import socket
+import subprocess
 import threading
 from collections import deque
 from datetime import datetime
+from xml.sax.saxutils import escape as xml_escape
 
 import requests
 
@@ -19,7 +21,9 @@ from autotune import (
     STARTUP_STAGGER_SECONDS,
     STOCK_FREQ,
     STOCK_VOLT,
+    _overheat_mode_set,
     _power_fault_set,
+    _publish_status,
     get_miner_status,
     get_system_info,
     monitor_and_adjust,
@@ -34,14 +38,12 @@ from config import (
     HARD_MAX_VOLT,
     HARD_MIN_FREQ,
     HARD_MIN_VOLT,
-    add_miner,
     adopted_hostname,
     detect_miners,
     get_miner_defaults,
     get_miners,
     is_gamma_601,
     load_config,
-    miner_name_from_info,
     miner_type_from_info,
     remove_miner,
     save_config,
@@ -50,8 +52,12 @@ from config import (
 
 STATUS_REFRESH_SECONDS = 5
 LOG_LIMIT = 500
+WEAK_WIFI_DBM = -70
 NETWORK_REFRESH_SECONDS = 60
 DIFFICULTY_URL = "https://mempool.space/api/v1/mining/hashrate/3d"
+FIRMWARE_RELEASES_URL = "https://api.github.com/repos/bitaxeorg/ESP-Miner/releases?per_page=100"
+_STABLE_TAG = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
+_INSTALLED_VERSION = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)")
 # Stratum V2 listeners. CK Pool is stratum.ckpool.org:3336. Public Pool solo is :23330.
 POOLS = (
     ("stratum.ckpool.org", 3336),
@@ -66,6 +72,7 @@ LIMIT_FIELDS = (
     ("max_vr_temp", "VR temp (°C)"),
     ("min_input_voltage", "Input voltage (V)"),
     ("max_error_percentage", "Error %"),
+    ("max_droop_mv", "Droop (mV)"),
 )
 ALL_AUTOTUNE_FIELDS = tuple(field for field, _label in (*FREQ_FIELDS, *VOLT_FIELDS, *LIMIT_FIELDS))
 GLOBAL_INT_FIELDS = (
@@ -75,6 +82,8 @@ GLOBAL_INT_FIELDS = (
     "refresh_interval",
     "default_target_temp",
     "temp_tolerance",
+    "vr_temp_tolerance",
+    "ceiling_soak_seconds",
 )
 START_REQUIRED_FIELDS = (
     "min_freq",
@@ -351,6 +360,232 @@ def format_version_title(info):
     return str(info.get("version") or "").strip()
 
 
+def pool_host(info):
+    """Stratum host the miner is using, and whether that host is the fallback."""
+    if not isinstance(info, dict):
+        return "", False
+    fallback = _flag_set(info.get("isUsingFallbackStratum"))
+    raw = info.get("fallbackStratumURL") if fallback else info.get("stratumURL")
+    if not str(raw or "").strip():
+        raw = info.get("stratumURL") or info.get("fallbackStratumURL") or ""
+    text = str(raw or "").strip()
+    if "://" in text:
+        text = text.split("://", 1)[1]
+    text = text.split("/")[0].split(":")[0]
+    return text, fallback
+
+
+def wifi_reading(info):
+    """Wi-Fi RSSI in dBm. AxeOS uses wifiRSSI on system info."""
+    if not isinstance(info, dict):
+        return None
+    number = _plain_number(info.get("wifiRSSI"))
+    if number is None:
+        number = _plain_number(info.get("wifiRssi"))
+    return number
+
+
+def wifi_is_weak(rssi):
+    """True when the radio is at or below the weak-signal mark."""
+    number = _plain_number(rssi)
+    return number is not None and number <= WEAK_WIFI_DBM
+
+
+def subnet_range_for(ip):
+    """First and last host of an IPv4 address's /24. Blank when the address is not usable."""
+    text = str(ip or "").strip()
+    if not text:
+        return "", ""
+    try:
+        network = ipaddress.ip_network(f"{text}/24", strict=False)
+    except ValueError:
+        return "", ""
+    if network.version != 4:
+        return "", ""
+    hosts = list(network.hosts())
+    if len(hosts) < 2:
+        return "", ""
+    return str(hosts[0]), str(hosts[-1])
+
+
+def local_ipv4():
+    """This machine's IPv4, or blank when it cannot be learned without sending a packet."""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    except Exception:
+        return ""
+    try:
+        sock.connect(("192.0.2.1", 80))
+        address = sock.getsockname()[0]
+    except Exception:
+        return ""
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+    if not address or address.startswith("127."):
+        return ""
+    return address
+
+
+def solo_day_odds(hash_ghs, difficulty):
+    """Average days per block. None when hashrate or network difficulty is missing."""
+    rate = _plain_number(hash_ghs)
+    diff = _plain_number(difficulty)
+    if rate is None or diff is None or rate <= 0 or diff <= 0:
+        return None
+    seconds = (diff * 2 ** 32) / (rate * 1_000_000_000)
+    return seconds / 86400.0
+
+
+def format_odds_count(days):
+    number = _plain_number(days)
+    if number is None or number <= 0:
+        return ""
+    if number < 10:
+        return f"{number:.1f}"
+    return format_difficulty(number)
+
+
+def format_solo_odds(hash_ghs, difficulty):
+    """'1 in N today' from fleet hashrate and the current network difficulty."""
+    days = solo_day_odds(hash_ghs, difficulty)
+    count = format_odds_count(days)
+    if not count:
+        return ""
+    return f"1 in {count} today"
+
+
+def format_best_share_percent(best, difficulty):
+    """How close the best share is to a block, as a percent of network difficulty."""
+    share = _plain_number(best)
+    diff = _plain_number(difficulty)
+    if share is None or diff is None or share <= 0 or diff <= 0:
+        return ""
+    percent = share / diff * 100.0
+    if percent >= 1:
+        text = f"{percent:.2f}"
+    elif percent >= 0.01:
+        text = f"{percent:.4f}"
+    elif percent >= 0.000001:
+        text = f"{percent:.6f}"
+    else:
+        text = f"{percent:.2e}"
+    return f"Best share is {text}% of the network"
+
+
+def fleet_summary(rows):
+    """Online count, summed hash and watts, and the best share across the table."""
+    online = offline = climb = hold = trim = 0
+    hash_sum = 0.0
+    watt_sum = 0.0
+    paired_watts = 0.0
+    counted_hash = False
+    counted_watts = False
+    best = None
+    live_phases = {"climb", "hold", "trim", "skipped", "stopped"}
+    for row in rows or []:
+        phase = str(row.get("phase") or "").strip().lower()
+        number = _plain_number(row.get("best_exact"))
+        if number is not None and (best is None or number > best):
+            best = number
+        if phase == "offline":
+            offline += 1
+            continue
+        has_reading = (
+            _plain_number(row.get("hash")) is not None or _plain_number(row.get("freq")) is not None
+        )
+        if phase in live_phases or has_reading:
+            online += 1
+        if phase == "climb":
+            climb += 1
+        elif phase == "hold":
+            hold += 1
+        elif phase == "trim":
+            trim += 1
+        hashrate = _plain_number(row.get("hash"))
+        watts = _plain_number(row.get("watts"))
+        if hashrate is not None and hashrate > 0:
+            hash_sum += hashrate
+            counted_hash = True
+            if watts is not None and watts > 0:
+                paired_watts += watts
+        if watts is not None and watts > 0:
+            watt_sum += watts
+            counted_watts = True
+    joules = None
+    if counted_hash and hash_sum > 0 and paired_watts > 0:
+        joules = paired_watts / (hash_sum / 1000.0)
+    return {
+        "online": online,
+        "offline": offline,
+        "climb": climb,
+        "hold": hold,
+        "trim": trim,
+        "hash": format_number(hash_sum, 2) if counted_hash else "-",
+        "watts": format_number(watt_sum, 2) if counted_watts else "-",
+        "jth": format_number(joules, 2) if joules is not None else "-",
+        "hash_ghs": hash_sum if counted_hash else 0.0,
+        "best": best,
+    }
+
+
+def alert_kind(row):
+    """The background notice for one row. Offline wins over a fault still on the last sample."""
+    phase = str((row or {}).get("phase") or "").strip().lower()
+    if phase == "offline":
+        return "offline"
+    if (row or {}).get("overheat"):
+        return "overheat"
+    if (row or {}).get("power_fault"):
+        return "power_fault"
+    return ""
+
+
+def alert_message(name, kind):
+    label = str(name or "Miner").strip() or "Miner"
+    if kind == "offline":
+        return f"{label} is offline."
+    if kind == "overheat":
+        return f"{label} is in overheat mode."
+    if kind == "power_fault":
+        return f"{label} reported a power fault."
+    return ""
+
+
+def show_windows_toast(title, message):
+    """A local Windows toast. Other systems do nothing."""
+    if platform.system() != "Windows":
+        return
+    heading = xml_escape(str(title or "Groundhog Gamma Tuner").replace("\r", " ").replace("\n", " "))
+    body = xml_escape(str(message or "").replace("\r", " ").replace("\n", " "))
+    toast_xml = (
+        "<toast><visual><binding template=\"ToastGeneric\">"
+        f"<text>{heading}</text><text>{body}</text>"
+        "</binding></visual></toast>"
+    )
+    script = """
+[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
+[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null
+$xml = New-Object Windows.Data.Xml.Dom.XmlDocument
+$xml.LoadXml(@'
+%s
+'@)
+$toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
+$app = '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe'
+[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($app).Show($toast)
+""" % toast_xml
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    subprocess.Popen(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=flags,
+    )
+
+
 def stratum_port_open(host, port, timeout=8, connect=None):
     """True when a Stratum port accepts a TCP connection."""
     opener = socket.create_connection if connect is None else connect
@@ -386,11 +621,108 @@ def read_network_status(get=None, connect=None):
     return {"difficulty": difficulty, "pools": pools}
 
 
+def parse_firmware_version(text):
+    """(major, minor, patch) from a miner version or a stable tag."""
+    match = _INSTALLED_VERSION.match(str(text or "").strip())
+    if match is None:
+        return None
+    return tuple(int(part) for part in match.groups())
+
+
+def latest_stable_firmware(releases):
+    """Highest vMAJOR.MINOR.PATCH among releases that are not drafts or prereleases."""
+    best = None
+    best_tag = ""
+    if not isinstance(releases, list):
+        return ""
+    for release in releases:
+        if not isinstance(release, dict):
+            continue
+        if release.get("draft") or release.get("prerelease"):
+            continue
+        tag = str(release.get("tag_name") or "").strip()
+        match = _STABLE_TAG.fullmatch(tag)
+        if match is None:
+            continue
+        version = tuple(int(part) for part in match.groups())
+        if best is None or version > best:
+            best = version
+            best_tag = tag
+    return best_tag
+
+
+def firmware_update_version(installed, stable):
+    """Stable tag when its triple is newer than the installed version, else ''."""
+    current = parse_firmware_version(installed)
+    available = parse_firmware_version(stable)
+    if current is None or available is None or available <= current:
+        return ""
+    return str(stable or "").strip()
+
+
+def firmware_check_due(last_checked, now):
+    """True before the first check, then once after local noon if that noon is still unchecked.
+
+    A noon missed while the tablet slept is caught the next time this runs, still once that day.
+    """
+    if last_checked is None:
+        return True
+    noon = now.replace(hour=12, minute=0, second=0, microsecond=0)
+    return now >= noon and last_checked < noon
+
+
+def read_latest_stable_firmware(get=None):
+    """Newest stable ESP-Miner tag. '' when none qualify. None when the request fails."""
+    getter = requests.get if get is None else get
+    try:
+        response = getter(FIRMWARE_RELEASES_URL, timeout=8)
+        response.raise_for_status()
+        payload = response.json()
+    except Exception:
+        return None
+    return latest_stable_firmware(payload)
+
+
 def over_limit(value, limit):
     limit_number = parse_display_number(limit)
     if value is None or limit_number is None:
         return False
     return value > limit_number
+
+
+def under_limit(value, limit):
+    """True when a reading falls under its floor."""
+    number = parse_display_number(value)
+    floor = parse_display_number(limit)
+    if number is None or floor is None:
+        return False
+    return number < floor
+
+
+def limit_level(value, limit, tolerance=0):
+    """'bad' above the cap, 'warn' inside the tolerance band under it, else ''."""
+    number = parse_display_number(value)
+    cap = parse_display_number(limit)
+    if number is None or cap is None:
+        return ""
+    if number > cap:
+        return "bad"
+    band = parse_display_number(tolerance)
+    if band is None or band <= 0:
+        return ""
+    if number > cap - band:
+        return "warn"
+    return ""
+
+
+def _configured_tolerance(settings, key):
+    """A global tolerance. Missing or negative values use the tuner default of 3."""
+    if not isinstance(settings, dict):
+        return 3
+    number = parse_display_number(settings.get(key))
+    if number is None or number < 0:
+        return 3
+    return number
 
 
 def row_state_tag(phase, asic_text, error_text, max_temp, max_error):
@@ -408,6 +740,8 @@ def row_state_tag(phase, asic_text, error_text, max_temp, max_error):
         return "climb"
     if phase_name == "trim":
         return "trim"
+    if phase_name == "stopped":
+        return "idle"
     return "idle"
 
 
@@ -434,10 +768,24 @@ def blank_miner_row(nickname, ip):
         "tag": "idle",
         "up_seconds": None,
         "mv_alert": False,
+        "asic_level": "",
+        "vr_level": "",
+        "error_alert": False,
+        "watts_alert": False,
+        "vin_alert": False,
         "name_title": "",
+        "firmware_update": "",
         "mv_title": "",
         "hash_title": "",
         "shares_title": "",
+        "reason": "",
+        "pool": "",
+        "fallback": False,
+        "wifi": "",
+        "wifi_weak": False,
+        "power_fault": False,
+        "overheat": False,
+        "best_exact": None,
     }
 
 
@@ -462,6 +810,64 @@ def _fail(message, title="Error", level="error"):
     return {"ok": False, "message": message, "notice": _notice(level, title, message)}
 
 
+def format_local_time(moment=None):
+    """Short time in the Windows clock format. Other systems keep HH:MM:SS."""
+    moment = moment or datetime.now()
+    if platform.system() != "Windows":
+        return moment.strftime("%H:%M:%S")
+    try:
+        formatted = _windows_short_time(moment)
+    except (OSError, AttributeError):
+        formatted = ""
+    return formatted or moment.strftime("%H:%M:%S")
+
+
+def _windows_short_time(moment):
+    """User short time via GetTimeFormatEx. TIME_NOSECONDS matches the taskbar clock."""
+    import ctypes
+    from ctypes import wintypes
+
+    class SystemTime(ctypes.Structure):
+        _fields_ = [
+            ("wYear", wintypes.WORD),
+            ("wMonth", wintypes.WORD),
+            ("wDayOfWeek", wintypes.WORD),
+            ("wDay", wintypes.WORD),
+            ("wHour", wintypes.WORD),
+            ("wMinute", wintypes.WORD),
+            ("wSecond", wintypes.WORD),
+            ("wMilliseconds", wintypes.WORD),
+        ]
+
+    system_time = SystemTime(
+        moment.year,
+        moment.month,
+        (moment.weekday() + 1) % 7,
+        moment.day,
+        moment.hour,
+        moment.minute,
+        moment.second,
+        moment.microsecond // 1000,
+    )
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_time = kernel.GetTimeFormatEx
+    get_time.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        ctypes.POINTER(SystemTime),
+        wintypes.LPCWSTR,
+        wintypes.LPWSTR,
+        ctypes.c_int,
+    ]
+    get_time.restype = ctypes.c_int
+    buffer = ctypes.create_unicode_buffer(64)
+    # TIME_NOSECONDS: the taskbar short time, without a forced seconds field.
+    written = get_time(None, 0x00000002, ctypes.byref(system_time), None, buffer, len(buffer))
+    if written <= 0:
+        return ""
+    return buffer.value
+
+
 class TunerDashboard:
     """Tuner state the page reads and the actions it calls."""
 
@@ -481,8 +887,15 @@ class TunerDashboard:
         self._network = {
             "difficulty": "-",
             "difficulty_title": "",
+            "difficulty_exact": None,
             "pools": [{"name": host, "online": None} for host, _port in POOLS],
         }
+        self._latest_firmware = ""
+        self._firmware_checked = None
+        self._alerts = {}
+        self._focused = True
+        start_ip, end_ip = subnet_range_for(local_ipv4())
+        self._scan_range = {"start": start_ip, "end": end_ip}
         self._scan = None
         self._scan_cancel = threading.Event()
         self._scan_running = False
@@ -556,6 +969,10 @@ class TunerDashboard:
             rows.append(blank_miner_row(nickname, ip))
         with self._lock:
             self._rows = rows
+            kept = {row["ip"] for row in rows}
+            for ip in list(self._alerts):
+                if ip not in kept:
+                    self._drop_miner_runtime_locked(ip)
         self.log_message(f"Loaded {len(rows)} miners.", "success")
         self._wake.set()
 
@@ -573,18 +990,46 @@ class TunerDashboard:
                 "level": level,
             })
 
-    def get_snapshot(self, since_log_id=0):
-        """Table, button state, scan progress, and log lines after since_log_id."""
+    def get_snapshot(self, since_log_id=0, focused=None):
+        """Table, button state, scan progress, and log lines after since_log_id.
+
+        `focused` is whether the window is in front. A background fault can toast.
+        """
         since = _coerce_log_id(since_log_id)
         with self._lock:
+            if focused is not None:
+                self._focused = _as_bool(focused)
+            summary = fleet_summary(self._rows)
+            difficulty = self._network.get("difficulty_exact")
+            latest = self._latest_firmware
+            miners = []
+            for row in self._rows:
+                item = dict(row)
+                item["firmware_update"] = firmware_update_version(item.get("name_title"), latest)
+                miners.append(item)
             return {
                 "updated": self._updated,
-                "miners": [dict(row) for row in self._rows],
+                "miners": miners,
                 "log": [dict(line) for line in self._log if line["id"] > since],
                 "scan": None if self._scan is None else dict(self._scan),
                 "controls": self._controls_locked(),
                 "prompts": {"baseline": BASELINE_PROMPT},
                 "network": self._network_locked(),
+                "fleet": {
+                    "online": summary["online"],
+                    "offline": summary["offline"],
+                    "climb": summary["climb"],
+                    "hold": summary["hold"],
+                    "trim": summary["trim"],
+                    "hash": summary["hash"],
+                    "watts": summary["watts"],
+                    "jth": summary["jth"],
+                },
+                "odds": {
+                    "today": format_solo_odds(summary["hash_ghs"], difficulty),
+                    "best": format_best_share_percent(summary["best"], difficulty),
+                },
+                "scan_range": dict(self._scan_range),
             }
 
     def _network_locked(self):
@@ -601,12 +1046,33 @@ class TunerDashboard:
             if number is not None:
                 self._network["difficulty"] = format_difficulty(number)
                 self._network["difficulty_title"] = difficulty_title(number)
+                self._network["difficulty_exact"] = number
             self._network["pools"] = status["pools"]
+
+    def _refresh_firmware(self, now=None):
+        """Read the newest stable tag. A failed request keeps the previous tag."""
+        tag = read_latest_stable_firmware()
+        with self._lock:
+            self._firmware_checked = now or datetime.now()
+            if tag is not None:
+                self._latest_firmware = tag
+
+    def _refresh_firmware_if_due(self):
+        now = datetime.now()
+        with self._lock:
+            checked = self._firmware_checked
+        if not firmware_check_due(checked, now):
+            return
+        self._refresh_firmware(now)
 
     def _network_loop(self):
         while not self._closed.is_set():
             try:
                 self._refresh_network()
+            except Exception:
+                pass
+            try:
+                self._refresh_firmware_if_due()
             except Exception:
                 pass
             if self._closed.wait(NETWORK_REFRESH_SECONDS):
@@ -696,6 +1162,7 @@ class TunerDashboard:
                     },
                     daemon=True,
                 )
+                thread.miner_ip = miner["ip"]
                 thread.start()
                 threads.append(thread)
 
@@ -740,7 +1207,10 @@ class TunerDashboard:
         with self._lock:
             if self._baseline_reset_running:
                 blocked = "reset"
-            elif self.running or self._stop_in_progress or any(thread.is_alive() for thread in self.threads):
+            elif (
+                self.running or self._stop_in_progress or self._start_pending
+                or any(thread.is_alive() for thread in self.threads)
+            ):
                 blocked = "busy"
             else:
                 blocked = None
@@ -859,32 +1329,6 @@ class TunerDashboard:
                 self._scan["message"] = "Stopping scan..."
         return {"ok": True, "running": True}
 
-    def add_miner_address(self, nickname, ip):
-        """Check the board, then save it when it is a Gamma 601."""
-        nickname = str(nickname or "").strip()
-        ip = str(ip or "").strip()
-        if not ip:
-            return _fail("IP Address is required.")
-        if any(miner["ip"] == ip for miner in get_miners()):
-            return _fail(f"Miner with IP {ip} already exists.")
-
-        info = get_system_info(ip)
-        if isinstance(info, str):
-            return _fail(info)
-        if not is_gamma_601(info):
-            return _fail(f"{ip} is not a Bitaxe Gamma 601 (BM1370, board 601).")
-
-        miner_type = miner_type_from_info(info)
-        name = miner_name_from_info(info, ip, nickname)
-        add_miner(miner_type, ip, name)
-        if not any(miner["ip"] == ip for miner in get_miners()):
-            return _fail(f"Could not add miner at {ip}.")
-        with self._lock:
-            self._rows.append(blank_miner_row(name, ip))
-        self._wake.set()
-        self.log_message(f"Miner {name} added.", "success")
-        return {"ok": True, "message": f"Miner {name} added successfully.", "name": name}
-
     def remove_miner_address(self, ip):
         """Drop one miner from the table and from config.json."""
         ip = str(ip or "").strip()
@@ -895,6 +1339,7 @@ class TunerDashboard:
         remove_miner(ip)
         with self._lock:
             self._rows = [row for row in self._rows if row["ip"] != ip]
+            self._drop_miner_runtime_locked(ip)
         self.log_message("Miner(s) removed successfully.", "success")
         return {"ok": True}
 
@@ -1060,6 +1505,7 @@ class TunerDashboard:
         return STATUS_REFRESH_SECONDS
 
     def _apply_results(self, results):
+        messages = []
         with self._lock:
             by_ip = {row["ip"]: row for row in self._rows}
             for ip, miner_data in results:
@@ -1067,12 +1513,19 @@ class TunerDashboard:
                 if row is None:
                     continue
                 self._apply_one_locked(row, ip, miner_data)
-            self._updated = datetime.now().strftime("%H:%M:%S")
+                message = self._note_alert_locked(row)
+                if message:
+                    messages.append(message)
+            self._updated = format_local_time()
+        self._deliver_alerts(messages)
 
     def _apply_one_locked(self, row, ip, miner_data):
         if isinstance(miner_data, str) or not isinstance(miner_data, dict):
             row["phase"] = "offline"
             row["tag"] = "alert"
+            row["reason"] = ""
+            row["power_fault"] = False
+            row["overheat"] = False
             return
         self._maybe_adopt_hostname(ip, miner_data, row)
         stored = get_miner_defaults(ip)
@@ -1105,6 +1558,32 @@ class TunerDashboard:
         error = miner_data.get("errorPercentage", status.get("error_percentage"))
         row["error"] = "-" if error in (None, "") else f"{format_number(error, 2)}%"
         row["setpoint"] = format_learned_wall(status, stored)
+        row["reason"] = str(status.get("reason") or "").strip()
+        row["power_fault"] = _power_fault_set(miner_data.get("power_fault"))
+        row["overheat"] = _overheat_mode_set(miner_data.get("overheat_mode"))
+        if not row["reason"] and row["overheat"]:
+            row["reason"] = "overheat mode"
+        elif not row["reason"] and row["power_fault"]:
+            row["reason"] = "power fault"
+        host, fallback = pool_host(miner_data)
+        row["pool"] = host
+        row["fallback"] = fallback
+        rssi = wifi_reading(miner_data)
+        row["wifi"] = "" if rssi is None else format_number(rssi, 0)
+        row["wifi_weak"] = wifi_is_weak(rssi)
+        row["best_exact"] = _plain_number(miner_data.get("bestDiff"))
+        settings = load_config()
+        row["asic_level"] = limit_level(
+            miner_data.get("temp"), stored.get("max_temp"), _configured_tolerance(settings, "temp_tolerance")
+        )
+        row["vr_level"] = limit_level(
+            miner_data.get("vrTemp"), stored.get("max_vr_temp"), _configured_tolerance(settings, "vr_temp_tolerance")
+        )
+        row["error_alert"] = over_limit(error, stored.get("max_error_percentage"))
+        row["watts_alert"] = over_limit(miner_data.get("power"), stored.get("max_watts"))
+        row["vin_alert"] = under_limit(
+            normalize_input_voltage(miner_data.get("voltage")), stored.get("min_input_voltage")
+        )
         row["tag"] = row_state_tag(
             row["phase"],
             row["asic"],
@@ -1112,6 +1591,26 @@ class TunerDashboard:
             stored.get("max_temp"),
             stored.get("max_error_percentage"),
         )
+        if row["power_fault"] or row["overheat"]:
+            row["tag"] = "alert"
+
+    def _drop_miner_runtime_locked(self, ip):
+        self._alerts.pop(ip, None)
+
+    def _note_alert_locked(self, row):
+        kind = alert_kind(row)
+        previous = self._alerts.get(row["ip"], "")
+        self._alerts[row["ip"]] = kind
+        if not kind or kind == previous or self._focused:
+            return ""
+        return alert_message(row.get("name") or row["ip"], kind)
+
+    def _deliver_alerts(self, messages):
+        for message in messages:
+            try:
+                show_windows_toast("Groundhog Gamma Tuner", message)
+            except Exception:
+                pass
 
     def _maybe_adopt_hostname(self, ip, miner_data, row):
         stored_name = str(get_miner_defaults(ip).get("nickname") or row.get("name") or "")
@@ -1148,26 +1647,55 @@ class TunerDashboard:
     def _controls_locked(self):
         if self._stop_in_progress:
             status, label = "stopping", "Stopping"
+        elif self._baseline_reset_running:
+            status, label = "resetting", "Resetting"
         elif self.running:
             status, label = "running", "Running"
         else:
             status, label = "idle", "Idle"
-        start_locked = (
-            self.running or self._stop_in_progress or self._baseline_reset_running or self._start_pending
+        reset_locked = (
+            self._baseline_reset_running
+            or self.running
+            or self._stop_in_progress
+            or self._start_pending
         )
-        running_now = self.running and not self._stop_in_progress
         return {
             "status": status,
             "status_label": label,
-            "start_enabled": not start_locked,
-            "start_label": "Autotuner Running" if running_now else "Start Autotuner",
-            "stop_enabled": running_now,
-            "reset_enabled": not self._baseline_reset_running,
+            "reset_enabled": not reset_locked,
             "scan_enabled": not self._scan_running,
         }
 
+    def _publish_stopped_phases(self, threads):
+        """Leave a finished tuner on Stopped. Keep the saved setpoint fields."""
+        stopped_ips = []
+        for thread in threads:
+            ip = getattr(thread, "miner_ip", "")
+            if not ip:
+                continue
+            phase = str(get_miner_status(ip).get("phase") or "").strip().lower()
+            if phase in ("climb", "hold", "trim"):
+                _publish_status(ip, phase="stopped")
+                stopped_ips.append(ip)
+        if not stopped_ips:
+            return
+        with self._lock:
+            for row in self._rows:
+                if row.get("ip") not in stopped_ips:
+                    continue
+                stored = get_miner_defaults(row["ip"])
+                row["phase"] = "stopped"
+                row["tag"] = row_state_tag(
+                    "stopped",
+                    row.get("asic"),
+                    row.get("error"),
+                    stored.get("max_temp"),
+                    stored.get("max_error_percentage"),
+                )
+
     def _finish_stop(self):
         with self._lock:
+            finished = [thread for thread in self.threads if not thread.is_alive()]
             self.threads = [thread for thread in self.threads if thread.is_alive()]
             self._stop_in_progress = False
             self.running = False
@@ -1176,6 +1704,7 @@ class TunerDashboard:
             self.log_message("Some tuner threads are still finishing a request.", "warning")
         else:
             self.log_message("Autotuning stopped.", "warning")
+        self._publish_stopped_phases(finished)
 
 
 class DashboardApi:
@@ -1184,8 +1713,8 @@ class DashboardApi:
     def __init__(self, dashboard):
         self._dashboard = dashboard
 
-    def get_snapshot(self, since_log_id=0):
-        return self._dashboard.get_snapshot(since_log_id)
+    def get_snapshot(self, since_log_id=0, focused=None):
+        return self._dashboard.get_snapshot(since_log_id, focused)
 
     def start_autotuner(self):
         return self._dashboard.start_autotuner()
@@ -1201,9 +1730,6 @@ class DashboardApi:
 
     def cancel_scan(self):
         return self._dashboard.cancel_scan()
-
-    def add_miner_address(self, nickname, ip):
-        return self._dashboard.add_miner_address(nickname, ip)
 
     def remove_miner_address(self, ip):
         return self._dashboard.remove_miner_address(ip)

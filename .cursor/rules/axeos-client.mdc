@@ -1,0 +1,27 @@
+---
+description: AxeOS miner calls and their return shapes
+globs: autotune.py,config.py,dashboard.py
+alwaysApply: false
+---
+
+# AxeOS client
+
+Miner traffic is these three calls:
+
+- `GET http://{ip}/api/system/info`
+- `PATCH http://{ip}/api/system` with `coreVoltage`, `frequency`, `overclockEnabled`, and fan keys `autofanspeed` / `fanspeed`
+- `POST http://{ip}/api/system/restart`
+
+`get_system_info` returns a dict or an error string. `patch_system` returns `(ok, error_text)`. A missing `errorPercentage` skips that miner. Read `ASICModel` and `boardVersion` through `is_gamma_601`.
+
+The mempool difficulty fetch stays a read of `DIFFICULTY_URL`.
+
+```python
+# BAD — extra endpoint
+requests.get(f"http://{ip}/api/system/asic")
+
+# GOOD
+info = get_system_info(ip)
+if isinstance(info, str):
+    log_callback(info, "error")
+```

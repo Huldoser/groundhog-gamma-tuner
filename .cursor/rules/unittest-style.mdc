@@ -1,0 +1,25 @@
+---
+description: unittest style with mocked miner I/O
+globs: test_*.py
+alwaysApply: false
+---
+
+# Tests
+
+Tests use `unittest.TestCase` and `unittest.mock`. Session tests patch miner I/O with `patched_io` in `test_autotune.py`. Leave the network and live miners out of tests.
+
+Run `python -m unittest`.
+
+```python
+# BAD
+import pytest
+
+def test_live_board():
+    requests.get("http://192.168.1.10/api/system/info")
+
+# GOOD
+class DecisionTests(unittest.TestCase):
+    def test_overheat_steps_frequency_down(self):
+        frequency, voltage, reason = autotune.decide_adjustment(**_limits(temp=75))
+        self.assertLess(frequency, 700)
+```
