@@ -163,6 +163,40 @@ def clamp_limits(limits):
     return clamped
 
 
+_RUNNING_LIMIT_FIELDS = (
+    "min_freq",
+    "max_freq",
+    "min_volt",
+    "max_volt",
+    "max_temp",
+    "max_watts",
+    "max_vr_temp",
+)
+
+
+def refresh_running_limits(limits, record):
+    """Apply caps saved while a session is already running.
+
+    A missing field keeps the value already in use. A reversed frequency or
+    voltage pair is ignored so a bad edit cannot invert a live session.
+    """
+    if not isinstance(record, dict):
+        return limits
+    updated = dict(limits)
+    changed = False
+    for key in _RUNNING_LIMIT_FIELDS:
+        value = coerce_limit(record.get(key))
+        if value is None or value == updated.get(key):
+            continue
+        updated[key] = value
+        changed = True
+    if not changed:
+        return limits
+    if updated["min_freq"] > updated["max_freq"] or updated["min_volt"] > updated["max_volt"]:
+        return limits
+    return clamp_limits(updated)
+
+
 def normalize_input_voltage(value):
     """Return input voltage in volts. Readings above 20 are millivolts."""
     number = _as_float(value)
@@ -555,6 +589,54 @@ def _blocks_reclimb(reason):
         or "rejected shares" in text
         or "above target" in text
     )
+
+
+def frequency_block_cleared(
+    blocked_frequency,
+    voltage,
+    blocked_voltage,
+    needs_cool,
+    cooled,
+    for_rejects,
+    share,
+    limit=DEFAULT_MAX_REJECT_SHARE,
+):
+    """True when a frequency retreat may be climbed again.
+
+    Any block clears once voltage rises or a hot retreat has cooled. A block
+    that came from hardware rejects also clears after a later clean share sample.
+    `share` is None until that sample is large enough to judge.
+    """
+    if blocked_frequency is None:
+        return False
+    if blocked_voltage is not None and voltage is not None and voltage > blocked_voltage:
+        return True
+    if needs_cool and cooled:
+        return True
+    judged = _as_float(share)
+    reject_limit = DEFAULT_MAX_REJECT_SHARE if limit is None else float(limit)
+    return bool(for_rejects) and judged is not None and judged <= reject_limit
+
+
+def setpoint_to_remember(confirmed, probe, pending):
+    """Clocks worth saving when tuning stops.
+
+    An open probe has not proved its new clocks, so keep the clocks it left.
+    A retreat that was written and not yet confirmed should not resume on the
+    clocks just abandoned. Otherwise keep the last confirmed clocks.
+    """
+    if isinstance(probe, dict) and probe.get("from_freq") is not None and probe.get("from_volt") is not None:
+        return int(probe["from_freq"]), int(probe["from_volt"])
+    if pending is not None and confirmed is not None:
+        pending_frequency = int(pending[0])
+        pending_voltage = int(pending[1])
+        confirmed_frequency = int(confirmed[0])
+        confirmed_voltage = int(confirmed[1])
+        if pending_frequency < confirmed_frequency or pending_voltage < confirmed_voltage:
+            return pending_frequency, pending_voltage
+    if confirmed is not None:
+        return int(confirmed[0]), int(confirmed[1])
+    return None
 
 
 def reject_share(accepted_delta, rejected_delta, stale_delta=0):
@@ -1027,6 +1109,7 @@ def monitor_and_adjust(bitaxe_ip, bitaxe_type, interval, log_callback,
     blocked_frequency = None
     blocked_voltage = None
     blocked_needs_cool = False
+    blocked_for_rejects = False
     reject_sample = RejectSample()
     saved_signature = None
     error_samples = []
@@ -1049,6 +1132,7 @@ def monitor_and_adjust(bitaxe_ip, bitaxe_type, interval, log_callback,
                 min_input_voltage = _record_float(record, "min_input_voltage", DEFAULT_MIN_INPUT_VOLTAGE)
                 max_error_percentage = _record_float(record, "max_error_percentage", DEFAULT_MAX_ERROR_PERCENTAGE)
                 max_droop_mv = _record_float(record, "max_droop_mv", DEFAULT_MAX_DROOP_MV)
+                limits = refresh_running_limits(limits, record)
                 last_config_refresh = now
 
             voltage_step = _positive_int(runtime.get("voltage_step"), 10)
@@ -1279,10 +1363,19 @@ def monitor_and_adjust(bitaxe_ip, bitaxe_type, interval, log_callback,
             )
             if thermal_hold and cooled:
                 thermal_hold = False
-            if blocked_frequency is not None and (
-                confirmed[1] > blocked_voltage or (blocked_needs_cool and cooled)
+            if frequency_block_cleared(
+                blocked_frequency,
+                confirmed[1],
+                blocked_voltage,
+                blocked_needs_cool,
+                cooled,
+                blocked_for_rejects,
+                share,
             ):
                 blocked_frequency = None
+                blocked_voltage = None
+                blocked_needs_cool = False
+                blocked_for_rejects = False
 
             probe_ready = (
                 probe is not None
@@ -1561,6 +1654,16 @@ def monitor_and_adjust(bitaxe_ip, bitaxe_type, interval, log_callback,
                     break
                 continue
 
+            climb_cap = limits["max_freq"]
+            if hash_ceiling is not None:
+                climb_cap = min(climb_cap, hash_ceiling)
+            if phase == "climb" and reason == "increase frequency" and confirmed[0] >= climb_cap:
+                # The applied clock is already at the cap. A PLL reading a few MHz
+                # under that cap must not keep the session in climb forever.
+                reason = "frequency ceiling"
+                new_frequency = confirmed[0]
+                new_voltage = confirmed[1]
+
             if reason == "frequency ceiling" and phase == "climb":
                 phase = "trim"
                 trim_good_voltage = confirmed[1]
@@ -1633,6 +1736,7 @@ def monitor_and_adjust(bitaxe_ip, bitaxe_type, interval, log_callback,
                         blocked_frequency = confirmed[0]
                         blocked_voltage = confirmed[1]
                         blocked_needs_cool = not cooled
+                        blocked_for_rejects = "rejected shares" in (reason or "").lower()
                     if error_ok and reason in ("increase frequency", "increase voltage", "trim voltage"):
                         signature = (confirmed[0], confirmed[1], limit_wall)
                         if signature != saved_signature:
@@ -1649,7 +1753,13 @@ def monitor_and_adjust(bitaxe_ip, bitaxe_type, interval, log_callback,
                         saved_signature = (new_frequency, new_voltage, limit_wall)
                 else:
                     log_callback(f"{bitaxe_ip} -> Miner rejected the change. Setpoint left unchanged.", "warning")
-            elif phase == "hold" and hold_since is not None and not ceiling_saved and reason in (
+            else:
+                # Clocks stayed put. Wait out another full settle before the next
+                # error decision so one poll cannot walk the clocks down.
+                last_tune_time = time.time()
+            if phase == "hold" and hold_since is not None and not ceiling_saved and _same_setpoint(
+                (new_frequency, new_voltage), confirmed
+            ) and reason in (
                 "holding",
                 "holding after thermal retreat",
                 "holding after frequency retreat",
@@ -1679,6 +1789,7 @@ def monitor_and_adjust(bitaxe_ip, bitaxe_type, interval, log_callback,
             if _wait(event, interval or 5):
                 break
 
-    if confirmed is not None:
-        remember_setpoint(bitaxe_ip, confirmed[0], confirmed[1], limit_wall)
+    remembered = setpoint_to_remember(confirmed, probe, pending)
+    if remembered is not None:
+        remember_setpoint(bitaxe_ip, remembered[0], remembered[1], limit_wall)
     log_callback(f"{bitaxe_ip} -> Autotuning stopped.", "warning")

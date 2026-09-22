@@ -429,67 +429,17 @@ def local_ipv4():
     return address
 
 
-def solo_day_odds(hash_ghs, difficulty):
-    """Average days per block. None when hashrate or network difficulty is missing."""
-    rate = _plain_number(hash_ghs)
-    diff = _plain_number(difficulty)
-    if rate is None or diff is None or rate <= 0 or diff <= 0:
-        return None
-    seconds = (diff * 2 ** 32) / (rate * 1_000_000_000)
-    return seconds / 86400.0
-
-
-def format_odds_count(days):
-    number = _plain_number(days)
-    if number is None or number <= 0:
-        return ""
-    if number < 10:
-        return f"{number:.1f}"
-    return format_difficulty(number)
-
-
-def format_solo_odds(hash_ghs, difficulty):
-    """'1 in N today' from fleet hashrate and the current network difficulty."""
-    days = solo_day_odds(hash_ghs, difficulty)
-    count = format_odds_count(days)
-    if not count:
-        return ""
-    return f"1 in {count} today"
-
-
-def format_best_share_percent(best, difficulty):
-    """How close the best share is to a block, as a percent of network difficulty."""
-    share = _plain_number(best)
-    diff = _plain_number(difficulty)
-    if share is None or diff is None or share <= 0 or diff <= 0:
-        return ""
-    percent = share / diff * 100.0
-    if percent >= 1:
-        text = f"{percent:.2f}"
-    elif percent >= 0.01:
-        text = f"{percent:.4f}"
-    elif percent >= 0.000001:
-        text = f"{percent:.6f}"
-    else:
-        text = f"{percent:.2e}"
-    return f"Best share is {text}% of the network"
-
-
 def fleet_summary(rows):
-    """Online count, summed hash and watts, and the best share across the table."""
-    online = offline = climb = hold = trim = 0
+    """Online count and summed hash and watts across the table."""
+    online = offline = hold = trim = 0
     hash_sum = 0.0
     watt_sum = 0.0
     paired_watts = 0.0
     counted_hash = False
     counted_watts = False
-    best = None
     live_phases = {"climb", "hold", "trim", "skipped", "stopped"}
     for row in rows or []:
         phase = str(row.get("phase") or "").strip().lower()
-        number = _plain_number(row.get("best_exact"))
-        if number is not None and (best is None or number > best):
-            best = number
         if phase == "offline":
             offline += 1
             continue
@@ -498,9 +448,7 @@ def fleet_summary(rows):
         )
         if phase in live_phases or has_reading:
             online += 1
-        if phase == "climb":
-            climb += 1
-        elif phase == "hold":
+        if phase == "hold":
             hold += 1
         elif phase == "trim":
             trim += 1
@@ -520,14 +468,11 @@ def fleet_summary(rows):
     return {
         "online": online,
         "offline": offline,
-        "climb": climb,
         "hold": hold,
         "trim": trim,
         "hash": format_number(hash_sum, 2) if counted_hash else "-",
         "watts": format_number(watt_sum, 2) if counted_watts else "-",
         "jth": format_number(joules, 2) if joules is not None else "-",
-        "hash_ghs": hash_sum if counted_hash else 0.0,
-        "best": best,
     }
 
 
@@ -876,6 +821,7 @@ class TunerDashboard:
         self.running = False
         self.threads = []
         self.stop_event = None
+        self._miner_stops = {}
         self._status_refresh_running = False
         self._stop_in_progress = False
         self._baseline_reset_running = False
@@ -887,7 +833,6 @@ class TunerDashboard:
         self._network = {
             "difficulty": "-",
             "difficulty_title": "",
-            "difficulty_exact": None,
             "pools": [{"name": host, "online": None} for host, _port in POOLS],
         }
         self._latest_firmware = ""
@@ -944,8 +889,7 @@ class TunerDashboard:
         self._closed.set()
         self._scan_cancel.set()
         self._wake.set()
-        if self.stop_event is not None:
-            self.stop_event.set()
+        self._signal_all_stops()
         # Tuner threads are daemons. Join them so a confirmed setpoint is written
         # before the process exits. Each join uses the same budget as Stop.
         for thread in list(self.threads):
@@ -999,8 +943,8 @@ class TunerDashboard:
         with self._lock:
             if focused is not None:
                 self._focused = _as_bool(focused)
+            self._reap_threads_locked()
             summary = fleet_summary(self._rows)
-            difficulty = self._network.get("difficulty_exact")
             latest = self._latest_firmware
             miners = []
             for row in self._rows:
@@ -1018,16 +962,11 @@ class TunerDashboard:
                 "fleet": {
                     "online": summary["online"],
                     "offline": summary["offline"],
-                    "climb": summary["climb"],
                     "hold": summary["hold"],
                     "trim": summary["trim"],
                     "hash": summary["hash"],
                     "watts": summary["watts"],
                     "jth": summary["jth"],
-                },
-                "odds": {
-                    "today": format_solo_odds(summary["hash_ghs"], difficulty),
-                    "best": format_best_share_percent(summary["best"], difficulty),
                 },
                 "scan_range": dict(self._scan_range),
             }
@@ -1046,7 +985,6 @@ class TunerDashboard:
             if number is not None:
                 self._network["difficulty"] = format_difficulty(number)
                 self._network["difficulty_title"] = difficulty_title(number)
-                self._network["difficulty_exact"] = number
             self._network["pools"] = status["pools"]
 
     def _refresh_firmware(self, now=None):
@@ -1136,9 +1074,12 @@ class TunerDashboard:
                 notice = _notice("warning", "Some miners skipped", error_message.strip())
 
             stop_event = threading.Event()
+            miner_stops = {}
             threads = []
             self.log_message("Starting autotuning for selected miners...", "success")
             for index, miner in enumerate(ready_miners):
+                miner_event = threading.Event()
+                miner_stops[miner["ip"]] = miner_event
                 thread = threading.Thread(
                     target=monitor_and_adjust,
                     args=(
@@ -1157,17 +1098,20 @@ class TunerDashboard:
                         miner.get("max_vr_temp"),
                     ),
                     kwargs={
-                        "stop_event": stop_event,
+                        "stop_event": miner_event,
                         "startup_delay": index * STARTUP_STAGGER_SECONDS,
                     },
                     daemon=True,
                 )
                 thread.miner_ip = miner["ip"]
-                thread.start()
                 threads.append(thread)
 
             with self._lock:
                 self.stop_event = stop_event
+                self._miner_stops = miner_stops
+            for thread in threads:
+                thread.start()
+            with self._lock:
                 self.threads = threads
                 self.running = True
             self._wake.set()
@@ -1189,9 +1133,8 @@ class TunerDashboard:
                 return {"ok": True}
             self._stop_in_progress = True
             self.running = False
-            if self.stop_event is not None:
-                self.stop_event.set()
             threads = list(self.threads)
+        self._signal_all_stops()
         self.log_message("Stopping autotuning...", "warning")
 
         def join_threads():
@@ -1336,6 +1279,7 @@ class TunerDashboard:
             return _fail("Please select a miner to delete.", "No Selection", "warning")
         if not any(miner["ip"] == ip for miner in get_miners()):
             return _fail(f"Miner with IP {ip} was not found.")
+        self._signal_miner_stop(ip)
         remove_miner(ip)
         with self._lock:
             self._rows = [row for row in self._rows if row["ip"] != ip]
@@ -1368,6 +1312,7 @@ class TunerDashboard:
                     "Not a Gamma 601",
                 )
             miner_type = miner_type_from_info(info)
+            self._signal_miner_stop(current_ip)
 
         self._apply_miner_edit(current_ip, nickname, new_ip, miner_type)
         self.log_message(f"Updated miner settings: {nickname} ({miner_type}) at {new_ip}", "success")
@@ -1644,8 +1589,34 @@ class TunerDashboard:
                 names[ip] = name
         return names
 
+    def _signal_miner_stop(self, ip):
+        """Ask the tuner thread for one address to leave. Other miners keep running."""
+        with self._lock:
+            event = self._miner_stops.get(ip)
+        if event is not None:
+            event.set()
+
+    def _signal_all_stops(self):
+        """Ask every tuner thread to leave."""
+        with self._lock:
+            events = list(self._miner_stops.values())
+            shared = self.stop_event
+        if shared is not None:
+            shared.set()
+        for event in events:
+            event.set()
+
+    def _reap_threads_locked(self):
+        """Drop tuner threads that have already exited and mark those rows stopped."""
+        finished = [thread for thread in self.threads if not thread.is_alive()]
+        self.threads = [thread for thread in self.threads if thread.is_alive()]
+        if finished:
+            self._publish_stopped_phases(finished)
+
     def _controls_locked(self):
-        if self._stop_in_progress:
+        self._reap_threads_locked()
+        alive = bool(self.threads)
+        if self._stop_in_progress or (alive and not self.running and not self._baseline_reset_running):
             status, label = "stopping", "Stopping"
         elif self._baseline_reset_running:
             status, label = "resetting", "Resetting"
@@ -1658,6 +1629,7 @@ class TunerDashboard:
             or self.running
             or self._stop_in_progress
             or self._start_pending
+            or alive
         )
         return {
             "status": status,

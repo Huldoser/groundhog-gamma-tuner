@@ -541,6 +541,29 @@ class SnapshotTests(unittest.TestCase):
             self.assertFalse(app.running)
             self.assertIn("No miners are enabled", result["message"])
 
+    def test_remove_stops_only_that_miner_thread(self):
+        first = config.new_miner_record("BM1370 601", "10.0.0.8", "Alpha", config.get_default_config())
+        second = config.new_miner_record("BM1370 601", "10.0.0.9", "Beta", config.get_default_config())
+        events = {}
+
+        def fake_monitor(*args, **kwargs):
+            events[args[0]] = kwargs["stop_event"]
+            kwargs["stop_event"].wait(2)
+
+        with temp_config([first, second]):
+            app = TunerDashboard()
+            with mock.patch("dashboard.monitor_and_adjust", fake_monitor):
+                started = app.start_autotuner()
+                self.assertTrue(started["ok"])
+                self.assertEqual(set(events), {"10.0.0.8", "10.0.0.9"})
+                removed = app.remove_miner_address("10.0.0.8")
+                self.assertTrue(removed["ok"])
+                self.assertTrue(events["10.0.0.8"].wait(1))
+                self.assertFalse(events["10.0.0.9"].is_set())
+                app._signal_miner_stop("10.0.0.9")
+                for thread in app.threads:
+                    thread.join(timeout=2)
+
     def test_run_control_follows_tuner_state(self):
         app = TunerDashboard()
         idle = app.get_snapshot(0)["controls"]
@@ -624,7 +647,16 @@ class SnapshotTests(unittest.TestCase):
             self.assertEqual(app._rows[1]["phase"], "skipped")
             self.assertEqual(app._rows[2]["phase"], "climb")
             self.assertIn(live, app.threads)
-            self.assertEqual(app.get_snapshot(0)["controls"]["status"], "idle")
+            controls = app.get_snapshot(0)["controls"]
+            self.assertEqual(controls["status"], "stopping")
+            self.assertFalse(controls["reset_enabled"])
+            refused = app.start_autotuner()
+            self.assertFalse(refused["ok"])
+            gate.set()
+            live.join(timeout=2)
+            settled = app.get_snapshot(0)["controls"]
+            self.assertEqual(settled["status"], "idle")
+            self.assertTrue(settled["reset_enabled"])
         finally:
             gate.set()
             if live is not None:
@@ -673,35 +705,28 @@ class SnapshotTests(unittest.TestCase):
             self.assertEqual(stored["vr_temp_tolerance"], 4)
             self.assertEqual(stored["ceiling_soak_seconds"], 900)
 
-    def test_subnet_odds_fleet_and_pool(self):
+    def test_subnet_fleet_and_pool(self):
         self.assertEqual(dashboard.subnet_range_for("192.168.8.40"), ("192.168.8.1", "192.168.8.254"))
         self.assertEqual(dashboard.subnet_range_for(""), ("", ""))
         self.assertEqual(dashboard.subnet_range_for("not-an-ip"), ("", ""))
-        day = 86400 * 1_000_000_000 / 2 ** 32
-        self.assertAlmostEqual(dashboard.solo_day_odds(1, day), 1.0, places=5)
-        self.assertEqual(dashboard.format_solo_odds(1, day), "1 in 1.0 today")
-        self.assertEqual(dashboard.format_solo_odds(0, day), "")
         self.assertFalse(dashboard.wifi_is_weak(-44))
         self.assertTrue(dashboard.wifi_is_weak(-70))
         host, fallback = dashboard.pool_host({"stratumURL": "stratum+tcp://public-pool.io:23330"})
         self.assertEqual(host, "public-pool.io")
         self.assertFalse(fallback)
         rows = [
-            {"phase": "climb", "hash": "1000.00", "watts": "20.00", "best_exact": 100, "freq": "600"},
-            {"phase": "hold", "hash": "500.00", "watts": "15.00", "best_exact": 400, "freq": "500"},
-            {"phase": "offline", "hash": "900.00", "watts": "10.00", "best_exact": 9000, "freq": "400"},
+            {"phase": "climb", "hash": "1000.00", "watts": "20.00", "freq": "600"},
+            {"phase": "hold", "hash": "500.00", "watts": "15.00", "freq": "500"},
+            {"phase": "offline", "hash": "900.00", "watts": "10.00", "freq": "400"},
         ]
         summary = dashboard.fleet_summary(rows)
         self.assertEqual(summary["online"], 2)
         self.assertEqual(summary["offline"], 1)
-        self.assertEqual(summary["climb"], 1)
         self.assertEqual(summary["hold"], 1)
-        self.assertEqual(summary["hash_ghs"], 1500)
-        self.assertEqual(summary["best"], 9000)
+        self.assertNotIn("climb", summary)
         self.assertEqual(summary["jth"], "23.33")
-        self.assertTrue(dashboard.format_best_share_percent(49224525, 132757073449487.5).startswith("Best share is "))
 
-    def test_refresh_fills_fleet_and_odds(self):
+    def test_refresh_fills_fleet(self):
         app = TunerDashboard()
         app._rows = [blank_miner_row("Alpha", "10.0.0.8")]
         info = {"frequency": 640, "temp": 60, "hashRate_1m": 1000, "power": 20}
@@ -711,12 +736,12 @@ class SnapshotTests(unittest.TestCase):
                 mock.patch("dashboard.get_miner_defaults", return_value=stored), \
                 mock.patch("dashboard.load_config", return_value={}):
             app.refresh_once()
-        app._network["difficulty_exact"] = 86400 * 1000 * 1_000_000_000 / 2 ** 32
         snapshot = app.get_snapshot(0)
         self.assertNotIn("history", snapshot)
+        self.assertNotIn("odds", snapshot)
         self.assertEqual(snapshot["fleet"]["online"], 1)
         self.assertEqual(snapshot["fleet"]["hash"], "1000.00")
-        self.assertEqual(snapshot["odds"]["today"], "1 in 1.0 today")
+        self.assertEqual(snapshot["fleet"]["hold"], 1)
         self.assertIn("start", snapshot["scan_range"])
 
     def test_background_notice_for_offline_power_fault_and_overheat(self):

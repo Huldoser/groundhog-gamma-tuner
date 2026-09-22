@@ -147,11 +147,20 @@ def detect_miners(start_ip, end_ip, on_progress=None, should_cancel=None):
         except requests.exceptions.RequestException:
             continue
 
-    if detected_miners:
-        config["miners"].extend(detected_miners)
-        save_config(config)
+    if not detected_miners:
+        return []
 
-    return detected_miners
+    # Reload under the config lock. The scan holds the list it loaded at the
+    # start, and a rename, delete, or settings save during the scan has to win.
+    with _config_lock:
+        fresh = load_config()
+        known = {miner.get("ip") for miner in fresh.get("miners", [])}
+        added = [miner for miner in detected_miners if miner.get("ip") not in known]
+        if not added:
+            return []
+        fresh.setdefault("miners", []).extend(added)
+        save_config(fresh)
+    return added
 
 def load_config():
     """Load configuration settings from config.json.
