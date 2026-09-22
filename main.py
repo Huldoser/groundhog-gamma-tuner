@@ -1,9 +1,8 @@
-from gui import BitaxeAutotuningApp
+from dashboard import TunerDashboard
 
 
 if __name__ == "__main__":
     try:
-        app = BitaxeAutotuningApp()
-        app.run()
+        TunerDashboard().run()
     except KeyboardInterrupt:
         print("\nProgram interrupted and exiting cleanly...")

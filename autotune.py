@@ -203,9 +203,13 @@ def remember_setpoint(ip, frequency, voltage, wall_type):
 
 def wall_type_from_reason(reason):
     text = (reason or "").lower()
+    if "good hashrate" in text or "low hashrate" in text:
+        return "hash"
+    if "rejected shares" in text:
+        return "reject"
     if "input sag" in text:
         return "input"
-    if "silicon" in text:
+    if "silicon" in text or "above target" in text:
         return "silicon"
     if "power limit" in text or "power fault" in text or "droop" in text:
         return "power"
@@ -341,6 +345,274 @@ def expected_hashrate_from_info(info, frequency):
     return formula if formula > 0 else 0
 
 
+def good_hashrate(hash_rate, error_percentage):
+    """Measured hashes that were not invalid ASIC jobs.
+
+    None when the rate or the error percentage is missing. Error percentage is
+    the share of invalid jobs, reported separately from hashrate.
+    """
+    rate = _as_float(hash_rate)
+    error = _as_float(error_percentage)
+    if rate is None or rate <= 0 or error is None:
+        return None
+    kept = 1 - (max(error, 0.0) / 100.0)
+    if kept < 0:
+        return 0
+    return rate * kept
+
+
+def measured_hashrate(info):
+    """Prefer the 1-minute rate. Use the live rate only when the miner omits it."""
+    if not isinstance(info, dict):
+        return None
+    if "hashRate_1m" in info and info.get("hashRate_1m") is not None:
+        minute = _as_float(info.get("hashRate_1m"))
+        if minute is not None and minute > 0:
+            return minute
+        return None
+    live = _as_float(info.get("hashRate"))
+    if live is not None and live > 0:
+        return live
+    return None
+
+
+# BM1370 self-test treats delivered hashrate under 85% of expected as a miss.
+# hashRate_10m covers ten minutes, so it is only compared after the clocks have
+# been sitting still for that long.
+HASHRATE_SHORTFALL_RATIO = 0.85
+HASHRATE_10M_SETTLE_SECONDS = 10 * 60
+
+# Pool reject share that steps frequency down. Stale and non-silicon results are left out.
+# One counted reject must not cross the limit, so a sample needs more than 100 judged shares.
+DEFAULT_MAX_REJECT_SHARE = 0.01
+MIN_JUDGED_SHARES = 100
+ABOVE_TARGET_WINDOWS = 2
+_STALE_REJECT_MARKERS = ("job not found", "stale")
+_ABOVE_TARGET_MARKERS = ("above target", "low difficulty")
+_HARDWARE_REJECT_MARKERS = ("invalid", "hardware")
+_IGNORED_REJECT_MARKERS = ("duplicate", "ntime", "worker", "unauthorized", "mismatch")
+
+# BM1370 expected hashrate is frequency * 2040 / 1000 GH/s. A 5 MHz step is 10.2 GH/s.
+BM1370_HASHRATE_PER_MHZ = 2.04
+
+
+def average_error(samples):
+    """Mean of the settle-window error samples. None when the window is empty."""
+    values = []
+    for sample in samples or []:
+        number = _as_float(sample)
+        if number is not None:
+            values.append(number)
+    if not values:
+        return None
+    return sum(values) / len(values)
+
+
+def hashrate_well_below_expected(hash_rate, expected, ratio=HASHRATE_SHORTFALL_RATIO):
+    """True when a settled hashrate is under the BM1370 self-test fraction of expected."""
+    rate = _as_float(hash_rate)
+    target = _as_float(expected)
+    if rate is None or target is None or target <= 0:
+        return False
+    return rate < (target * ratio)
+
+
+def rounded_pll_frequency(value):
+    """Nearest whole MHz for a PLL reading. None when the miner did not report one."""
+    number = _as_float(value)
+    if number is None or number <= 0:
+        return None
+    return int(number + 0.5)
+
+
+def reject_reason_class(message):
+    """Classify a pool reject string.
+
+    Stale and non-silicon results do not move the clocks. Above-target results
+    are a silicon signal. Other hardware results can step frequency down.
+    """
+    text = str(message or "").lower()
+    if any(marker in text for marker in _ABOVE_TARGET_MARKERS):
+        return "above"
+    if any(marker in text for marker in _STALE_REJECT_MARKERS):
+        return "stale"
+    if any(marker in text for marker in _IGNORED_REJECT_MARKERS):
+        return "ignore"
+    if any(marker in text for marker in _HARDWARE_REJECT_MARKERS):
+        return "hardware"
+    return "ignore"
+
+
+def _stale_reject_reason(message):
+    return reject_reason_class(message) == "stale"
+
+
+def _reject_reason_counts(reasons):
+    counts = {}
+    if not isinstance(reasons, list):
+        return counts
+    for item in reasons:
+        if not isinstance(item, dict):
+            continue
+        count = _as_float(item.get("count"))
+        if count is None:
+            continue
+        counts[str(item.get("message") or "")] = count
+    return counts
+
+
+def reject_class_deltas(previous, current):
+    """New rejects in this window, split by reject_reason_class."""
+    previous_counts = _reject_reason_counts(previous)
+    totals = {"stale": 0.0, "above": 0.0, "hardware": 0.0, "ignore": 0.0}
+    for message, count in _reject_reason_counts(current).items():
+        delta = count - previous_counts.get(message, 0.0)
+        if delta > 0:
+            totals[reject_reason_class(message)] += delta
+    return totals
+
+
+def stale_reject_delta(previous, current):
+    """How many new rejects are stale pool results, from the reason counters."""
+    return reject_class_deltas(previous, current)["stale"]
+
+
+class RejectSample:
+    """Accumulate judged shares until the sample is large enough to act on.
+
+    Above-target has to stay high for two full samples. One difficulty-change
+    burst does not move the clocks.
+    """
+
+    def __init__(self):
+        self.accepted = 0.0
+        self.hardware = 0.0
+        self.above = 0.0
+        self.above_streak = 0
+
+    def reset(self):
+        self.accepted = 0.0
+        self.hardware = 0.0
+        self.above = 0.0
+        self.above_streak = 0
+
+    def add(self, accepted, hardware, above):
+        for value, name in ((accepted, "accepted"), (hardware, "hardware"), (above, "above")):
+            number = _as_float(value)
+            if number is not None and number > 0:
+                setattr(self, name, getattr(self, name) + number)
+
+    def judge(self, minimum=MIN_JUDGED_SHARES, limit=DEFAULT_MAX_REJECT_SHARE):
+        """Return (hardware share or None, above-target is sustained).
+
+        None means the sample is still too small. The counters reset once it qualifies.
+        """
+        judged = self.accepted + self.hardware + self.above
+        if judged < minimum:
+            return None, False
+        hardware_total = self.accepted + self.hardware
+        hardware_share = (self.hardware / hardware_total) if hardware_total > 0 else 0.0
+        above_total = self.accepted + self.above
+        above_share = (self.above / above_total) if above_total > 0 else 0.0
+        if above_share > limit:
+            self.above_streak += 1
+        else:
+            self.above_streak = 0
+        sustained = self.above_streak >= ABOVE_TARGET_WINDOWS
+        self.accepted = 0.0
+        self.hardware = 0.0
+        self.above = 0.0
+        return hardware_share, sustained
+
+
+def expected_step_gain(frequency_step):
+    """GH/s a BM1370 should gain from this many MHz, before errors."""
+    step = _as_float(frequency_step)
+    if step is None or step <= 0:
+        step = 1
+    return step * BM1370_HASHRATE_PER_MHZ
+
+
+def good_hashrate_held(baseline_good, current_good, band):
+    """True when good hashrate did not fall by more than `band` GH/s.
+
+    None when either sample is missing, so the caller waits.
+    """
+    if baseline_good is None or current_good is None:
+        return None
+    allowed = _as_float(band)
+    if allowed is None or allowed < 0:
+        allowed = 0
+    return current_good >= (baseline_good - allowed)
+
+
+def _blocks_reclimb(reason):
+    """True when this retreat should not be climbed back into immediately."""
+    text = (reason or "").lower()
+    return (
+        "silicon wall" in text
+        or "low hashrate" in text
+        or "rejected shares" in text
+        or "above target" in text
+    )
+
+
+def reject_share(accepted_delta, rejected_delta, stale_delta=0):
+    """Share of new rejects that are not stale. None when the window had no judged shares."""
+    accepted = _as_float(accepted_delta)
+    rejected = _as_float(rejected_delta)
+    if accepted is None or rejected is None or accepted < 0 or rejected < 0:
+        return None
+    stale = _as_float(stale_delta)
+    if stale is None or stale < 0:
+        stale = 0.0
+    if stale > rejected:
+        stale = rejected
+    bad = rejected - stale
+    total = accepted + bad
+    if total <= 0:
+        return None
+    return bad / total
+
+
+def cooled_after_retreat(temp, vr_temp, max_temp, max_vr_temp, temp_tolerance, vr_temp_tolerance):
+    """True when both reported sensors are at least one tolerance band under their caps.
+
+    A missing regulator reading does not keep the latch. The climb still waits
+    for that sensor on its own.
+    """
+    temp_value = _as_float(temp)
+    if temp_value is None:
+        return False
+    asic_band = temp_tolerance if temp_tolerance and temp_tolerance > 0 else 0
+    if temp_value > (max_temp - asic_band):
+        return False
+    vr_value = _as_float(vr_temp)
+    if vr_value is None:
+        return True
+    vr_band = vr_temp_tolerance if vr_temp_tolerance and vr_temp_tolerance > 0 else 0
+    return vr_value <= (max_vr_temp - vr_band)
+
+
+def frequency_step_paid(baseline_good, current_good, baseline_actual=None, current_actual=None, band=None):
+    """True when a settled frequency step did not give up more good hashrate than it is worth.
+
+    None when either good-hashrate sample is missing, so the caller waits.
+    A dip inside `band` GH/s is noise. The default band is one 5 MHz BM1370 step.
+    When both PLL clocks are known, a clock that did not rise did not pay,
+    even if the 1-minute rate twitched upward.
+    """
+    if baseline_good is None or current_good is None:
+        return None
+    baseline_clock = _as_float(baseline_actual)
+    current_clock = _as_float(current_actual)
+    if baseline_clock is not None and current_clock is not None and current_clock <= baseline_clock:
+        return False
+    if band is None:
+        band = expected_step_gain(5)
+    return good_hashrate_held(baseline_good, current_good, band)
+
+
 def _guard_bounds(current_frequency, current_voltage, new_frequency, new_voltage,
                   min_freq, max_freq, min_volt, max_volt, reason):
     new_frequency = _clamp(int(new_frequency), min_freq, max_freq)
@@ -397,15 +669,25 @@ def decide_adjustment(
     trim_good_voltage=None,
     max_error_percentage=DEFAULT_MAX_ERROR_PERCENTAGE,
     vr_temp_tolerance=3,
+    thermal_hold=False,
+    reject_share=None,
+    max_reject_share=DEFAULT_MAX_REJECT_SHARE,
+    hashrate_short=False,
+    blocked_frequency=None,
+    above_target_high=False,
 ):
     """Choose the next frequency and voltage.
 
     Returns (frequency, voltage, reason). Voltage is never raised while stepping down.
-    Either temperature sensor can hold the climb or force a step down.
+    Climb while both sensors are at or under their caps. `thermal_hold` is set after
+    a thermal retreat and blocks the next climb until the caller clears it.
+    `blocked_frequency` is a clock that just failed for errors or rejects. The climb
+    stops short of it until the caller clears the block.
     A missing regulator temperature blocks climbs and voltage increases.
-    `tier_list` is accepted and ignored so older callers keep working.
+    `tier_list`, `expected_hashrate`, and `shares_rejected_delta` stay in the
+    signature so older callers keep working.
     """
-    del tier_list, expected_hashrate
+    del tier_list, expected_hashrate, shares_rejected_delta
     frequency_step = max(int(frequency_step), 1)
     voltage_step = max(int(voltage_step), 1)
     temp_tolerance = temp_tolerance if temp_tolerance is not None else 0
@@ -459,27 +741,42 @@ def decide_adjustment(
             frequency_step, voltage_step, "core voltage droop"
         )
 
+    rate = _as_float(hash_rate)
+    if rate is not None and rate <= 0:
+        return current_frequency, current_voltage, "holding at zero hashrate"
+
     error = _as_float(error_percentage)
     error_budget = DEFAULT_MAX_ERROR_PERCENTAGE if max_error_percentage is None else float(max_error_percentage)
     error_high = error is not None and error > error_budget
-    asic_in_band = temp_value >= (max_temp - temp_tolerance)
-    vr_in_band = vr_value is not None and vr_value >= (max_vr_temp - vr_tolerance)
-    in_band = asic_in_band or vr_in_band
+    short_hash = bool(hashrate_short)
+    above_target_bad = bool(above_target_high)
+    quality_bad = error_high or short_hash or above_target_bad
+    if above_target_bad and not error_high and not short_hash:
+        quality_tag = "above target"
+    elif short_hash and not error_high:
+        quality_tag = "low hashrate"
+    else:
+        quality_tag = "silicon wall"
 
-    if shares_rejected_delta and shares_rejected_delta > 0 and not error_high:
-        return current_frequency, current_voltage, "holding after a pool reject"
+    share = _as_float(reject_share)
+    reject_limit = DEFAULT_MAX_REJECT_SHARE if max_reject_share is None else float(max_reject_share)
+    if not above_target_bad and share is not None and share > reject_limit:
+        return _apply_step_down(
+            current_frequency, current_voltage, min_freq, max_freq, min_volt, max_volt,
+            frequency_step, voltage_step, "rejected shares"
+        )
 
-    if error_high:
+    if quality_bad:
         if phase == "trim" and trim_good_voltage is not None and current_voltage < int(trim_good_voltage):
             restored = _clamp(int(trim_good_voltage), min_volt, max_volt)
             return _guard_bounds(
                 current_frequency, current_voltage, current_frequency, restored,
                 min_freq, max_freq, min_volt, max_volt, "restore voltage"
             )
-        if phase == "hold" or in_band or current_voltage >= max_volt:
+        if phase == "hold" or thermal_hold or current_voltage >= max_volt:
             return _apply_step_down(
                 current_frequency, current_voltage, min_freq, max_freq, min_volt, max_volt,
-                frequency_step, voltage_step, "silicon wall"
+                frequency_step, voltage_step, quality_tag
             )
         if vr_value is None:
             return current_frequency, current_voltage, "holding for telemetry"
@@ -491,11 +788,11 @@ def decide_adjustment(
             )
         return _apply_step_down(
             current_frequency, current_voltage, min_freq, max_freq, min_volt, max_volt,
-            frequency_step, voltage_step, "silicon wall"
+            frequency_step, voltage_step, quality_tag
         )
 
-    if in_band:
-        return current_frequency, current_voltage, "holding inside temperature band"
+    if thermal_hold and phase == "climb":
+        return current_frequency, current_voltage, "holding after thermal retreat"
 
     if error is None:
         return current_frequency, current_voltage, "holding for error percentage"
@@ -527,6 +824,9 @@ def decide_adjustment(
         return current_frequency, current_voltage, "holding for telemetry"
 
     new_frequency = min(max_freq, current_frequency + frequency_step)
+    blocked = coerce_limit(blocked_frequency)
+    if blocked is not None and new_frequency > current_frequency and new_frequency >= blocked:
+        return current_frequency, current_voltage, "holding after frequency retreat"
     return _guard_bounds(
         current_frequency, current_voltage, new_frequency, current_voltage,
         min_freq, max_freq, min_volt, max_volt, "increase frequency"
@@ -719,7 +1019,25 @@ def monitor_and_adjust(bitaxe_ip, bitaxe_type, interval, log_callback,
     hold_since = None
     ceiling_saved = False
     limit_wall = record.get("wall_type") or ""
+    # Frequency step or voltage trim waiting on a settled good-hashrate reading.
+    # hash_ceiling is the last clock that still paid, and only after the higher
+    # clock failed at max voltage or while a thermal retreat is latched.
+    probe = None
+    hash_ceiling = None
+    blocked_frequency = None
+    blocked_voltage = None
+    blocked_needs_cool = False
+    reject_sample = RejectSample()
     saved_signature = None
+    error_samples = []
+    window_positive_hash = False
+    window_zero_hash = False
+    zero_restarted = False
+    thermal_hold = False
+    setpoint_since = None
+    last_accepted = None
+    last_rejected = None
+    last_reasons = None
     _publish_status(bitaxe_ip, phase=phase, wall_type=limit_wall)
 
     while not event.is_set():
@@ -759,8 +1077,14 @@ def monitor_and_adjust(bitaxe_ip, bitaxe_type, interval, log_callback,
             if pending is not None and _numbers_match(reported_frequency, pending[0]) and _numbers_match(reported_voltage, pending[1]):
                 confirmed = pending
                 pending = None
+                if setpoint_since is None:
+                    setpoint_since = now
+                pll_note = ""
+                pll_at_confirm = rounded_pll_frequency(info.get("actualFrequency"))
+                if pll_at_confirm is not None and pll_at_confirm != confirmed[0]:
+                    pll_note = f" PLL is {pll_at_confirm} MHz."
                 log_callback(
-                    f"{bitaxe_ip} -> Confirmed {confirmed[0]} MHz / {confirmed[1]} mV.",
+                    f"{bitaxe_ip} -> Confirmed {confirmed[0]} MHz / {confirmed[1]} mV.{pll_note}",
                     "success",
                 )
             elif pending is not None and now >= settle_until:
@@ -770,6 +1094,8 @@ def monitor_and_adjust(bitaxe_ip, bitaxe_type, interval, log_callback,
                 )
                 if _as_float(reported_frequency) is not None and _as_float(reported_voltage) is not None:
                     confirmed = (int(float(reported_frequency)), int(float(reported_voltage)))
+                    if setpoint_since is None:
+                        setpoint_since = now
                 pending = None
             elif (
                 confirmed is None
@@ -778,6 +1104,8 @@ def monitor_and_adjust(bitaxe_ip, bitaxe_type, interval, log_callback,
                 and _as_float(reported_voltage) is not None
             ):
                 confirmed = (int(float(reported_frequency)), int(float(reported_voltage)))
+                if setpoint_since is None:
+                    setpoint_since = now
                 log_callback(
                     f"{bitaxe_ip} -> Using reported setpoint {confirmed[0]} MHz / {confirmed[1]} mV.",
                     "info",
@@ -793,6 +1121,20 @@ def monitor_and_adjust(bitaxe_ip, bitaxe_type, interval, log_callback,
             power = info.get("power") if "power" in info else None
             settling = pending is not None or now < settle_until
             error_percentage = _as_float(info.get("errorPercentage")) if _reports_error_percentage(info) else None
+
+            if pending is None and confirmed is not None:
+                if error_percentage is not None:
+                    error_samples.append(error_percentage)
+                if live_hash is not None or minute_hash is not None:
+                    positive_hash = (
+                        (live_hash is not None and live_hash > 0)
+                        or (minute_hash is not None and minute_hash > 0)
+                    )
+                    if positive_hash:
+                        window_positive_hash = True
+                        zero_restarted = False
+                    else:
+                        window_zero_hash = True
 
             if not settling and live_hash is not None and live_hash > 0:
                 sample = round(live_hash, 2)
@@ -819,7 +1161,14 @@ def monitor_and_adjust(bitaxe_ip, bitaxe_type, interval, log_callback,
                 log_callback(restart_bitaxe(bitaxe_ip), "warning")
                 hashrate_history.clear()
                 rolling_hashrate.clear()
+                error_samples.clear()
+                window_positive_hash = False
+                window_zero_hash = False
                 last_shares = None
+                last_accepted = None
+                last_rejected = None
+                last_reasons = None
+                reject_sample.reset()
                 settle_until = time.time() + refresh_interval
                 last_tune_time = time.time()
                 if _wait(event, interval):
@@ -863,26 +1212,235 @@ def monitor_and_adjust(bitaxe_ip, bitaxe_type, interval, log_callback,
                     break
                 continue
 
-            shares = info.get("sharesRejected")
-            shares_value = _as_float(shares)
+            accepted_now = _as_float(info.get("sharesAccepted"))
+            rejected_now = _as_float(info.get("sharesRejected"))
+            reasons_now = info.get("sharesRejectedReasons")
             shares_delta = 0
-            if last_shares is not None and shares_value is not None:
-                shares_delta = shares_value - last_shares
-            if shares_value is not None:
-                last_shares = shares_value
+            share = None
+            above_target_high = False
+            if (
+                last_accepted is not None
+                and last_rejected is not None
+                and accepted_now is not None
+                and rejected_now is not None
+                and accepted_now >= last_accepted
+                and rejected_now >= last_rejected
+            ):
+                shares_delta = rejected_now - last_rejected
+                classes = reject_class_deltas(last_reasons, reasons_now)
+                reject_sample.add(
+                    accepted_now - last_accepted,
+                    classes["hardware"],
+                    classes["above"],
+                )
+                share, above_target_high = reject_sample.judge(
+                    MIN_JUDGED_SHARES,
+                    DEFAULT_MAX_REJECT_SHARE,
+                )
+            if accepted_now is not None:
+                last_accepted = accepted_now
+            if rejected_now is not None:
+                last_rejected = rejected_now
+                last_shares = rejected_now
+            if isinstance(reasons_now, list):
+                last_reasons = reasons_now
 
-            average_hashrate = (sum(rolling_hashrate) / len(rolling_hashrate)) if rolling_hashrate else None
+            window_error = average_error(error_samples)
+            if window_error is not None:
+                error_percentage = window_error
+            error_samples.clear()
+            if window_zero_hash and not window_positive_hash:
+                average_hashrate = 0
+            else:
+                average_hashrate = (sum(rolling_hashrate) / len(rolling_hashrate)) if rolling_hashrate else None
+            window_zero_hash = False
+            window_positive_hash = False
+
+            hashrate_short = False
+            if setpoint_since is not None and (time.time() - setpoint_since) >= HASHRATE_10M_SETTLE_SECONDS:
+                hashrate_short = hashrate_well_below_expected(info.get("hashRate_10m"), expected_hashrate)
+
             error_budget = max_error_percentage
-            error_ok = error_percentage is not None and error_percentage <= error_budget
-            if phase == "trim" and error_ok:
+            error_ok = (
+                error_percentage is not None
+                and error_percentage <= error_budget
+                and not hashrate_short
+            )
+            if phase == "trim" and error_ok and probe is None:
                 trim_good_voltage = confirmed[1]
 
+            cooled = cooled_after_retreat(
+                _as_float(temp),
+                _as_float(vr_temp),
+                limits["max_temp"],
+                limits["max_vr_temp"],
+                temp_tolerance,
+                vr_temp_tolerance,
+            )
+            if thermal_hold and cooled:
+                thermal_hold = False
+            if blocked_frequency is not None and (
+                confirmed[1] > blocked_voltage or (blocked_needs_cool and cooled)
+            ):
+                blocked_frequency = None
+
+            probe_ready = (
+                probe is not None
+                and not immediate_retreat
+                and pending is None
+                and confirmed is not None
+                and confirmed[0] == probe["to_freq"]
+                and confirmed[1] == probe["to_volt"]
+                and now >= settle_until
+            )
+            if probe_ready:
+                current_good = good_hashrate(measured_hashrate(info), error_percentage)
+                kind = probe.get("kind") or "frequency"
+                band = expected_step_gain(frequency_step)
+                if kind == "trim":
+                    paid = good_hashrate_held(probe["baseline"], current_good, band)
+                else:
+                    paid = frequency_step_paid(
+                        probe["baseline"],
+                        current_good,
+                        probe.get("actual"),
+                        info.get("actualFrequency"),
+                        band,
+                    )
+                if paid is None:
+                    log_callback(f"{bitaxe_ip} -> holding for good hashrate.", "info")
+                    last_tune_time = time.time()
+                    _publish_status(
+                        bitaxe_ip,
+                        phase=phase,
+                        wall_type=limit_wall,
+                        error_percentage=error_percentage,
+                    )
+                    if _wait(event, interval):
+                        break
+                    continue
+                if not paid:
+                    back_frequency = probe["from_freq"]
+                    back_voltage = probe["from_volt"]
+                    failed_frequency = probe["to_freq"]
+                    baseline_clock = _as_float(probe.get("actual"))
+                    actual_now = _as_float(info.get("actualFrequency"))
+                    clock_stuck = (
+                        kind != "trim"
+                        and baseline_clock is not None
+                        and actual_now is not None
+                        and actual_now <= baseline_clock
+                    )
+                    can_raise_voltage = (
+                        kind != "trim"
+                        and not clock_stuck
+                        and not thermal_hold
+                        and _as_float(vr_temp) is not None
+                        and confirmed[1] < limits["max_volt"]
+                    )
+                    if can_raise_voltage:
+                        raised_voltage = min(limits["max_volt"], confirmed[1] + voltage_step)
+                        log_callback(
+                            f"{bitaxe_ip} -> {failed_frequency} MHz lost good hashrate. "
+                            f"Raising voltage to {raised_voltage} mV and retrying.",
+                            "info",
+                        )
+                        applied_settings = set_system_settings(bitaxe_ip, raised_voltage, failed_frequency)
+                        log_callback(applied_settings, "info")
+                        last_tune_time = time.time()
+                        if settings_were_applied(applied_settings):
+                            probe = dict(probe)
+                            probe["to_volt"] = raised_voltage
+                            pending = (failed_frequency, raised_voltage)
+                            setpoint_since = None
+                            settle_until = time.time() + refresh_interval
+                            hashrate_history.clear()
+                            rolling_hashrate.clear()
+                            error_samples.clear()
+                        else:
+                            log_callback(
+                                f"{bitaxe_ip} -> Miner rejected the change. Setpoint left unchanged.",
+                                "warning",
+                            )
+                        if _wait(event, interval):
+                            break
+                        continue
+                    if kind == "trim":
+                        log_callback(
+                            f"{bitaxe_ip} -> {confirmed[1]} mV lowered good hashrate. "
+                            f"Restoring {back_voltage} mV.",
+                            "info",
+                        )
+                    else:
+                        clock_note = f" PLL stayed at {actual_now:g} MHz." if clock_stuck else ""
+                        log_callback(
+                            f"{bitaxe_ip} -> {failed_frequency} MHz did not hold good hashrate. "
+                            f"Stepping back to {back_frequency} MHz.{clock_note}",
+                            "info",
+                        )
+                    reverted = _same_setpoint((back_frequency, back_voltage), confirmed)
+                    if not reverted:
+                        applied_settings = set_system_settings(bitaxe_ip, back_voltage, back_frequency)
+                        log_callback(applied_settings, "info")
+                        last_tune_time = time.time()
+                        reverted = settings_were_applied(applied_settings)
+                        if reverted:
+                            pending = (back_frequency, back_voltage)
+                            setpoint_since = None
+                            settle_until = time.time() + refresh_interval
+                            hashrate_history.clear()
+                            rolling_hashrate.clear()
+                            error_samples.clear()
+                        else:
+                            log_callback(
+                                f"{bitaxe_ip} -> Miner rejected the change. Setpoint left unchanged.",
+                                "warning",
+                            )
+                    if reverted:
+                        probe = None
+                        if kind == "trim":
+                            phase = "hold"
+                            hold_since = time.time()
+                            ceiling_saved = False
+                            trim_good_voltage = back_voltage
+                            log_callback(
+                                f"{bitaxe_ip} -> Holding {back_frequency} MHz / {back_voltage} mV.",
+                                "success",
+                            )
+                        else:
+                            hash_ceiling = back_frequency
+                            limit_wall = wall_type_from_reason("step frequency down after good hashrate")
+                        _publish_status(
+                            bitaxe_ip,
+                            phase=phase,
+                            wall_type=limit_wall,
+                            error_percentage=error_percentage,
+                        )
+                    if _wait(event, interval):
+                        break
+                    continue
+                if kind == "trim":
+                    trim_good_voltage = confirmed[1]
+                    log_callback(
+                        f"{bitaxe_ip} -> Kept {confirmed[1]} mV. Good hashrate held.",
+                        "success",
+                    )
+                else:
+                    log_callback(
+                        f"{bitaxe_ip} -> Kept {confirmed[0]} MHz. Good hashrate held.",
+                        "success",
+                    )
+                probe = None
+
             def choose(frequency, voltage):
+                climb_cap = limits["max_freq"]
+                if hash_ceiling is not None:
+                    climb_cap = min(climb_cap, hash_ceiling)
                 return decide_adjustment(
                     frequency,
                     voltage,
                     limits["min_freq"],
-                    limits["max_freq"],
+                    climb_cap,
                     limits["min_volt"],
                     limits["max_volt"],
                     limits["max_temp"],
@@ -908,24 +1466,34 @@ def monitor_and_adjust(bitaxe_ip, bitaxe_type, interval, log_callback,
                     trim_good_voltage=trim_good_voltage,
                     max_error_percentage=max_error_percentage,
                     vr_temp_tolerance=vr_temp_tolerance,
+                    thermal_hold=thermal_hold,
+                    reject_share=share,
+                    hashrate_short=hashrate_short,
+                    blocked_frequency=blocked_frequency,
+                    above_target_high=above_target_high,
                 )
 
-            new_frequency, new_voltage, reason = choose(confirmed[0], confirmed[1])
+            pll_frequency = rounded_pll_frequency(info.get("actualFrequency"))
+            decision_frequency = pll_frequency if pll_frequency is not None else confirmed[0]
+            new_frequency, new_voltage, reason = choose(decision_frequency, confirmed[1])
             reported_frequency_number = _as_float(reported_frequency)
             reported_voltage_number = _as_float(reported_voltage)
+            jump_frequency = pll_frequency if pll_frequency is not None else (
+                int(reported_frequency_number) if reported_frequency_number is not None else None
+            )
             if (
-                reported_frequency_number is not None
+                jump_frequency is not None
                 and reported_voltage_number is not None
                 and _proposal_jumps_above_report(
                     new_frequency,
                     new_voltage,
-                    int(reported_frequency_number),
+                    jump_frequency,
                     int(reported_voltage_number),
                     frequency_step,
                     voltage_step,
                 )
             ):
-                confirmed = (int(reported_frequency_number), int(reported_voltage_number))
+                confirmed = (jump_frequency, int(reported_voltage_number))
                 log_callback(
                     f"{bitaxe_ip} -> Reported {confirmed[0]} MHz / {confirmed[1]} mV. "
                     "Following the miner instead of jumping.",
@@ -936,6 +1504,43 @@ def monitor_and_adjust(bitaxe_ip, bitaxe_type, interval, log_callback,
                     new_frequency = confirmed[0] + frequency_step
                 if new_voltage > confirmed[1] + voltage_step:
                     new_voltage = confirmed[1] + voltage_step
+                decision_frequency = confirmed[0]
+
+            if _same_setpoint((new_frequency, new_voltage), (decision_frequency, confirmed[1])):
+                new_frequency = confirmed[0]
+                new_voltage = confirmed[1]
+
+            if reason == "increase frequency" and good_hashrate(measured_hashrate(info), error_percentage) is None:
+                new_frequency = confirmed[0]
+                new_voltage = confirmed[1]
+                reason = "holding for good hashrate"
+
+            if reason == "holding at zero hashrate":
+                if not zero_restarted:
+                    log_callback(
+                        f"{bitaxe_ip} -> Hashrate is 0 GH/s after settle. Restarting...",
+                        "error",
+                    )
+                    log_callback(restart_bitaxe(bitaxe_ip), "warning")
+                    zero_restarted = True
+                    error_samples.clear()
+                    hashrate_history.clear()
+                    rolling_hashrate.clear()
+                    last_shares = None
+                    last_accepted = None
+                    last_rejected = None
+                    last_reasons = None
+                    reject_sample.reset()
+                    settle_until = time.time() + refresh_interval
+                    last_tune_time = time.time()
+                else:
+                    log_callback(
+                        f"{bitaxe_ip} -> Hashrate still 0 GH/s after restart. Holding.",
+                        "error",
+                    )
+                if _wait(event, interval):
+                    break
+                continue
 
             if reason == "frequency ceiling" and phase == "climb":
                 phase = "trim"
@@ -947,7 +1552,10 @@ def monitor_and_adjust(bitaxe_ip, bitaxe_type, interval, log_callback,
                 continue
 
             leaving_hold = phase in ("hold", "trim") and (
-                reason.startswith("step frequency") or reason.startswith("step voltage") or "silicon wall" in reason
+                reason.startswith("step frequency")
+                or reason.startswith("step voltage")
+                or "silicon wall" in reason
+                or "above target" in reason
             )
             if reason in ("trim complete", "restore voltage"):
                 if phase != "hold":
@@ -964,6 +1572,8 @@ def monitor_and_adjust(bitaxe_ip, bitaxe_type, interval, log_callback,
             wall = wall_type_from_reason(reason)
             if wall:
                 limit_wall = wall
+            if wall == "thermal":
+                thermal_hold = True
             log_callback(f"{bitaxe_ip} -> {reason}.", "info")
             _publish_status(bitaxe_ip, phase=phase, wall_type=limit_wall, error_percentage=error_percentage)
 
@@ -972,15 +1582,43 @@ def monitor_and_adjust(bitaxe_ip, bitaxe_type, interval, log_callback,
                 log_callback(applied_settings, "info")
                 last_tune_time = time.time()
                 if settings_were_applied(applied_settings):
+                    if reason == "increase frequency":
+                        probe = {
+                            "kind": "frequency",
+                            "from_freq": confirmed[0],
+                            "from_volt": confirmed[1],
+                            "to_freq": new_frequency,
+                            "to_volt": new_voltage,
+                            "baseline": good_hashrate(measured_hashrate(info), error_percentage),
+                            "actual": _as_float(info.get("actualFrequency")),
+                        }
+                    elif reason == "trim voltage":
+                        probe = {
+                            "kind": "trim",
+                            "from_freq": confirmed[0],
+                            "from_volt": confirmed[1],
+                            "to_freq": new_frequency,
+                            "to_volt": new_voltage,
+                            "baseline": good_hashrate(measured_hashrate(info), error_percentage),
+                            "actual": None,
+                        }
+                    elif probe is not None:
+                        probe = None
+                    if new_frequency < confirmed[0] and _blocks_reclimb(reason):
+                        blocked_frequency = confirmed[0]
+                        blocked_voltage = confirmed[1]
+                        blocked_needs_cool = not cooled
                     if error_ok and reason in ("increase frequency", "increase voltage", "trim voltage"):
                         signature = (confirmed[0], confirmed[1], limit_wall)
                         if signature != saved_signature:
                             remember_setpoint(bitaxe_ip, confirmed[0], confirmed[1], limit_wall)
                             saved_signature = signature
                     pending = (new_frequency, new_voltage)
+                    setpoint_since = None
                     settle_until = time.time() + refresh_interval
                     hashrate_history.clear()
                     rolling_hashrate.clear()
+                    error_samples.clear()
                     if leaving_hold:
                         remember_setpoint(bitaxe_ip, new_frequency, new_voltage, limit_wall)
                         saved_signature = (new_frequency, new_voltage, limit_wall)
@@ -988,8 +1626,8 @@ def monitor_and_adjust(bitaxe_ip, bitaxe_type, interval, log_callback,
                     log_callback(f"{bitaxe_ip} -> Miner rejected the change. Setpoint left unchanged.", "warning")
             elif phase == "hold" and hold_since is not None and not ceiling_saved and reason in (
                 "holding",
-                "holding inside temperature band",
-                "holding after a pool reject",
+                "holding after thermal retreat",
+                "holding after frequency retreat",
             ):
                 if time.time() - hold_since >= soak_seconds:
                     remember_setpoint(bitaxe_ip, confirmed[0], confirmed[1], limit_wall)
@@ -1016,4 +1654,6 @@ def monitor_and_adjust(bitaxe_ip, bitaxe_type, interval, log_callback,
             if _wait(event, interval or 5):
                 break
 
+    if confirmed is not None:
+        remember_setpoint(bitaxe_ip, confirmed[0], confirmed[1], limit_wall)
     log_callback(f"{bitaxe_ip} -> Autotuning stopped.", "warning")

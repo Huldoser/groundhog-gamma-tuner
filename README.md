@@ -1,8 +1,8 @@
-# Bitaxe Gamma 601 Auto-Tuner
+# Groundhog Gamma Tuner
 
 A personal desktop tuner for one setup: custom-cooled Bitaxe Gamma 601 boards (ASIC BM1370, board version 601) on a Windows ARM tablet. The clocks, voltage, temperatures, and power guard in this repository are highly optimized for that cooling and that power supply. The app checks the live board and saves a miner only when AxeOS reports a BM1370 on board 601. It refuses every other board. It is not a tuner for a stock Gamma, and it is not a multi-model Bitaxe app.
 
-It runs as a Python Tk window, watches the miner's AxeOS API, and adjusts frequency and voltage to hold a higher hash rate without crossing that board's limits.
+It runs as a local dashboard window, watches the miner's AxeOS API, and adjusts frequency and voltage to hold a higher hash rate without crossing that board's limits. The page is a file inside that window. It is not a site, and it does not listen on the network.
 
 ## Credit
 
@@ -35,8 +35,9 @@ Those targets match this cooling and this power supply. Another board, a stock c
 ## Requirements
 
 - Windows on ARM tablet
-- Python 3 for Windows ARM64, from [python.org](https://www.python.org/downloads/windows/). The installer includes Tkinter.
-- The `requests` package listed in `requirements.txt`
+- Python 3 for Windows ARM64, from [python.org](https://www.python.org/downloads/windows/)
+- The packages in `requirements.txt` (`requests` and `pywebview`)
+- The Edge WebView2 runtime, which Windows 11 already includes
 
 ## Install
 
@@ -52,7 +53,7 @@ pip install -r requirements.txt
 python main.py
 ```
 
-The tablet and the Gamma 601 need to be on the same network. Add the miner by IP, or scan a range. The app saves a miner only after AxeOS reports a BM1370 on board 601.
+That opens the dashboard in its own window. The tablet and the Gamma 601 need to be on the same network. Add the miner by IP, or scan a range. The app saves a miner only after AxeOS reports a BM1370 on board 601.
 
 ## Desktop shortcut
 
@@ -63,7 +64,7 @@ Right-click `launch.bat` and choose **Send to > Desktop (create shortcut)**. Tha
 Use Task Scheduler so the window opens after you sign in.
 
 1. Press Win+R, type `taskschd.msc`, and press Enter.
-2. Choose **Create Basic Task**. Name it `Bitaxe Auto-Tuner`.
+2. Choose **Create Basic Task**. Name it `Groundhog Gamma Tuner`.
 3. Trigger: **When I log on**.
 4. Action: **Start a program**.
 5. Program: the full path to `launch.bat`. Example: `C:\Users\YourName\bitaxe-temp-monitor\launch.bat`
