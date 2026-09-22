@@ -63,13 +63,9 @@ That opens the dashboard in its own window. If the ARM64 build is the `python` o
 
 ## Desktop shortcut
 
-From this folder, run:
+Double-click `install-shortcut.bat`.
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\install-shortcut.ps1
-```
-
-That creates a desktop shortcut named Groundhog Gamma Tuner. Double-clicking it runs `run.bat`, which starts the window with no console. The shortcut icon comes from `assets/app_icon.png`. Settings are saved in `config.json` next to the scripts. If that file is missing, the app creates it. `config.example.json` is the starting template, with an empty miner list.
+That creates a desktop shortcut named Groundhog Gamma Tuner. Double-clicking the shortcut runs `run.bat`, which starts the window with no console. The shortcut icon is `assets/app_icon.ico`, made from `assets/app_icon.png`. Settings are saved in `config.json` next to the scripts. If that file is missing, the app creates it. `config.example.json` is the starting template, with an empty miner list.
 
 ## Start when you log on
 
