@@ -141,7 +141,9 @@ def local_python_exes():
     patterns = []
     local = os.environ.get("LOCALAPPDATA", "")
     if local:
-        patterns.append(os.path.join(local, "Programs", "Python", "Python*", "python.exe"))
+        patterns.append(
+            os.path.join(local, "Programs", "Python", "Python*", "python.exe")
+        )
     program_files = os.environ.get("ProgramFiles", "")
     if program_files:
         patterns.append(os.path.join(program_files, "Python*", "python.exe"))
@@ -232,7 +234,9 @@ def _drive_path_start(prefix):
 
 
 def _same_file(left, right):
-    return os.path.normcase(os.path.abspath(left)) == os.path.normcase(os.path.abspath(right))
+    return os.path.normcase(os.path.abspath(left)) == os.path.normcase(
+        os.path.abspath(right)
+    )
 
 
 def _quiet_subprocess():

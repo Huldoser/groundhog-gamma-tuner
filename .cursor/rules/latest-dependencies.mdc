@@ -5,10 +5,10 @@ alwaysApply: true
 
 # Latest dependencies
 
-Direct dependencies live only in `requirements.txt`. Today those are `requests` and `pywebview`.
+Direct dependencies of the window live only in `requirements.txt`. Today those are `requests` and `pywebview`. The push checks `ruff` and `pre-commit` live in `requirements-dev.txt` and are not part of the window install.
 
 - When adding or changing a package, check PyPI and require at least the current release: `package>=X.Y.Z`.
 - Do not pin an older release. Do not add an upper bound.
 - Hold a newer release only when it breaks the 64-bit Windows WebView2 window, needs a Python other than the tablet’s 64-bit 3.13, or breaks the AxeOS calls this app makes.
-- A newer pywebview does not change the 64-bit interpreter requirement. Do not move the window onto ARM64 Python.
+- A newer pywebview does not change the 64-bit interpreter requirement.
 - Leave transitive packages (`pythonnet`, `urllib3`, `certifi`, and the rest) to `requests` and `pywebview`. Do not add pywebview GUI extras (`gtk`, `qt`, `cef`).

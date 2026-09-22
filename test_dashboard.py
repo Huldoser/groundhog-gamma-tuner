@@ -1,17 +1,18 @@
 import os
 import tempfile
 import threading
+import time
 import unittest
-from datetime import datetime
 from contextlib import contextmanager
+from datetime import datetime
 from unittest import mock
 
 import config
 import dashboard
 from dashboard import (
     ALL_AUTOTUNE_FIELDS,
-    DashboardApi,
     LOG_LIMIT,
+    DashboardApi,
     TunerDashboard,
     blank_miner_row,
     difficulty_title,
@@ -22,6 +23,7 @@ from dashboard import (
     format_hash_title,
     format_input_voltage,
     format_learned_wall,
+    format_log_line,
     format_minute_hashrate,
     format_number,
     format_share_title,
@@ -93,22 +95,28 @@ class DisplayHelperTests(unittest.TestCase):
             return 7
 
         kernel.GetTimeFormatEx.side_effect = get_time
-        with mock.patch("dashboard.platform.system", return_value="Windows"), \
-                mock.patch("ctypes.WinDLL", return_value=kernel, create=True):
+        with (
+            mock.patch("dashboard.platform.system", return_value="Windows"),
+            mock.patch("ctypes.WinDLL", return_value=kernel, create=True),
+        ):
             self.assertEqual(dashboard.format_local_time(moment), "4:45 PM")
 
         kernel.GetTimeFormatEx.side_effect = None
         kernel.GetTimeFormatEx.return_value = 0
-        with mock.patch("dashboard.platform.system", return_value="Windows"), \
-                mock.patch("ctypes.WinDLL", return_value=kernel, create=True):
+        with (
+            mock.patch("dashboard.platform.system", return_value="Windows"),
+            mock.patch("ctypes.WinDLL", return_value=kernel, create=True),
+        ):
             self.assertEqual(dashboard.format_local_time(moment), "16:45:03")
 
         app = TunerDashboard()
         app._rows = [{"ip": "10.0.0.8"}]
-        with mock.patch("dashboard.format_local_time", return_value="4:45 PM"), \
-                mock.patch.object(app, "_apply_one_locked"), \
-                mock.patch.object(app, "_note_alert_locked", return_value=None), \
-                mock.patch.object(app, "_deliver_alerts"):
+        with (
+            mock.patch("dashboard.format_local_time", return_value="4:45 PM"),
+            mock.patch.object(app, "_apply_one_locked"),
+            mock.patch.object(app, "_note_alert_locked", return_value=None),
+            mock.patch.object(app, "_deliver_alerts"),
+        ):
             app._apply_results([("10.0.0.8", {})])
         self.assertEqual(app._updated, "4:45 PM")
 
@@ -155,22 +163,28 @@ class DisplayHelperTests(unittest.TestCase):
 
     def test_failed_difficulty_fetch_keeps_the_last_value(self):
         app = TunerDashboard()
-        with mock.patch("dashboard.read_network_status", return_value={
-            "difficulty": 132757073449487.5,
-            "pools": [
-                {"name": "stratum.ckpool.org", "online": True},
-                {"name": "public-pool.io", "online": True},
-            ],
-        }):
+        with mock.patch(
+            "dashboard.read_network_status",
+            return_value={
+                "difficulty": 132757073449487.5,
+                "pools": [
+                    {"name": "stratum.ckpool.org", "online": True},
+                    {"name": "public-pool.io", "online": True},
+                ],
+            },
+        ):
             app._refresh_network()
         self.assertEqual(app.get_snapshot(0)["network"]["difficulty"], "132.76T")
-        with mock.patch("dashboard.read_network_status", return_value={
-            "difficulty": None,
-            "pools": [
-                {"name": "stratum.ckpool.org", "online": False},
-                {"name": "public-pool.io", "online": True},
-            ],
-        }):
+        with mock.patch(
+            "dashboard.read_network_status",
+            return_value={
+                "difficulty": None,
+                "pools": [
+                    {"name": "stratum.ckpool.org", "online": False},
+                    {"name": "public-pool.io", "online": True},
+                ],
+            },
+        ):
             app._refresh_network()
         network = app.get_snapshot(0)["network"]
         self.assertEqual(network["difficulty"], "132.76T")
@@ -180,7 +194,9 @@ class DisplayHelperTests(unittest.TestCase):
         self.assertEqual(format_input_voltage(5093.75), "5.09")
         self.assertEqual(format_input_voltage(5.05), "5.05")
         self.assertEqual(format_input_voltage(None), "-")
-        self.assertEqual(format_minute_hashrate({"hashRate_1m": 1000.5, "hashRate": 900}), "1000.50")
+        self.assertEqual(
+            format_minute_hashrate({"hashRate_1m": 1000.5, "hashRate": 900}), "1000.50"
+        )
         self.assertEqual(format_minute_hashrate({"hashRate": 900}), "-")
         self.assertEqual(format_efficiency(18.5, 1000, None), "18.50")
         self.assertEqual(format_efficiency(18.5, 0, None), "-")
@@ -191,23 +207,31 @@ class DisplayHelperTests(unittest.TestCase):
         self.assertEqual(format_uptime(45), ("45s", 45))
         self.assertEqual(format_uptime(None), ("-", None))
         self.assertEqual(
-            format_hash_title({"hashRate": 1072.24, "hashRate_10m": 1070, "expectedHashrate": 1071}),
+            format_hash_title(
+                {"hashRate": 1072.24, "hashRate_10m": 1070, "expectedHashrate": 1071}
+            ),
             "Live 1072.24 GH/s\n10m 1070.00 GH/s\nExpected 1071.00 GH/s",
         )
-        self.assertEqual(format_core_voltage_title(1150, 1144), "Measured 1144 mV, droop 6 mV")
+        self.assertEqual(
+            format_core_voltage_title(1150, 1144), "Measured 1144 mV, droop 6 mV"
+        )
         self.assertEqual(format_core_voltage_title(1150, None), "")
         self.assertFalse(droop_alert(1150, 1110, {"max_droop_mv": 40}))
         self.assertTrue(droop_alert(1150, 1109, {"max_droop_mv": 40}))
         self.assertTrue(droop_alert(1150, 1109, {}))
         self.assertEqual(
-            format_share_title({
-                "sharesRejectedReasons": [{"message": "Stale", "count": 13}],
-                "poolDifficulty": 1000,
-                "isUsingFallbackStratum": 1,
-            }),
+            format_share_title(
+                {
+                    "sharesRejectedReasons": [{"message": "Stale", "count": 13}],
+                    "poolDifficulty": 1000,
+                    "isUsingFallbackStratum": 1,
+                }
+            ),
             "Stale 13\nPool difficulty 1000\nFallback pool",
         )
-        self.assertEqual(format_share_title({"isUsingFallbackStratum": 0, "poolDifficulty": 0}), "")
+        self.assertEqual(
+            format_share_title({"isUsingFallbackStratum": 0, "poolDifficulty": 0}), ""
+        )
         self.assertEqual(format_version_title({"version": "v2.15.1"}), "v2.15.1")
         self.assertEqual(limit_level(65, 68, 3), "")
         self.assertEqual(limit_level(65.1, 68, 3), "warn")
@@ -220,6 +244,17 @@ class DisplayHelperTests(unittest.TestCase):
         self.assertTrue(under_limit(4.89, 4.9))
         self.assertFalse(under_limit(None, 4.9))
         self.assertFalse(under_limit(4.8, None))
+
+    def test_log_line_stamps_the_date_and_brackets_the_hostname(self):
+        moment = datetime(2026, 9, 22, 18, 16, 5)
+        self.assertEqual(
+            format_log_line("goose -> holding for good hashrate.", moment),
+            "[2026-09-22 18:16:05] [goose] holding for good hashrate.",
+        )
+        self.assertEqual(
+            format_log_line("Loaded 2 miners.", moment),
+            "[2026-09-22 18:16:05] Loaded 2 miners.",
+        )
 
     def test_ip_inside_a_nickname_is_left_alone(self):
         text = replace_ips_with_names(
@@ -271,7 +306,9 @@ class DisplayHelperTests(unittest.TestCase):
 
     def test_failed_firmware_fetch_keeps_the_last_tag(self):
         app = TunerDashboard()
-        with mock.patch("dashboard.read_latest_stable_firmware", return_value="v2.15.2"):
+        with mock.patch(
+            "dashboard.read_latest_stable_firmware", return_value="v2.15.2"
+        ):
             app._refresh_firmware()
         self.assertEqual(app._latest_firmware, "v2.15.2")
         with mock.patch("dashboard.read_latest_stable_firmware", return_value=None):
@@ -303,8 +340,12 @@ class DisplayHelperTests(unittest.TestCase):
         self.assertTrue(firmware_check_due(afternoon, next_noon))
 
         app = TunerDashboard()
-        with mock.patch("dashboard.read_latest_stable_firmware", return_value="v2.15.2") as fetch, \
-                mock.patch("dashboard.datetime") as clock:
+        with (
+            mock.patch(
+                "dashboard.read_latest_stable_firmware", return_value="v2.15.2"
+            ) as fetch,
+            mock.patch("dashboard.datetime") as clock,
+        ):
             clock.now.return_value = morning
             app._refresh_firmware_if_due()
             clock.now.return_value = morning.replace(minute=5)
@@ -386,10 +427,12 @@ class SnapshotTests(unittest.TestCase):
             "wall_type": "silicon",
         }
         settings = {"temp_tolerance": 3, "vr_temp_tolerance": 3}
-        with mock.patch("dashboard.get_system_info", return_value=info), \
-                mock.patch("dashboard.get_miner_status", return_value=status), \
-                mock.patch("dashboard.get_miner_defaults", return_value=stored), \
-                mock.patch("dashboard.load_config", return_value=settings):
+        with (
+            mock.patch("dashboard.get_system_info", return_value=info),
+            mock.patch("dashboard.get_miner_status", return_value=status),
+            mock.patch("dashboard.get_miner_defaults", return_value=stored),
+            mock.patch("dashboard.load_config", return_value=settings),
+        ):
             app.refresh_once()
         row = app.get_snapshot(0)["miners"][0]
         self.assertEqual(row["tag"], "hold")
@@ -405,12 +448,16 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(row["vin"], "5.09")
         self.assertEqual(row["asic"], "61.2")
         self.assertEqual(row["hash"], "12.50")
-        self.assertEqual(row["hash_title"], "Live 12.50 GH/s\n10m 12.20 GH/s\nExpected 13.00 GH/s")
+        self.assertEqual(
+            row["hash_title"], "Live 12.50 GH/s\n10m 12.20 GH/s\nExpected 13.00 GH/s"
+        )
         self.assertEqual(row["jth"], "1480.00")
         self.assertEqual(row["up"], "5h")
         self.assertEqual(row["up_seconds"], 18000)
         self.assertEqual(row["name_title"], "v2.15.1")
-        self.assertEqual(row["shares_title"], "Stale 13\nPool difficulty 1000\nFallback pool")
+        self.assertEqual(
+            row["shares_title"], "Stale 13\nPool difficulty 1000\nFallback pool"
+        )
         self.assertEqual(row["error"], "0.50%")
         self.assertEqual(row["setpoint"], "silicon 640/1200")
         self.assertEqual(row["reason"], "holding")
@@ -430,10 +477,12 @@ class SnapshotTests(unittest.TestCase):
 
         info["temp"] = 80
         status["phase"] = "climb"
-        with mock.patch("dashboard.get_system_info", return_value=info), \
-                mock.patch("dashboard.get_miner_status", return_value=status), \
-                mock.patch("dashboard.get_miner_defaults", return_value=stored), \
-                mock.patch("dashboard.load_config", return_value=settings):
+        with (
+            mock.patch("dashboard.get_system_info", return_value=info),
+            mock.patch("dashboard.get_miner_status", return_value=status),
+            mock.patch("dashboard.get_miner_defaults", return_value=stored),
+            mock.patch("dashboard.load_config", return_value=settings),
+        ):
             app.refresh_once()
         hot = app.get_snapshot(0)["miners"][0]
         self.assertEqual(hot["tag"], "alert")
@@ -451,12 +500,19 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(offline["freq"], "500")
         self.assertEqual(offline["reason"], "")
 
-        cursor = app.get_snapshot(0)["log"][-1]["id"] if app.get_snapshot(0)["log"] else 0
-        with mock.patch("dashboard.get_miners", return_value=[{"ip": "10.1.1.5", "nickname": "Alpha"}]):
+        cursor = (
+            app.get_snapshot(0)["log"][-1]["id"] if app.get_snapshot(0)["log"] else 0
+        )
+        with mock.patch(
+            "dashboard.get_miners",
+            return_value=[{"ip": "10.1.1.5", "nickname": "Alpha"}],
+        ):
             app.log_message("heat on 10.1.1.5", "warning")
             app.log_message("settled", "success")
         tail = app.get_snapshot(cursor)
-        self.assertEqual([line["level"] for line in tail["log"]], ["warning", "success"])
+        self.assertEqual(
+            [line["level"] for line in tail["log"]], ["warning", "success"]
+        )
         self.assertIn("heat on Alpha", tail["log"][0]["text"])
         self.assertNotIn("10.1.1.5", tail["log"][0]["text"])
         self.assertEqual(app.get_snapshot(tail["log"][-1]["id"])["log"], [])
@@ -486,10 +542,12 @@ class SnapshotTests(unittest.TestCase):
             "min_input_voltage": 4.9,
         }
         settings = {"temp_tolerance": 3, "vr_temp_tolerance": 3}
-        with mock.patch("dashboard.get_system_info", return_value=info), \
-                mock.patch("dashboard.get_miner_status", return_value={"phase": "hold"}), \
-                mock.patch("dashboard.get_miner_defaults", return_value=stored), \
-                mock.patch("dashboard.load_config", return_value=settings):
+        with (
+            mock.patch("dashboard.get_system_info", return_value=info),
+            mock.patch("dashboard.get_miner_status", return_value={"phase": "hold"}),
+            mock.patch("dashboard.get_miner_defaults", return_value=stored),
+            mock.patch("dashboard.load_config", return_value=settings),
+        ):
             app.refresh_once()
         row = app.get_snapshot(0)["miners"][0]
         self.assertEqual(row["asic_level"], "warn")
@@ -498,11 +556,21 @@ class SnapshotTests(unittest.TestCase):
         self.assertTrue(row["error_alert"])
         self.assertTrue(row["vin_alert"])
 
-        info.update({"temp": 60, "vrTemp": 80, "power": 18, "voltage": 5.1, "errorPercentage": 0.4})
-        with mock.patch("dashboard.get_system_info", return_value=info), \
-                mock.patch("dashboard.get_miner_status", return_value={"phase": "hold"}), \
-                mock.patch("dashboard.get_miner_defaults", return_value=stored), \
-                mock.patch("dashboard.load_config", return_value=settings):
+        info.update(
+            {
+                "temp": 60,
+                "vrTemp": 80,
+                "power": 18,
+                "voltage": 5.1,
+                "errorPercentage": 0.4,
+            }
+        )
+        with (
+            mock.patch("dashboard.get_system_info", return_value=info),
+            mock.patch("dashboard.get_miner_status", return_value={"phase": "hold"}),
+            mock.patch("dashboard.get_miner_defaults", return_value=stored),
+            mock.patch("dashboard.load_config", return_value=settings),
+        ):
             app.refresh_once()
         clear = app.get_snapshot(0)["miners"][0]
         self.assertEqual(clear["asic_level"], "")
@@ -542,8 +610,12 @@ class SnapshotTests(unittest.TestCase):
             self.assertIn("No miners are enabled", result["message"])
 
     def test_remove_stops_only_that_miner_thread(self):
-        first = config.new_miner_record("BM1370 601", "10.0.0.8", "Alpha", config.get_default_config())
-        second = config.new_miner_record("BM1370 601", "10.0.0.9", "Beta", config.get_default_config())
+        first = config.new_miner_record(
+            "BM1370 601", "10.0.0.8", "Alpha", config.get_default_config()
+        )
+        second = config.new_miner_record(
+            "BM1370 601", "10.0.0.9", "Beta", config.get_default_config()
+        )
         events = {}
 
         def fake_monitor(*args, **kwargs):
@@ -610,10 +682,16 @@ class SnapshotTests(unittest.TestCase):
 
         try:
             autotune._publish_status(
-                held_ip, phase="hold", last_good_freq=640, last_good_volt=1200, wall_type="silicon",
+                held_ip,
+                phase="hold",
+                last_good_freq=640,
+                last_good_volt=1200,
+                wall_type="silicon",
             )
             autotune._publish_status(skipped_ip, phase="skipped", last_good_freq=525)
-            autotune._publish_status(live_ip, phase="climb", last_good_freq=600, last_good_volt=1150)
+            autotune._publish_status(
+                live_ip, phase="climb", last_good_freq=600, last_good_volt=1150
+            )
             app = TunerDashboard()
             held = threading.Thread(target=lambda: None)
             held.miner_ip = held_ip
@@ -627,9 +705,27 @@ class SnapshotTests(unittest.TestCase):
             live.miner_ip = live_ip
             live.start()
             app._rows = [
-                {"ip": held_ip, "phase": "hold", "tag": "hold", "asic": "60", "error": "1%"},
-                {"ip": skipped_ip, "phase": "skipped", "tag": "idle", "asic": "60", "error": "1%"},
-                {"ip": live_ip, "phase": "climb", "tag": "climb", "asic": "60", "error": "1%"},
+                {
+                    "ip": held_ip,
+                    "phase": "hold",
+                    "tag": "hold",
+                    "asic": "60",
+                    "error": "1%",
+                },
+                {
+                    "ip": skipped_ip,
+                    "phase": "skipped",
+                    "tag": "idle",
+                    "asic": "60",
+                    "error": "1%",
+                },
+                {
+                    "ip": live_ip,
+                    "phase": "climb",
+                    "tag": "climb",
+                    "asic": "60",
+                    "error": "1%",
+                },
             ]
             app.threads = [held, skipped, live]
             app.running = True
@@ -666,16 +762,23 @@ class SnapshotTests(unittest.TestCase):
             autotune._clear_miner_status(live_ip)
 
     def test_blank_limit_disables_the_miner_and_frequency_is_clamped(self):
-        miner = {"ip": "10.0.0.8", "nickname": "Alpha", "enabled": True, "type": "BM1370 601"}
+        miner = {
+            "ip": "10.0.0.8",
+            "nickname": "Alpha",
+            "enabled": True,
+            "type": "BM1370 601",
+        }
         with temp_config([miner]):
             app = TunerDashboard()
             fields = {field: "10" for field in ALL_AUTOTUNE_FIELDS}
             fields["max_freq"] = "5000"
             fields["min_input_voltage"] = "4.9"
             fields["max_error_percentage"] = "2"
-            saved = app.save_autotuner_settings([
-                {"ip": "10.0.0.8", "enabled": True, "fields": fields},
-            ])
+            saved = app.save_autotuner_settings(
+                [
+                    {"ip": "10.0.0.8", "enabled": True, "fields": fields},
+                ]
+            )
             self.assertTrue(saved["ok"])
             stored = config.get_miners()[0]
             self.assertEqual(stored["max_freq"], dashboard.HARD_MAX_FREQ)
@@ -683,9 +786,11 @@ class SnapshotTests(unittest.TestCase):
             self.assertTrue(stored["enabled"])
 
             fields["max_temp"] = ""
-            cleared = app.save_autotuner_settings([
-                {"ip": "10.0.0.8", "enabled": True, "fields": fields},
-            ])
+            cleared = app.save_autotuner_settings(
+                [
+                    {"ip": "10.0.0.8", "enabled": True, "fields": fields},
+                ]
+            )
             self.assertTrue(cleared["ok"])
             stored = config.get_miners()[0]
             self.assertEqual(stored["max_temp"], "")
@@ -705,13 +810,109 @@ class SnapshotTests(unittest.TestCase):
             self.assertEqual(stored["vr_temp_tolerance"], 4)
             self.assertEqual(stored["ceiling_soak_seconds"], 900)
 
+    def test_settings_save_keeps_a_setpoint_learned_while_it_waits(self):
+        miner = config.new_miner_record(
+            "BM1370 601", "10.0.0.8", "Alpha", config.get_default_config()
+        )
+        miner["last_good_freq"] = 400
+        miner["last_good_volt"] = 1100
+        entered = threading.Event()
+        release = threading.Event()
+        started = threading.Event()
+        real_save = config.save_config
+
+        def save_and_pause(cfg):
+            entered.set()
+            self.assertTrue(release.wait(2))
+            real_save(cfg)
+
+        def learn():
+            started.set()
+            config.update_miner(
+                "10.0.0.8", {"last_good_freq": 640, "last_good_volt": 1200}
+            )
+
+        with temp_config([miner]):
+            app = TunerDashboard()
+            fields = {field: str(miner[field]) for field in ALL_AUTOTUNE_FIELDS}
+            fields["max_temp"] = "55"
+
+            def saver():
+                with mock.patch("config.save_config", save_and_pause):
+                    app.save_autotuner_settings(
+                        [{"ip": "10.0.0.8", "enabled": True, "fields": fields}]
+                    )
+
+            saving = threading.Thread(target=saver)
+            saving.start()
+            self.assertTrue(entered.wait(2))
+            learning = threading.Thread(target=learn)
+            learning.start()
+            self.assertTrue(started.wait(2))
+            time.sleep(0.05)
+            release.set()
+            saving.join(2)
+            learning.join(2)
+            self.assertFalse(saving.is_alive())
+            self.assertFalse(learning.is_alive())
+            stored = config.get_miners()[0]
+            self.assertEqual(stored["max_temp"], 55)
+            self.assertEqual(stored["last_good_freq"], 640)
+            self.assertEqual(stored["last_good_volt"], 1200)
+
+    def test_skipped_session_returns_to_idle(self):
+        miner = config.new_miner_record(
+            "BM1370 601", "10.0.0.8", "Alpha", config.get_default_config()
+        )
+
+        def finished(*args, **kwargs):
+            return None
+
+        with temp_config([miner]):
+            app = TunerDashboard()
+            with mock.patch("dashboard.monitor_and_adjust", finished):
+                started = app.start_autotuner()
+                self.assertTrue(started["ok"])
+                for thread in list(app.threads):
+                    thread.join(timeout=2)
+                controls = app.get_snapshot(0)["controls"]
+                self.assertEqual(controls["status"], "idle")
+                self.assertTrue(controls["reset_enabled"])
+                again = app.start_autotuner()
+                self.assertTrue(again["ok"])
+                for thread in list(app.threads):
+                    thread.join(timeout=2)
+
+    def test_baseline_reset_staggers_each_miner(self):
+        miner = config.new_miner_record(
+            "BM1370 601", "10.0.0.8", "Alpha", config.get_default_config()
+        )
+        called = threading.Event()
+        seen = {}
+
+        def fake_reset(*args, **kwargs):
+            seen["kwargs"] = kwargs
+            called.set()
+
+        with temp_config([miner]):
+            app = TunerDashboard()
+            with mock.patch("dashboard.reset_miners_to_baseline", fake_reset):
+                result = app.reset_baseline()
+                self.assertTrue(result["ok"])
+                self.assertTrue(called.wait(2))
+        self.assertFalse(seen["kwargs"].get("parallel", False))
+
     def test_subnet_fleet_and_pool(self):
-        self.assertEqual(dashboard.subnet_range_for("192.168.8.40"), ("192.168.8.1", "192.168.8.254"))
+        self.assertEqual(
+            dashboard.subnet_range_for("192.168.8.40"), ("192.168.8.1", "192.168.8.254")
+        )
         self.assertEqual(dashboard.subnet_range_for(""), ("", ""))
         self.assertEqual(dashboard.subnet_range_for("not-an-ip"), ("", ""))
         self.assertFalse(dashboard.wifi_is_weak(-44))
         self.assertTrue(dashboard.wifi_is_weak(-70))
-        host, fallback = dashboard.pool_host({"stratumURL": "stratum+tcp://public-pool.io:23330"})
+        host, fallback = dashboard.pool_host(
+            {"stratumURL": "stratum+tcp://public-pool.io:23330"}
+        )
         self.assertEqual(host, "public-pool.io")
         self.assertFalse(fallback)
         rows = [
@@ -731,10 +932,15 @@ class SnapshotTests(unittest.TestCase):
         app._rows = [blank_miner_row("Alpha", "10.0.0.8")]
         info = {"frequency": 640, "temp": 60, "hashRate_1m": 1000, "power": 20}
         stored = {"nickname": "Alpha"}
-        with mock.patch("dashboard.get_system_info", return_value=info), \
-                mock.patch("dashboard.get_miner_status", return_value={"phase": "hold", "reason": "holding"}), \
-                mock.patch("dashboard.get_miner_defaults", return_value=stored), \
-                mock.patch("dashboard.load_config", return_value={}):
+        with (
+            mock.patch("dashboard.get_system_info", return_value=info),
+            mock.patch(
+                "dashboard.get_miner_status",
+                return_value={"phase": "hold", "reason": "holding"},
+            ),
+            mock.patch("dashboard.get_miner_defaults", return_value=stored),
+            mock.patch("dashboard.load_config", return_value={}),
+        ):
             app.refresh_once()
         snapshot = app.get_snapshot(0)
         self.assertNotIn("history", snapshot)
@@ -749,44 +955,66 @@ class SnapshotTests(unittest.TestCase):
         app._rows = [blank_miner_row("Alpha", "10.0.0.8")]
         app._focused = False
         stored = {"nickname": "Alpha"}
-        with mock.patch("dashboard.show_windows_toast") as toast, \
-                mock.patch("dashboard.get_system_info", return_value="timed out"):
+        with (
+            mock.patch("dashboard.show_windows_toast") as toast,
+            mock.patch("dashboard.get_system_info", return_value="timed out"),
+        ):
             app.refresh_once()
         toast.assert_called_once_with("Groundhog Gamma Tuner", "Alpha is offline.")
-        with mock.patch("dashboard.show_windows_toast") as toast, \
-                mock.patch("dashboard.get_system_info", return_value="timed out"):
+        with (
+            mock.patch("dashboard.show_windows_toast") as toast,
+            mock.patch("dashboard.get_system_info", return_value="timed out"),
+        ):
             app.refresh_once()
         toast.assert_not_called()
 
         fault = {"power_fault": "UV", "temp": 40, "hashRate_1m": 10, "frequency": 500}
-        with mock.patch("dashboard.show_windows_toast") as toast, \
-                mock.patch("dashboard.get_system_info", return_value=fault), \
-                mock.patch("dashboard.get_miner_status", return_value={"phase": "hold"}), \
-                mock.patch("dashboard.get_miner_defaults", return_value=stored), \
-                mock.patch("dashboard.load_config", return_value={}):
+        with (
+            mock.patch("dashboard.show_windows_toast") as toast,
+            mock.patch("dashboard.get_system_info", return_value=fault),
+            mock.patch("dashboard.get_miner_status", return_value={"phase": "hold"}),
+            mock.patch("dashboard.get_miner_defaults", return_value=stored),
+            mock.patch("dashboard.load_config", return_value={}),
+        ):
             app.refresh_once()
-        toast.assert_called_once_with("Groundhog Gamma Tuner", "Alpha reported a power fault.")
+        toast.assert_called_once_with(
+            "Groundhog Gamma Tuner", "Alpha reported a power fault."
+        )
         row = app.get_snapshot(0)["miners"][0]
         self.assertTrue(row["power_fault"])
         self.assertEqual(row["reason"], "power fault")
         self.assertEqual(row["tag"], "alert")
 
-        hot = {"overheat_mode": 1, "power_fault": "none", "temp": 40, "hashRate_1m": 10, "frequency": 500}
-        with mock.patch("dashboard.show_windows_toast") as toast, \
-                mock.patch("dashboard.get_system_info", return_value=hot), \
-                mock.patch("dashboard.get_miner_status", return_value={"phase": "hold"}), \
-                mock.patch("dashboard.get_miner_defaults", return_value=stored), \
-                mock.patch("dashboard.load_config", return_value={}):
+        hot = {
+            "overheat_mode": 1,
+            "power_fault": "none",
+            "temp": 40,
+            "hashRate_1m": 10,
+            "frequency": 500,
+        }
+        with (
+            mock.patch("dashboard.show_windows_toast") as toast,
+            mock.patch("dashboard.get_system_info", return_value=hot),
+            mock.patch("dashboard.get_miner_status", return_value={"phase": "hold"}),
+            mock.patch("dashboard.get_miner_defaults", return_value=stored),
+            mock.patch("dashboard.load_config", return_value={}),
+        ):
             app.refresh_once()
-        toast.assert_called_once_with("Groundhog Gamma Tuner", "Alpha is in overheat mode.")
+        toast.assert_called_once_with(
+            "Groundhog Gamma Tuner", "Alpha is in overheat mode."
+        )
         self.assertEqual(app.get_snapshot(0)["miners"][0]["reason"], "overheat mode")
 
         app._focused = True
-        with mock.patch("dashboard.show_windows_toast") as toast, \
-                mock.patch("dashboard.get_system_info", return_value="timed out"):
+        with (
+            mock.patch("dashboard.show_windows_toast") as toast,
+            mock.patch("dashboard.get_system_info", return_value="timed out"),
+        ):
             app.refresh_once()
         toast.assert_not_called()
-        self.assertEqual(app.get_snapshot(0, focused=False)["miners"][0]["phase"], "offline")
+        self.assertEqual(
+            app.get_snapshot(0, focused=False)["miners"][0]["phase"], "offline"
+        )
         self.assertFalse(app._focused)
         DashboardApi(app).get_snapshot(0, True)
         self.assertTrue(app._focused)

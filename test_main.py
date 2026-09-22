@@ -48,15 +48,23 @@ class InterpreterDiscoveryTests(unittest.TestCase):
 
     def test_host_arm64_label_does_not_classify_the_build(self):
         self.assertEqual(arch_from_platform("ARM64"), "")
-        self.assertIsNone(choose_amd64_python([AMD64], lambda _path: arch_from_platform("ARM64")))
+        self.assertIsNone(
+            choose_amd64_python([AMD64], lambda _path: arch_from_platform("ARM64"))
+        )
 
     def test_windowed_start_uses_pythonw_beside_the_64_bit_interpreter(self):
         self.assertEqual(
-            launch_executable(AMD64, r"C:\Users\huldo\AppData\Local\Programs\Python\Python313-arm64\pythonw.exe"),
+            launch_executable(
+                AMD64,
+                r"C:\Users\huldo\AppData\Local\Programs\Python\Python313-arm64\pythonw.exe",
+            ),
             r"C:\Program Files\Python313\pythonw.exe",
         )
         self.assertEqual(
-            launch_executable(AMD64, r"C:\Users\huldo\AppData\Local\Programs\Python\Python313-arm64\python.exe"),
+            launch_executable(
+                AMD64,
+                r"C:\Users\huldo\AppData\Local\Programs\Python\Python313-arm64\python.exe",
+            ),
             AMD64,
         )
 

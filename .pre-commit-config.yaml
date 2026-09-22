@@ -1,0 +1,23 @@
+default_install_hook_types: [pre-push]
+repos:
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: ruff check
+        entry: python -m ruff check
+        language: system
+        types: [python]
+        stages: [pre-push]
+      - id: ruff-format
+        name: ruff format
+        entry: python -m ruff format --check
+        language: system
+        types: [python]
+        stages: [pre-push]
+      - id: unittest
+        name: unittest
+        entry: python -m unittest
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]

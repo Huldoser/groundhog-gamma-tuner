@@ -10,7 +10,7 @@ Writes go through `save_config` / `_write_config`: hold `_config_lock`, write a 
 
 A `JSONDecodeError` keeps `_last_good_config`. `_drop_daily_reset` removes `daily_reset_enabled` and `daily_reset_time` on load and save.
 
-New rows come from `new_miner_record` after `is_gamma_601`. `config.json` stays gitignored.
+`detect_miners` checks `is_gamma_601` before `new_miner_record`. `add_miner` does not perform that check. `config.json` stays gitignored.
 
 ```python
 # BAD
