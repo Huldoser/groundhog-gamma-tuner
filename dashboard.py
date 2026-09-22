@@ -497,8 +497,9 @@ class TunerDashboard:
         try:
             import webview
         except ImportError as exc:
-            print("The dashboard window needs pywebview. Install it with: pip install -r requirements.txt")
-            raise SystemExit(1) from exc
+            message = "The dashboard window needs pywebview. Install it with: pip install -r requirements.txt"
+            print(message)
+            raise SystemExit(message) from exc
 
         self.start_background()
         page = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web", "index.html")

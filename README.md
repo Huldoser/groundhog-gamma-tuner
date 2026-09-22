@@ -35,16 +35,22 @@ Those targets match this cooling and this power supply. Another board, a stock c
 ## Requirements
 
 - Windows on ARM tablet
-- Python 3 for Windows ARM64, from [python.org](https://www.python.org/downloads/windows/)
+- Python 3 from [python.org](https://www.python.org/downloads/windows/), using the **Windows installer (64-bit)**. The 64-bit build runs under emulation on this tablet. The ARM64 installer cannot open the window, because pywebview’s .NET helper does not load in that build.
 - The packages in `requirements.txt` (`requests` and `pywebview`)
 - The Edge WebView2 runtime, which Windows 11 already includes
 
 ## Install
 
-Open Command Prompt in this folder:
+Open Command Prompt in this folder. Install the packages with the 64-bit interpreter. `pip` on PATH may still be the ARM64 one. List the interpreters:
 
 ```bat
-pip install -r requirements.txt
+py -0p
+```
+
+Use the `python.exe` whose folder is not `Python313-arm64`:
+
+```bat
+"%LocalAppData%\Programs\Python\Python313\python.exe" -m pip install -r requirements.txt
 ```
 
 ## Run
@@ -53,11 +59,17 @@ pip install -r requirements.txt
 python main.py
 ```
 
-That opens the dashboard in its own window. The tablet and the Gamma 601 need to be on the same network. Add the miner by IP, or scan a range. The app saves a miner only after AxeOS reports a BM1370 on board 601.
+That opens the dashboard in its own window. If the ARM64 build is the `python` on PATH, `main.py` starts the 64-bit interpreter instead. The tablet and the Gamma 601 need to be on the same network. Add the miner by IP, or scan a range. The app saves a miner only after AxeOS reports a BM1370 on board 601.
 
 ## Desktop shortcut
 
-Right-click `launch.bat` and choose **Send to > Desktop (create shortcut)**. That shortcut starts the window with no console. `launch.bat` switches to this folder first. Settings are saved in `config.json` next to the scripts. If that file is missing, the app creates it. `config.example.json` is the starting template, with an empty miner list.
+From this folder, run:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install-shortcut.ps1
+```
+
+That creates a desktop shortcut named Groundhog Gamma Tuner. Double-clicking it runs `run.bat`, which starts the window with no console. The shortcut icon comes from `assets/app_icon.png`. Settings are saved in `config.json` next to the scripts. If that file is missing, the app creates it. `config.example.json` is the starting template, with an empty miner list.
 
 ## Start when you log on
 
@@ -67,7 +79,7 @@ Use Task Scheduler so the window opens after you sign in.
 2. Choose **Create Basic Task**. Name it `Groundhog Gamma Tuner`.
 3. Trigger: **When I log on**.
 4. Action: **Start a program**.
-5. Program: the full path to `launch.bat`. Example: `C:\Users\YourName\bitaxe-temp-monitor\launch.bat`
+5. Program: the full path to `run.bat`. Example: `C:\Users\YourName\bitaxe-temp-monitor\run.bat`
 6. On **Conditions**, clear **Start the task only if the computer is on AC power**.
 
 ## Disclaimer

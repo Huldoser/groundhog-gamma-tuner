@@ -10,6 +10,6 @@ if not errorlevel 1 (
   start "" pythonw "%~dp0main.py"
   exit /b 0
 )
-echo Could not find Python. Install Python 3 for Windows ARM64 from python.org and enable the py launcher.
+echo Could not find Python. Install the 64-bit Python from python.org (Windows installer (64-bit)) and enable the py launcher.
 pause
 exit /b 1
