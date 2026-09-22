@@ -6,9 +6,9 @@ not load in the ARM64 build, so an ARM64 process restarts in the 64-bit one.
 
 import glob
 import os
-import platform
 import subprocess
 import sys
+import sysconfig
 import traceback
 
 X64_PYTHON_MESSAGE = (
@@ -76,9 +76,28 @@ def launch_executable(python_exe, current_executable):
     return python_exe
 
 
+def arch_from_platform(value):
+    """Map a sysconfig platform tag to the interpreter build.
+
+    ``win-amd64`` and ``win-arm64`` name the Python build. A host CPU
+    label such as ``ARM64`` stays unmapped.
+    """
+    text = str(value).strip().lower()
+    if text == "win-amd64":
+        return "AMD64"
+    if text == "win-arm64":
+        return "ARM64"
+    return ""
+
+
+def interpreter_arch():
+    """Architecture of this Python build, not the tablet CPU."""
+    return arch_from_platform(sysconfig.get_platform())
+
+
 def ensure_amd64_python():
     """Restart under 64-bit Python when this process is the ARM64 build."""
-    if sys.platform != "win32" or platform.machine().upper() != "ARM64":
+    if sys.platform != "win32" or interpreter_arch() != "ARM64":
         return
     chosen = choose_amd64_python(discover_interpreters(), machine_of)
     launch = launch_executable(chosen, sys.executable) if chosen else ""
@@ -118,17 +137,31 @@ def read_py_list():
 
 
 def local_python_exes():
+    """Per-user installs, then an all-users install under Program Files."""
+    patterns = []
     local = os.environ.get("LOCALAPPDATA", "")
-    if not local:
-        return []
-    pattern = os.path.join(local, "Programs", "Python", "Python*", "python.exe")
-    return sorted(glob.glob(pattern))
+    if local:
+        patterns.append(os.path.join(local, "Programs", "Python", "Python*", "python.exe"))
+    program_files = os.environ.get("ProgramFiles", "")
+    if program_files:
+        patterns.append(os.path.join(program_files, "Python*", "python.exe"))
+        patterns.append(os.path.join(program_files, "Python", "Python*", "python.exe"))
+    found = []
+    seen = set()
+    for pattern in patterns:
+        for path in sorted(glob.glob(pattern)):
+            key = os.path.normcase(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append(path)
+    return found
 
 
 def machine_of(executable):
     try:
         completed = subprocess.run(
-            [executable, "-c", "import platform; print(platform.machine())"],
+            [executable, "-c", "import sysconfig; print(sysconfig.get_platform())"],
             capture_output=True,
             text=True,
             timeout=30,
@@ -139,7 +172,7 @@ def machine_of(executable):
         return ""
     if completed.returncode != 0:
         return ""
-    return completed.stdout.strip()
+    return arch_from_platform(completed.stdout)
 
 
 def show_windows_dialog(message):

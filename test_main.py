@@ -1,6 +1,7 @@
 import unittest
 
 from main import (
+    arch_from_platform,
     choose_amd64_python,
     interpreter_candidates,
     launch_executable,
@@ -34,6 +35,20 @@ class InterpreterDiscoveryTests(unittest.TestCase):
 
     def test_choose_amd64_is_empty_when_every_install_is_arm64(self):
         self.assertIsNone(choose_amd64_python([ARM64], lambda _path: "ARM64"))
+
+    def test_win_amd64_build_is_chosen_and_win_arm64_is_skipped(self):
+        platforms = {ARM64: "win-arm64", AMD64: "win-amd64"}
+        chosen = choose_amd64_python(
+            [ARM64, AMD64],
+            lambda path: arch_from_platform(platforms[path]),
+        )
+        self.assertEqual(arch_from_platform("win-amd64"), "AMD64")
+        self.assertEqual(arch_from_platform("win-arm64"), "ARM64")
+        self.assertEqual(chosen, AMD64)
+
+    def test_host_arm64_label_does_not_classify_the_build(self):
+        self.assertEqual(arch_from_platform("ARM64"), "")
+        self.assertIsNone(choose_amd64_python([AMD64], lambda _path: arch_from_platform("ARM64")))
 
     def test_windowed_start_uses_pythonw_beside_the_64_bit_interpreter(self):
         self.assertEqual(
