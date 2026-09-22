@@ -51,6 +51,7 @@ function openModal(id) {
 
 function closeModal(id) {
   $(id).hidden = true;
+  clearSelection();
 }
 
 function setFormError(id, message) {
@@ -87,6 +88,12 @@ function settleConfirm(value) {
 
 function selectedMiner() {
   return (lastSnapshot.miners || []).find((miner) => miner.ip === selectedIp) || null;
+}
+
+function clearSelection() {
+  if (!selectedIp) return;
+  selectedIp = "";
+  renderTable(lastSnapshot.miners || []);
 }
 
 function hideMenu() {
@@ -463,17 +470,14 @@ function addStat(parent, label, value, tone, title, unit) {
   parent.appendChild(item);
 }
 
-function renderFleet(fleet, odds, miners) {
+function renderFleet(fleet, miners) {
   const strip = $("summary");
   const fleetEl = $("fleet");
-  const oddsEl = $("odds");
-  if (!fleetEl || !oddsEl) return;
+  if (!fleetEl) return;
   if (!miners || !miners.length || !fleet) {
     if (strip) strip.hidden = true;
     fleetEl.hidden = true;
     fleetEl.replaceChildren();
-    oddsEl.hidden = true;
-    oddsEl.replaceChildren();
     return;
   }
   fleetEl.replaceChildren();
@@ -482,72 +486,10 @@ function renderFleet(fleet, odds, miners) {
   if (shown(fleet.hash)) addStat(fleetEl, "Hash", `${fleet.hash} GH/s`);
   if (shown(fleet.watts)) addStat(fleetEl, "Power", `${fleet.watts} W`);
   if (shown(fleet.jth)) addStat(fleetEl, "", fleet.jth, "", "", "J/TH");
-  if (fleet.climb) addStat(fleetEl, "Climbing", String(fleet.climb), "climb");
   if (fleet.hold) addStat(fleetEl, "Holding", String(fleet.hold), "hold");
   if (fleet.trim) addStat(fleetEl, "Trimming", String(fleet.trim), "trim");
   fleetEl.hidden = false;
-  oddsEl.replaceChildren();
-  const today = odds && odds.today;
-  if (shown(today)) {
-    const suffix = " today";
-    if (String(today).endsWith(suffix)) addStat(oddsEl, "Today", String(today).slice(0, -suffix.length));
-    else addStat(oddsEl, "", today);
-  }
-  const best = odds && odds.best;
-  const match = typeof best === "string" && best.match(/^Best share is (.+) of the network$/);
-  if (match) addStat(oddsEl, "Best", match[1], "", best);
-  else if (shown(best)) addStat(oddsEl, "Best", best);
-  oddsEl.hidden = oddsEl.childElementCount === 0;
   if (strip) strip.hidden = false;
-}
-
-function factLine(parent, label, text, note) {
-  if (!shown(text) && !shown(note)) return;
-  const item = document.createElement("span");
-  const name = document.createElement("span");
-  name.className = "fact-label";
-  name.textContent = label;
-  item.append(name);
-  if (shown(text)) item.append(document.createTextNode(` ${text}`));
-  if (shown(note)) {
-    const mark = document.createElement("span");
-    mark.className = "note warn";
-    mark.textContent = note;
-    item.append(document.createTextNode(" "), mark);
-  }
-  parent.appendChild(item);
-}
-
-function joinedTitle(text) {
-  return String(text || "").split("\n").map((line) => line.trim()).filter(Boolean).join(" · ");
-}
-
-function renderDetail(miners) {
-  const card = $("detail");
-  if (!card) return;
-  const miner = (miners || []).find((row) => row.ip === selectedIp);
-  if (!miner) {
-    card.hidden = true;
-    return;
-  }
-  card.hidden = false;
-  $("detail-title").textContent = shown(miner.name) ? miner.name : miner.ip;
-  const facts = $("detail-facts");
-  facts.replaceChildren();
-  factLine(
-    facts,
-    "Firmware",
-    miner.name_title,
-    shown(miner.firmware_update) ? `${miner.firmware_update} available` : "",
-  );
-  factLine(facts, "Hash", joinedTitle(miner.hash_title));
-  factLine(facts, "Core", miner.mv_title);
-  factLine(facts, "Shares", joinedTitle(miner.shares_title));
-  if (shown(miner.pool)) {
-    factLine(facts, "Pool", miner.fallback ? `${miner.pool} fallback` : miner.pool);
-  }
-  if (shown(miner.wifi)) factLine(facts, "WiFi", `${miner.wifi} dBm`);
-  if (shown(miner.reason)) factLine(facts, "Decision", miner.reason);
 }
 
 function applySnapshot(snapshot) {
@@ -560,8 +502,7 @@ function applySnapshot(snapshot) {
   appendLog(snapshot.log || []);
   syncScan(snapshot.scan);
   renderNetwork(snapshot.network);
-  renderFleet(snapshot.fleet, snapshot.odds, snapshot.miners || []);
-  renderDetail(snapshot.miners || []);
+  renderFleet(snapshot.fleet, snapshot.miners || []);
 }
 
 function windowFocused() {
@@ -720,7 +661,6 @@ async function submitEdit(event) {
       setFormError("edit-error", result.message);
       return;
     }
-    selectedIp = newIp;
     closeModal("edit");
     poll();
   } finally {
@@ -938,8 +878,6 @@ function bind() {
   $("settings-open").addEventListener("click", toggleSettingsMenu);
   $("scan-open").addEventListener("click", openScan);
   $("empty-scan").addEventListener("click", openScan);
-  $("detail-restart").addEventListener("click", restartSelected);
-  $("detail-remove").addEventListener("click", removeSelected);
   $("run").addEventListener("click", onRun);
   $("scan-form").addEventListener("submit", submitScan);
   $("scan-cancel").addEventListener("click", closeScan);
@@ -987,22 +925,19 @@ function bind() {
     if (!row) return;
     selectedIp = row.dataset.ip;
     renderTable(lastSnapshot.miners || []);
-    renderDetail(lastSnapshot.miners || []);
   });
-  $("miner-body").addEventListener("dblclick", (event) => {
-    const row = event.target.closest("tr");
-    if (!row) return;
-    selectedIp = row.dataset.ip;
-    renderTable(lastSnapshot.miners || []);
-    openEdit();
-  });
+  document.addEventListener("pointerdown", (event) => {
+    if (event.target.closest("#miner-body tr")) return;
+    if (event.target.closest("#row-menu")) return;
+    if (event.target.closest(".modal:not([hidden])")) return;
+    clearSelection();
+  }, true);
   $("miner-body").addEventListener("contextmenu", (event) => {
     const row = event.target.closest("tr");
     if (!row) return;
     event.preventDefault();
     selectedIp = row.dataset.ip;
     renderTable(lastSnapshot.miners || []);
-    renderDetail(lastSnapshot.miners || []);
     showRowMenu(event);
   });
 
@@ -1014,6 +949,7 @@ function bind() {
       }
       if (!$("row-menu").hidden) {
         hideMenu();
+        clearSelection();
         return;
       }
       if (!$("notice").hidden) {
