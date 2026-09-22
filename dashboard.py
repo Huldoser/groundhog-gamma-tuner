@@ -30,6 +30,7 @@ from autotune import (
     normalize_input_voltage,
     reset_miners_to_baseline,
     restart_bitaxe,
+    restart_miners,
 )
 from config import (
     DEFAULT_MAX_DROOP_MV,
@@ -870,6 +871,7 @@ class TunerDashboard:
         self._status_refresh_running = False
         self._stop_in_progress = False
         self._baseline_reset_running = False
+        self._restart_all_running = False
         self._start_pending = False
         self._rows = []
         self._log = deque(maxlen=LOG_LIMIT)
@@ -1072,6 +1074,8 @@ class TunerDashboard:
             self._reap_threads_locked()
             if self._baseline_reset_running:
                 blocked = "baseline"
+            elif self._restart_all_running:
+                blocked = "restart"
             elif (
                 self._start_pending
                 or self.running
@@ -1089,6 +1093,15 @@ class TunerDashboard:
             return _fail(
                 "Wait for the baseline reset to finish before starting.",
                 "Reset in Progress",
+                "warning",
+            )
+        if blocked == "restart":
+            self.log_message(
+                "Wait for the miner restart to finish before starting.", "warning"
+            )
+            return _fail(
+                "Wait for the miner restart to finish before starting.",
+                "Restart in Progress",
                 "warning",
             )
         if blocked == "running":
@@ -1221,6 +1234,8 @@ class TunerDashboard:
         with self._lock:
             if self._baseline_reset_running:
                 blocked = "reset"
+            elif self._restart_all_running:
+                blocked = "restart"
             elif (
                 self.running
                 or self._stop_in_progress
@@ -1236,6 +1251,16 @@ class TunerDashboard:
             return _fail(
                 "A baseline reset is already in progress.",
                 "Reset in Progress",
+                "warning",
+            )
+        if blocked == "restart":
+            self.log_message(
+                "Wait for the miner restart to finish before resetting to baseline.",
+                "warning",
+            )
+            return _fail(
+                "Wait for the miner restart to finish before resetting to baseline.",
+                "Restart in Progress",
                 "warning",
             )
         if blocked == "busy":
@@ -1275,6 +1300,64 @@ class TunerDashboard:
 
         threading.Thread(target=work, daemon=True).start()
         return {"ok": True}
+
+    def restart_all_miners(self):
+        """Restart every saved miner. The page confirms before it calls this."""
+        with self._lock:
+            if self._restart_all_running:
+                blocked = "restart"
+            elif self._baseline_reset_running:
+                blocked = "baseline"
+            else:
+                blocked = None
+                self._restart_all_running = True
+        if blocked == "restart":
+            self.log_message(
+                "A restart of all miners is already in progress.", "warning"
+            )
+            return _fail(
+                "A restart of all miners is already in progress.",
+                "Restart in Progress",
+                "warning",
+            )
+        if blocked == "baseline":
+            self.log_message(
+                "Wait for the baseline reset to finish before restarting miners.",
+                "warning",
+            )
+            return _fail(
+                "Wait for the baseline reset to finish before restarting miners.",
+                "Reset in Progress",
+                "warning",
+            )
+
+        miners = list(get_miners())
+        if not miners:
+            with self._lock:
+                self._restart_all_running = False
+            return _fail(
+                "Please add a miner first before restarting all miners.",
+                "No Miners Found",
+                "warning",
+            )
+
+        self.log_message("Restarting all miners.", "warning")
+
+        def work():
+            try:
+                restart_miners(miners, self.log_message)
+            finally:
+                with self._lock:
+                    self._restart_all_running = False
+                self.log_message("Restart of all miners finished.", "success")
+
+        threading.Thread(target=work, daemon=True).start()
+        return {
+            "ok": True,
+            "notice": _notice(
+                "info", "Restart Triggered", "Restarting every saved miner."
+            ),
+        }
 
     def start_scan(self, start_ip, end_ip):
         """Scan an inclusive IPv4 range. Only a Gamma 601 is saved."""
@@ -1442,6 +1525,7 @@ class TunerDashboard:
             )
         except (KeyError, TypeError, ValueError):
             return _fail("Please enter valid integer values.")
+
         def mutate(config):
             config.update(new_settings)
             config.pop("enforce_safe_pairing", None)
@@ -1491,7 +1575,9 @@ class TunerDashboard:
             fields = {}
             for field in ALL_AUTOTUNE_FIELDS:
                 try:
-                    fields[field] = parse_autotuner_value(field, incoming.get(field, ""))
+                    fields[field] = parse_autotuner_value(
+                        field, incoming.get(field, "")
+                    )
                 except (TypeError, ValueError):
                     return _fail(
                         f"Enter a number for {field.replace('_', ' ')} on {row.get('ip')}."
@@ -1751,12 +1837,15 @@ class TunerDashboard:
             status, label = "stopping", "Stopping"
         elif self._baseline_reset_running:
             status, label = "resetting", "Resetting"
+        elif self._restart_all_running and not self.running:
+            status, label = "restarting", "Restarting"
         elif self.running:
             status, label = "running", "Running"
         else:
             status, label = "idle", "Idle"
         reset_locked = (
             self._baseline_reset_running
+            or self._restart_all_running
             or self.running
             or self._stop_in_progress
             or self._start_pending
@@ -1766,6 +1855,9 @@ class TunerDashboard:
             "status": status,
             "status_label": label,
             "reset_enabled": not reset_locked,
+            "restart_all_enabled": not (
+                self._restart_all_running or self._baseline_reset_running
+            ),
             "scan_enabled": not self._scan_running,
         }
 
@@ -1844,6 +1936,9 @@ class DashboardApi:
 
     def restart_miner(self, ip):
         return self._dashboard.restart_miner(ip)
+
+    def restart_all_miners(self):
+        return self._dashboard.restart_all_miners()
 
     def get_global_settings(self):
         return self._dashboard.get_global_settings()

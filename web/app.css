@@ -140,7 +140,8 @@ h1 { font-size: 22px; letter-spacing: -0.02em; }
 
 .pill.running { background: var(--hold); color: var(--ok); }
 .pill.stopping,
-.pill.resetting { background: var(--trim); color: var(--warn); }
+.pill.resetting,
+.pill.restarting { background: var(--trim); color: var(--warn); }
 
 .updated {
   color: var(--muted);

@@ -117,6 +117,23 @@ def reset_miners_to_baseline(
         _reset_one_miner_to_baseline(miner, log_callback)
 
 
+def restart_miners(miners, log_callback, stagger_seconds=STARTUP_STAGGER_SECONDS):
+    """POST a restart for each saved miner.
+
+    A failed restart is logged and does not skip the miners after it.
+    """
+    started = 0
+    for miner in list(miners or []):
+        ip = str((miner or {}).get("ip") or "").strip()
+        if not ip:
+            continue
+        if started and stagger_seconds:
+            time.sleep(stagger_seconds)
+        started += 1
+        log_callback(f"Restarting miner at {ip}...", "warning")
+        log_callback(restart_bitaxe(ip), "warning")
+
+
 def _wait(stop_event, seconds):
     """Wait up to `seconds`. Return True if tuning was asked to stop."""
     if seconds is None or seconds <= 0:
@@ -652,9 +669,7 @@ def _quality_frequency_retreat(reason):
     text = (reason or "").lower()
     if "step frequency" not in text:
         return False
-    return (
-        "silicon wall" in text or "low hashrate" in text or "above target" in text
-    )
+    return "silicon wall" in text or "low hashrate" in text or "above target" in text
 
 
 def frequency_block_cleared(
