@@ -65,30 +65,50 @@ def _clear_miner_status(ip):
         _miner_status.pop(ip, None)
 
 
-def reset_miners_to_baseline(miners, log_callback, stagger_seconds=STARTUP_STAGGER_SECONDS):
+def _reset_one_miner_to_baseline(miner, log_callback):
+    """Write factory clocks for one miner and forget its learned setpoint."""
+    ip = (miner or {}).get("ip")
+    if not ip:
+        return
+    message = set_system_settings(ip, STOCK_VOLT, STOCK_FREQ)
+    log_callback(message, "success" if settings_were_applied(message) else "error")
+    update_miner(ip, {
+        "last_good_freq": "",
+        "last_good_volt": "",
+        "wall_type": "",
+        "wall_timestamp": "",
+        "target_hashrate": "",
+        "start_freq": STOCK_FREQ,
+        "start_volt": STOCK_VOLT,
+    })
+    _clear_miner_status(ip)
+
+
+def reset_miners_to_baseline(miners, log_callback, stagger_seconds=STARTUP_STAGGER_SECONDS, parallel=False):
     """Write factory clocks and forget the learned setpoint for each saved miner.
 
     A failed write is logged and does not skip clearing that miner or the ones after it.
     Min, max, temperature, and power limits are left as the user set them.
+    parallel=True starts every write together and ignores the stagger.
     """
-    for index, miner in enumerate(list(miners or [])):
+    miners = list(miners or [])
+    if parallel:
+        threads = []
+        for miner in miners:
+            thread = threading.Thread(
+                target=_reset_one_miner_to_baseline,
+                args=(miner, log_callback),
+                daemon=True,
+            )
+            thread.start()
+            threads.append(thread)
+        for thread in threads:
+            thread.join()
+        return
+    for index, miner in enumerate(miners):
         if index > 0 and stagger_seconds:
             time.sleep(stagger_seconds)
-        ip = (miner or {}).get("ip")
-        if not ip:
-            continue
-        message = set_system_settings(ip, STOCK_VOLT, STOCK_FREQ)
-        log_callback(message, "success" if settings_were_applied(message) else "error")
-        update_miner(ip, {
-            "last_good_freq": "",
-            "last_good_volt": "",
-            "wall_type": "",
-            "wall_timestamp": "",
-            "target_hashrate": "",
-            "start_freq": STOCK_FREQ,
-            "start_volt": STOCK_VOLT,
-        })
-        _clear_miner_status(ip)
+        _reset_one_miner_to_baseline(miner, log_callback)
 
 
 def _wait(stop_event, seconds):
