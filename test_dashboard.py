@@ -902,6 +902,80 @@ class SnapshotTests(unittest.TestCase):
                 self.assertTrue(called.wait(2))
         self.assertFalse(seen["kwargs"].get("parallel", False))
 
+    def test_restart_all_miners_restarts_each_saved_miner(self):
+        first = config.new_miner_record(
+            "BM1370 601", "10.0.0.8", "Alpha", config.get_default_config()
+        )
+        second = config.new_miner_record(
+            "BM1370 601", "10.0.0.9", "Beta", config.get_default_config()
+        )
+        called = threading.Event()
+        release = threading.Event()
+        seen = {}
+
+        def fake_restart(*args, **kwargs):
+            seen["args"] = args
+            seen["kwargs"] = kwargs
+            called.set()
+            release.wait(2)
+
+        with temp_config([first, second]):
+            app = TunerDashboard()
+            with mock.patch("dashboard.restart_miners", fake_restart):
+                result = DashboardApi(app).restart_all_miners()
+                self.assertTrue(result["ok"])
+                self.assertEqual(result["notice"]["title"], "Restart Triggered")
+                self.assertTrue(called.wait(2))
+                blocked = app.restart_all_miners()
+                self.assertFalse(blocked["ok"])
+                self.assertIn("already in progress", blocked["message"])
+                release.set()
+                for _ in range(40):
+                    if not app._restart_all_running:
+                        break
+                    time.sleep(0.05)
+        self.assertEqual(
+            [miner["ip"] for miner in seen["args"][0]], ["10.0.0.8", "10.0.0.9"]
+        )
+        self.assertNotIn("stagger_seconds", seen["kwargs"])
+        self.assertFalse(app._restart_all_running)
+
+    def test_restart_all_without_miners_stays_idle(self):
+        with temp_config([]):
+            app = TunerDashboard()
+            result = app.restart_all_miners()
+            self.assertFalse(result["ok"])
+            self.assertIn("add a miner", result["message"])
+            self.assertFalse(app._restart_all_running)
+            controls = app.get_snapshot(0)["controls"]
+            self.assertEqual(controls["status"], "idle")
+            self.assertTrue(controls["restart_all_enabled"])
+
+    def test_restart_all_waits_for_baseline_and_blocks_start(self):
+        miner = config.new_miner_record(
+            "BM1370 601", "10.0.0.8", "Alpha", config.get_default_config()
+        )
+        with temp_config([miner]):
+            app = TunerDashboard()
+            app._baseline_reset_running = True
+            during_reset = app.restart_all_miners()
+            self.assertFalse(during_reset["ok"])
+            self.assertFalse(app._restart_all_running)
+
+            app._baseline_reset_running = False
+            app._restart_all_running = True
+            during_restart = app.reset_baseline()
+            self.assertFalse(during_restart["ok"])
+            self.assertFalse(app._baseline_reset_running)
+            started = app.start_autotuner()
+            self.assertFalse(started["ok"])
+            self.assertIn("restart", started["message"])
+            controls = app.get_snapshot(0)["controls"]
+            self.assertEqual(controls["status"], "restarting")
+            self.assertEqual(controls["status_label"], "Restarting")
+            self.assertFalse(controls["reset_enabled"])
+            self.assertFalse(controls["restart_all_enabled"])
+
     def test_subnet_fleet_and_pool(self):
         self.assertEqual(
             dashboard.subnet_range_for("192.168.8.40"), ("192.168.8.1", "192.168.8.254")

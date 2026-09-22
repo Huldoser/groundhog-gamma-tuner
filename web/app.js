@@ -33,6 +33,7 @@ let lastSnapshot = {
     status: "idle",
     status_label: "Idle",
     reset_enabled: true,
+    restart_all_enabled: true,
     scan_enabled: true,
   },
 };
@@ -165,6 +166,7 @@ function applyControls(controls) {
   const busy = runBusy || status === "stopping";
   run.setAttribute("aria-busy", busy ? "true" : "false");
   $("reset").disabled = !controls.reset_enabled;
+  $("restart-all").disabled = !controls.restart_all_enabled;
   $("scan-open").disabled = !controls.scan_enabled;
   if ($("empty-scan")) $("empty-scan").disabled = !controls.scan_enabled;
 }
@@ -554,6 +556,21 @@ async function onRun() {
   }
 }
 
+async function restartAll() {
+  const bridge = api();
+  if (!bridge) return;
+  const yes = await confirmAction({
+    title: "Restart All Miners",
+    message: "Restart every saved miner?",
+    confirmLabel: "Restart",
+    danger: true,
+  });
+  if (!yes) return;
+  const result = await bridge.restart_all_miners();
+  if (result && result.notice) showNotice(result.notice);
+  poll();
+}
+
 async function onReset() {
   const bridge = api();
   if (!bridge) return;
@@ -910,6 +927,7 @@ function bind() {
     hideSettingsMenu();
     if (action === "global") openGlobal();
     if (action === "tuner") openTuner();
+    if (action === "restart-all") restartAll();
     if (action === "reset") onReset();
   });
 

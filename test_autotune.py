@@ -414,8 +414,12 @@ class DecisionTests(unittest.TestCase):
         self.assertEqual(autotune.reject_reason_class("difficulty-too-low"), "above")
         self.assertEqual(autotune.reject_reason_class("Invalid JobID"), "stale")
         self.assertEqual(autotune.reject_reason_class("invalid-job-id"), "stale")
-        self.assertEqual(autotune.reject_reason_class("Invalid nonce2 length"), "ignore")
-        self.assertEqual(autotune.reject_reason_class("Invalid Bitcoin address"), "ignore")
+        self.assertEqual(
+            autotune.reject_reason_class("Invalid nonce2 length"), "ignore"
+        )
+        self.assertEqual(
+            autotune.reject_reason_class("Invalid Bitcoin address"), "ignore"
+        )
         self.assertEqual(autotune.reject_reason_class("invalid-channel-id"), "ignore")
         self.assertEqual(autotune.reject_reason_class("Invalid"), "hardware")
 
@@ -1983,8 +1987,9 @@ class SessionTests(unittest.TestCase):
         def log(message, level="info"):
             logs.append(message)
 
-        with patched_io(get_info, set_settings, runtime_config=runtime), mock.patch.object(
-            autotune, "update_miner", update
+        with (
+            patched_io(get_info, set_settings, runtime_config=runtime),
+            mock.patch.object(autotune, "update_miner", update),
         ):
             thread = _start_miner(
                 "miner",
@@ -1997,7 +2002,9 @@ class SessionTests(unittest.TestCase):
             thread.join(3)
         self.assertFalse(thread.is_alive())
         self.assertIn((495, 1400), state["calls"])
-        self.assertTrue(any(freq < 500 and volt < 1400 for freq, volt in state["calls"]))
+        self.assertTrue(
+            any(freq < 500 and volt < 1400 for freq, volt in state["calls"])
+        )
         self.assertTrue(
             any("Frequency retreat. Trimming voltage." in message for message in logs)
         )
@@ -2078,9 +2085,7 @@ class SessionTests(unittest.TestCase):
             thread.join(3)
         self.assertFalse(thread.is_alive())
         self.assertIsNotNone(state["stepped_from"])
-        after_drop = [
-            freq for freq, _volt in state["calls"][state["drop_at"] + 1 :]
-        ]
+        after_drop = [freq for freq, _volt in state["calls"][state["drop_at"] + 1 :]]
         self.assertFalse(
             any(freq >= state["stepped_from"] for freq in after_drop),
             (state["stepped_from"], state["calls"]),
@@ -2473,6 +2478,52 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(set(calls), {"10.0.0.1", "10.0.0.2"})
         self.assertEqual(set(cleared), {"10.0.0.1", "10.0.0.2"})
         self.assertEqual(len(calls), 2)
+
+    def test_restart_miners_keeps_going_after_a_failure(self):
+        calls = []
+        logs = []
+
+        def restart(ip):
+            calls.append(ip)
+            if ip == "bad":
+                return f"{ip} -> Error restarting system: down"
+            return f"{ip} -> Restart initiated."
+
+        def log(message, level="info"):
+            logs.append((level, message))
+
+        with mock.patch.object(autotune, "restart_bitaxe", restart):
+            autotune.restart_miners(
+                [{"ip": "bad"}, {"ip": ""}, {"ip": "good"}],
+                log,
+                stagger_seconds=0,
+            )
+
+        self.assertEqual(calls, ["bad", "good"])
+        self.assertEqual(
+            logs,
+            [
+                ("warning", "Restarting miner at bad..."),
+                ("warning", "bad -> Error restarting system: down"),
+                ("warning", "Restarting miner at good..."),
+                ("warning", "good -> Restart initiated."),
+            ],
+        )
+
+    def test_restart_miners_staggers_after_the_first(self):
+        slept = []
+        with (
+            mock.patch.object(autotune, "restart_bitaxe", lambda ip: f"{ip} ok"),
+            mock.patch.object(autotune.time, "sleep", slept.append),
+        ):
+            autotune.restart_miners(
+                [{"ip": "a"}, {"ip": "b"}, {"ip": "c"}],
+                lambda *args: None,
+            )
+        self.assertEqual(
+            slept,
+            [autotune.STARTUP_STAGGER_SECONDS, autotune.STARTUP_STAGGER_SECONDS],
+        )
 
     def test_overclock_flag_is_sent_with_the_setpoint(self):
         class FakeResponse:
@@ -3449,9 +3500,12 @@ class InstallAndConfigTests(unittest.TestCase):
         self.assertNotIn('class="danger"', html)
         menu = html.split('id="settings-menu"', 1)[1].split('id="row-menu"', 1)[0]
         self.assertLess(menu.find("AutoTuner Settings"), menu.find("Global Settings"))
+        self.assertLess(menu.find("Global Settings"), menu.find("Restart All Miners"))
         self.assertLess(
-            menu.find("Global Settings"), menu.find("Reset All to Baseline")
+            menu.find("Restart All Miners"), menu.find("Reset All to Baseline")
         )
+        self.assertIn('id="restart-all"', menu)
+        self.assertIn("restart_all_miners", script)
         self.assertIn('id="reset"', menu)
         for label in (
             "Edit Miner Settings",
@@ -3517,7 +3571,9 @@ class InstallAndConfigTests(unittest.TestCase):
         )[0]
         self.assertNotIn('id="run"', toolbar)
         statusbar = html.split('class="statusbar"', 1)[1].split("</footer>", 1)[0]
-        self.assertLess(statusbar.find('id="updated"'), statusbar.find('id="network-diff"'))
+        self.assertLess(
+            statusbar.find('id="updated"'), statusbar.find('id="network-diff"')
+        )
         self.assertIn("stratum.ckpool.org", statusbar)
         self.assertIn("public-pool.io", statusbar)
         self.assertNotIn('class="group"', html)
