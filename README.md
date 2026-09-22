@@ -75,7 +75,7 @@ Use Task Scheduler so the window opens after you sign in.
 2. Choose **Create Basic Task**. Name it `Groundhog Gamma Tuner`.
 3. Trigger: **When I log on**.
 4. Action: **Start a program**.
-5. Program: the full path to `run.bat`. Example: `C:\Users\YourName\bitaxe-temp-monitor\run.bat`
+5. Program: the full path to `run.bat`. Example: `C:\Users\YourName\groundhog-gamma-tuner\run.bat`
 6. On **Conditions**, clear **Start the task only if the computer is on AC power**.
 
 ## Disclaimer
