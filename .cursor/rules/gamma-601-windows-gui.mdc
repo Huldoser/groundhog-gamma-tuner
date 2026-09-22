@@ -1,0 +1,15 @@
+---
+description: Tune only a Bitaxe Gamma 601 from the Windows ARM tablet GUI
+alwaysApply: true
+---
+
+# Gamma 601 Windows GUI
+
+This repo tunes a custom Bitaxe Gamma 601 (ASIC BM1370, board version 601) on a Windows ARM tablet.
+
+- Run it with `python main.py`. That opens the Tk GUI.
+- Install dependencies from `requirements.txt`. Tkinter comes with Windows Python.
+- Keep the live `is_gamma_601` check. Do not tune any other board.
+- A network scan or manual add may save only a Gamma 601. Set the row type from the board (`BM1370 601`).
+- Do not add Docker, a web server, Flask, or Linux, macOS, or Raspberry Pi launch paths.
+- A different device type is a later rewrite, not a new branch in this code.

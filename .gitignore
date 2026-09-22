@@ -8,3 +8,11 @@ venv/
 # IDE specific folders
 .vscode/
 .idea/
+
+# Live miner list and learned setpoints. The app creates config.json if it is missing.
+config.json
+.config-*.json
+
+# Local logs and secrets
+*.log
+.env

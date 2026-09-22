@@ -1,244 +1,84 @@
-# Bitaxe Temperature Monitor and Auto-Tuner
+# Bitaxe Gamma 601 Auto-Tuner
 
-This project contains a Python-based monitoring and auto-tuning application for the Bitaxe Gamma 601 Bitcoin solo miner. This tool dynamically adjusts operating frequency and voltage to achieve optimal hash rate while preventing overheating.
+A personal desktop tuner for one setup: custom-cooled Bitaxe Gamma 601 boards (ASIC BM1370, board version 601) on a Windows ARM tablet. The clocks, voltage, temperatures, and power guard in this repository are highly optimized for that cooling and that power supply. The app checks the live board and saves a miner only when AxeOS reports a BM1370 on board 601. It refuses every other board. It is not a tuner for a stock Gamma, and it is not a multi-model Bitaxe app.
 
-## Overview
+It runs as a Python Tk window, watches the miner's AxeOS API, and adjusts frequency and voltage to hold a higher hash rate without crossing that board's limits.
 
-The **Bitaxe Temp Monitor & Auto-Tuner** continuously polls the Bitaxe's `/api/system/info` endpoint to monitor current temperature, hash rate, and voltage. Based on configurable parameters (target temperature, interval, voltage step, etc.), the script automatically adjusts:
+## Credit
 
-  - **Frequency**: Decreases frequency if the temperature exceeds the target or increases it if the temperature is well below the target.
-  - **Voltage**: If frequency adjustments alone are insufficient or at their limits, voltage is also adjusted within safe operating ranges.
+This project is a heavily modified fork of [bitaxe-temp-monitor](https://github.com/Hurllz/bitaxe-temp-monitor) by [Hurllz](https://github.com/Hurllz). Copyright in the original work remains with Hurllz. Copyright in these modifications is held by Andrey Rychkov. This copy is published at [Huldoser/bitaxe-temp-monitor](https://github.com/Huldoser/bitaxe-temp-monitor).
 
-The app aims to maximize the miner's hash rate while maintaining stable and safe operation.
+The upstream project also includes work by [DeanCollier](https://github.com/DeanCollier), Andrew Kuehne ([andewkuehne](https://github.com/andewkuehne)), [mrv777](https://github.com/mrv777), and GUI work credited to Birdman332. The headless web server, Docker setup, and Linux, macOS, and Raspberry Pi launch paths from that project are not in this fork.
 
-## Features
+This is an unofficial tool. It is not affiliated with Hurllz or the Bitaxe project.
 
-  - **Automatic Auto-Tuning**: Continuously monitors the Bitaxe's performance and temperature.
-  - **Dynamic Adjustment**: Automatically adjusts frequency and voltage in real-time based on temperature and hash rate.
-  - **Dual-Mode Operation**: Run as a desktop GUI or a headless web server.
-  - **Docker Support**: Includes `Dockerfile` and `docker-compose.yaml` for easy deployment.
-  - **Graceful Shutdown**: Listens for interrupt signals (Ctrl+C) and exits safely.
-  - **Customizable Parameters**: Easily modify settings such as target temperature, sample interval, and safe operating limits.
-  - **Cross-Platform Support**: Works on **Windows**, **Linux**, **macOS**, and **Raspberry Pi**.
+## What it does
+
+1. Confirms the board is a Gamma 601, enables overclocking, and applies the last good frequency and voltage for that chip, or the starting setpoint.
+2. Polls AxeOS and waits until the miner reports the new setpoint before the next step.
+3. Lowers frequency if ASIC temperature, regulator temperature, power, input voltage, or core-voltage droop crosses the limit.
+4. Raises voltage only when the ASIC error percentage is above the budget, then raises frequency while errors stay inside that budget.
+5. Trims voltage down at the ceiling, then holds. The last good setpoint is saved so the next start does not begin from stock. The fan stays at full speed for the whole session, so a warmer room is what moves the clocks.
+
+## This setup
+
+These Gammas use a custom shell with better cooling than a stock board. Most can hold higher clocks than the usual 700–800 MHz, but each BM1370 is different and the tuner stops that chip on heat or errors. It does not assume every board can hold the frequency cap.
+
+The power supply is oversized for this setup and is not the tuning limit. The 50 W figure is a fault guard. If a barrel jack or board trace ever runs hot, lower that miner's watt cap.
+
+Operating targets are about 65°C on the chip and 85°C on the regulator. The tuner stops climbing there and steps frequency down before 70°C on the chip and 90°C on the regulator. A hotter afternoon takes a larger step than a one-degree drift. A cooler night lets a chip that is still under its frequency cap climb again.
+
+AxeOS will still emergency-stop at 75°C on the ASIC or 105°C on the regulator, then restart about 100 MHz and 100 mV lower. These limits stay under that, so the tuner remains the controller. Core voltage stays at or below 1300 mV.
+
+Those targets match this cooling and this power supply. Another board, a stock cooler, or a smaller supply needs its own limits.
 
 ## Requirements
 
-  - **Python 3.x** (tested with Python 3.9+)
-  - All required Python modules are listed in `requirements.txt`. Key dependencies include:
-      - `requests`
-      - `pandas`
-      - `Flask`
-      - `gunicorn`
-      - `tkinter`
-          - Pre-installed on Windows
-          - May require manual installation on Linux/macOS
+- Windows on ARM tablet
+- Python 3 for Windows ARM64, from [python.org](https://www.python.org/downloads/windows/). The installer includes Tkinter.
+- The `requests` package listed in `requirements.txt`
 
------
+## Install
 
-## Installation
+Open Command Prompt in this folder:
 
-### 🪟 Windows
-
-1.  Open Command Prompt as Administrator.
-
-2.  Clone the repository:
-
-    ```bash
-    git clone https://github.com/andewkuehne/bitaxe-temp-monitor.git
-    cd bitaxe-temp-monitor
-    ```
-
-3.  Install dependencies:
-
-    ```bash
-    pip install -r requirements.txt
-    ```
-
------
-
-### 🍎 macOS
-
-1.  Open a terminal window.
-
-2.  Install Homebrew (if not already installed):
-
-    ```bash
-    /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-    ```
-
-3.  Install Python 3 and Tkinter:
-
-    ```bash
-    brew install python
-    brew install tcl-tk
-    ```
-
-4.  Add this to your shell profile (`~/.zshrc`, `~/.bash_profile`, or `~/.bashrc`):
-
-    ```bash
-    export PATH="/opt/homebrew/opt/python/libexec/bin:$PATH"
-    export LDFLAGS="-L/opt/homebrew/opt/tcl-tk/lib"
-    export CPPFLAGS="-I/opt/homebrew/opt/tcl-tk/include"
-    export PKG_CONFIG_PATH="/opt/homebrew/opt/tcl-tk/lib/pkgconfig"
-    ```
-
-5.  Apply changes:
-
-    ```bash
-    source ~/.zshrc   # or ~/.bash_profile
-    ```
-
-6.  Clone the project:
-
-    ```bash
-    git clone https://github.com/andewkuehne/bitaxe-temp-monitor.git
-    cd bitaxe-temp-monitor
-    ```
-
-7.  Install dependencies:
-
-    ```bash
-    pip3 install -r requirements.txt
-    ```
-
------
-
-### 🐧 Linux
-
-1.  Open a terminal window.
-
-2.  Clone the repository:
-
-    ```bash
-    git clone https://github.com/andewkuehne/bitaxe-temp-monitor.git
-    cd bitaxe-temp-monitor
-    ```
-
-3.  Install dependencies:
-
-    ```bash
-    sudo apt-get install python3-tk
-    pip3 install -r requirements.txt
-    ```
-
------
-
-### 🍓 Raspberry Pi (RPi 5)
-
-1.  Open a terminal window.
-
-2.  Clone the repository:
-
-    ```bash
-    git clone https://github.com/andewkuehne/bitaxe-temp-monitor.git
-    cd bitaxe-temp-monitor
-    ```
-
-3.  Install dependencies:
-
-    ```bash
-    sudo apt update
-    sudo apt install -y python3 python3-pip python3-tk
-    pip3 install --upgrade pip
-    pip3 install -r requirements.txt
-    ```
-
------
-
-## Usage
-
-The application can be run in two different modes.
-
-### 1\. Desktop GUI (Default)
-
-To launch the desktop application, run the script without any arguments. This is ideal for managing a miner on your local machine.
-
-```bash
-python3 main.py
+```bat
+pip install -r requirements.txt
 ```
 
-### 2\. Headless Web Server
+## Run
 
-To launch the web interface, use the `headless` argument. This is perfect for remote servers.
-
-```bash
-python3 main.py headless
+```bat
+python main.py
 ```
 
-Once running, access the interface from a web browser at `http://<your_server_ip>:5000`.
+The tablet and the Gamma 601 need to be on the same network. Add the miner by IP, or scan a range. The app saves a miner only after AxeOS reports a BM1370 on board 601.
 
------
+## Desktop shortcut
 
-## Deployment with Docker (Recommended for Servers)
+Right-click `launch.bat` and choose **Send to > Desktop (create shortcut)**. That shortcut starts the window with no console. `launch.bat` switches to this folder first. Settings are saved in `config.json` next to the scripts. If that file is missing, the app creates it. `config.example.json` is the starting template, with an empty miner list.
 
-Using Docker is the best way to run the web server for a stable, long-running deployment.
+## Start when you log on
 
-### Prerequisites
+Use Task Scheduler so the window opens after you sign in.
 
-  - You are on a Linux server with **Docker** and **Docker Compose** installed.
-
-### Steps
-
-1.  **Navigate to the project directory:**
-    ```bash
-    cd bitaxe-temp-monitor
-    ```
-2.  **Launch the container:**
-    Run the application in detached mode (`-d`) to have it run in the background.
-    ```bash
-    docker-compose up -d
-    ```
-3.  **Access the Web Interface:**
-    Navigate to `http://<your_server_ip>:5000` in your web browser.
-
-### Managing the Docker Container
-
-  - **View Logs:** `docker-compose logs -f`
-  - **Stop the App:** `docker-compose down`
-  - **Update the App:** After a `git pull`, rebuild and restart with `docker-compose up -d --build`.
-
------
-
-## How It Works
-
-1.  **Initialization**: Applies the initial voltage and frequency settings to the Bitaxe.
-2.  **Autotuning Loop**:
-      - Continuously polls the Bitaxe API.
-      - Decreases frequency or voltage if the temperature exceeds the target.
-      - Increases frequency or voltage if temperature is well below target and hashrate is low.
-3.  **Dynamic Adjustment**: Applies updated settings in real-time.
-4.  **Graceful Exit**: On shutdown, the current state is logged and the app exits cleanly.
-
------
+1. Press Win+R, type `taskschd.msc`, and press Enter.
+2. Choose **Create Basic Task**. Name it `Bitaxe Auto-Tuner`.
+3. Trigger: **When I log on**.
+4. Action: **Start a program**.
+5. Program: the full path to `launch.bat`. Example: `C:\Users\YourName\bitaxe-temp-monitor\launch.bat`
+6. On **Conditions**, clear **Start the task only if the computer is on AC power**.
 
 ## Disclaimer
 
-**WARNING:** This tool modifies hardware settings and may stress-test your Bitaxe. Although safeguards are in place, running the miner outside its standard operating parameters can pose risks. Use this script at your own risk. The authors are not responsible for any damage to your hardware.
+This program writes frequency, voltage, fan, and overclock settings to a miner. The limits in this repository were chosen for the author's custom-cooled Gamma 601 boards and oversized power supply. They are above stock clocks. They are for that cooling and that power, not for someone else's board.
 
------
+Overclocking can overheat the ASIC, the regulator, the board, or the barrel jack. That can damage the hardware or start a fire. A stock cooler, a weak supply, a loose jack, or a warm room makes that more likely.
 
-## Contributors
+You are responsible for the cooling, power, and limits on your own hardware. Read the settings before you start, and lower them if you are not sure.
 
-  - **Birdman332** (Reddit): Created GUI management features.
-  - **AndrewKuehne** (GitHub): Create the web interface and docker environment.
-
------
-
-## Contributing
-
-Contributions, bug reports, and feature requests are welcome\! Feel free to open an issue or submit a pull request.
-
------
-
-## Inspirational Shoutouts
-
-The benchmark tool below is highly recommended for baselining and optimizing your miner's tuning:
-
-1.  **WhiteyCookie**: [Bitaxe-Hashrate-Benchmark](https://github.com/WhiteyCookie/Bitaxe-Hashrate-Benchmark)
-2.  **mrv777**: [Forked Bitaxe Benchmark](https://github.com/mrv777/bitaxe-hashrate-benchmark)
-
------
+The software is provided as is, without warranty. Andrey Rychkov and the other authors are not responsible for damaged hardware, injury, fire, lost mining, or any other loss from using it. The legal warranty disclaimer is in the [MIT License](LICENSE).
 
 ## License
 
-This project is licensed under the [MIT License](https://www.google.com/search?q=LICENSE).
+MIT. Copyright (c) 2025 Hurllz and Copyright (c) 2026 Andrey Rychkov. See [LICENSE](LICENSE).

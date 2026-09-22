@@ -1,900 +1,1607 @@
-import tkinter as tk
-from tkinter import scrolledtext, ttk, messagebox
-import threading
-from datetime import datetime
-from config import get_miner_defaults, add_miner, remove_miner, get_miners, update_miner, load_config, save_config, detect_miners
-from autotune import monitor_and_adjust, stop_autotuning, get_system_info, restart_bitaxe
+import ipaddress
 import os
-import sys
-import time
-import webbrowser
 import platform
+import sys
+import threading
+import time
+import tkinter as tk
+import webbrowser
+from datetime import datetime
+from tkinter import messagebox, scrolledtext, ttk
+
+from autotune import (
+    STARTUP_STAGGER_SECONDS,
+    get_miner_status,
+    get_system_info,
+    monitor_and_adjust,
+    reset_miners_to_baseline,
+    restart_bitaxe,
+)
+from config import (
+    GAMMA601_LIMITS,
+    HARD_MAX_FREQ,
+    HARD_MAX_VOLT,
+    HARD_MIN_FREQ,
+    HARD_MIN_VOLT,
+    STOCK_FREQ,
+    STOCK_VOLT,
+    add_miner,
+    detect_miners,
+    get_miner_defaults,
+    get_miners,
+    is_gamma_601,
+    load_config,
+    miner_type_from_info,
+    save_config,
+)
+
+BG = "#141414"
+PANEL = "#1c1c1c"
+TEXT = "#f2f2f2"
+MUTED = "#9a9a9a"
+ACCENT = "#e0a100"
+ACCENT_TEXT = "#141414"
+SELECTION = "#8a5a00"
+DANGER = "#6e3030"
+QUIET = "#2a2a2a"
+FIELD_BG = "#2a2a2a"
+HOLD = "#1e3a2a"
+CLIMB = "#1a2e44"
+TRIM = "#3a3018"
+ALERT = "#3a1e1e"
+
+FONT = ("Segoe UI", 11)
+FONT_SMALL = ("Segoe UI", 9)
+FONT_BOLD = ("Segoe UI", 11, "bold")
+FONT_TITLE = ("Segoe UI", 18, "bold")
+FONT_SECTION = ("Segoe UI", 12, "bold")
+
+IDLE_POLL_SECONDS = 10
+TREE_COLUMNS = ("Name", "IP", "Freq", "mV", "ASIC", "VR", "GH/s", "W", "Phase", "Error", "Setpoint")
+COL_NAME, COL_IP, COL_FREQ, COL_MV, COL_ASIC, COL_VR, COL_HASH, COL_WATTS, COL_PHASE, COL_ERROR, COL_SETPOINT = range(11)
+
+FREQ_FIELDS = (("min_freq", "Min"), ("start_freq", "Start"), ("max_freq", "Max"))
+VOLT_FIELDS = (("min_volt", "Min"), ("start_volt", "Start"), ("max_volt", "Max"))
+LIMIT_FIELDS = (
+    ("max_temp", "ASIC temp (°C)"),
+    ("max_watts", "Watts"),
+    ("max_vr_temp", "VR temp (°C)"),
+    ("min_input_voltage", "Input voltage (V)"),
+    ("max_error_percentage", "Error %"),
+)
+ALL_AUTOTUNE_FIELDS = tuple(field for field, _label in (*FREQ_FIELDS, *VOLT_FIELDS, *LIMIT_FIELDS))
+
+
+def enable_windows_dpi_awareness():
+    """Make Tk honor the tablet's per-monitor scale factor."""
+    if platform.system() != "Windows":
+        return
+    try:
+        import ctypes
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except Exception:
+        try:
+            import ctypes
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+
+def fit_window_to_work_area(root):
+    """Size the window to the screen instead of a fixed 1300x700."""
+    root.update_idletasks()
+    screen_w = max(320, int(root.winfo_screenwidth()) - 16)
+    screen_h = max(240, int(root.winfo_screenheight()) - 72)
+    root.geometry(f"{screen_w}x{screen_h}+0+0")
+    root.minsize(min(640, screen_w), min(480, screen_h))
+
+
+def blank_miner_row(nickname, ip):
+    """Tree row: name, address, then live readings. Board type is kept beside the row."""
+    return (nickname, ip, "-", "-", "-", "-", "-", "-", "-", "-", "-")
+
+
+def parse_autotuner_value(field, raw):
+    """Parse one AutoTuner cell. Frequency and voltage are clamped to the Gamma 601 range."""
+    text = str(raw).strip()
+    if text == "":
+        return ""
+    if field in ("min_input_voltage", "max_error_percentage"):
+        return float(text)
+    number = int(float(text))
+    if field in ("min_freq", "max_freq", "start_freq"):
+        return max(HARD_MIN_FREQ, min(HARD_MAX_FREQ, number))
+    if field in ("min_volt", "max_volt", "start_volt"):
+        return max(HARD_MIN_VOLT, min(HARD_MAX_VOLT, number))
+    return number
+
+
+def format_learned_wall(status, stored):
+    wall = (status or {}).get("wall_type") or (stored or {}).get("wall_type") or ""
+    freq = (status or {}).get("last_good_freq")
+    volt = (status or {}).get("last_good_volt")
+    if freq in ("", None):
+        freq = (stored or {}).get("last_good_freq") or ""
+    if volt in ("", None):
+        volt = (stored or {}).get("last_good_volt") or ""
+    if wall and freq not in ("", None) and volt not in ("", None):
+        return f"{wall} {freq}/{volt}"
+    if freq not in ("", None) and volt not in ("", None):
+        return f"{freq}/{volt}"
+    return wall or "-"
+
+
+def parse_display_number(value):
+    if value in (None, "", "-"):
+        return None
+    cleaned = str(value).replace("°C", "").replace("°", "").replace("%", "").replace(",", "").strip()
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
+def format_number(value, digits):
+    number = parse_display_number(value)
+    if number is None:
+        return "-"
+    if digits == 0:
+        return str(int(round(number)))
+    return f"{number:.{digits}f}"
+
+
+def over_limit(value, limit):
+    limit_number = parse_display_number(limit)
+    if value is None or limit_number is None:
+        return False
+    return value > limit_number
+
+
+def row_state_tag(phase, asic_text, error_text, max_temp, max_error):
+    """Color a miner row from its phase, or red when it is offline or past a limit."""
+    phase_name = str(phase or "").strip().lower()
+    if phase_name == "offline":
+        return "alert"
+    if over_limit(parse_display_number(asic_text), max_temp):
+        return "alert"
+    if over_limit(parse_display_number(error_text), max_error):
+        return "alert"
+    if phase_name == "hold":
+        return "hold"
+    if phase_name == "climb":
+        return "climb"
+    if phase_name == "trim":
+        return "trim"
+    return "idle"
 
 
 def resource_path(relative_path):
-    """Get absolute path to resource (for PyInstaller compatibility)"""
+    """Get absolute path to resource (for PyInstaller compatibility)."""
     try:
-        base_path = sys._MEIPASS  # When running from PyInstaller bundle
+        base_path = sys._MEIPASS
     except Exception:
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
 
+
+class WrappingButtonRow(tk.Frame):
+    """A row of controls that moves onto the next line when the window is narrow."""
+
+    def __init__(self, master, bg):
+        super().__init__(master, bg=bg)
+        self._widgets = []
+        self._last_width = 0
+        self.bind("<Configure>", self._reflow)
+
+    def add(self, widget):
+        self._widgets.append(widget)
+
+    def reflow(self):
+        self._last_width = 0
+        self._reflow()
+
+    def _reflow(self, event=None):
+        if event is not None and event.widget is not self:
+            return
+        width = event.width if event is not None and event.width > 1 else self.winfo_width()
+        if width <= 1:
+            width = self.winfo_screenwidth()
+        if width == self._last_width:
+            return
+        self._last_width = width
+        for widget in self._widgets:
+            widget.grid_forget()
+        columns = self.grid_size()[0]
+        for column in range(columns):
+            self.columnconfigure(column, minsize=0, weight=0)
+        x = 0
+        row = 0
+        column = 0
+        for widget in self._widgets:
+            widget.update_idletasks()
+            needed = widget.winfo_reqwidth() + 8
+            if column and x + needed > width:
+                row += 1
+                column = 0
+                x = 0
+            widget.grid(row=row, column=column, padx=(0, 8), pady=(0, 8), sticky="w")
+            x += needed
+            column += 1
+
+
 class BitaxeAutotuningApp:
     def __init__(self):
+        enable_windows_dpi_awareness()
         self.root = tk.Tk()
-        self.root.title("Bitaxe Multi Autotuner")
-        self.root.geometry("1300x700")
-
-        if platform.system() == "Windows":
-            try:
-                self.root.iconbitmap(resource_path("bitaxe_icon.ico"))
-            except:
-                pass # Icon loading can silently fail if not found or invalid
-
-        self.root.config(bg="black")
+        self.root.title("Bitaxe Gamma 601")
+        fit_window_to_work_area(self.root)
+        self._apply_icon(self.root)
+        self.root.configure(bg=BG)
         self.root.resizable(True, True)
 
         self.running = False
         self.threads = []
-
-        # Enable Full-Screen Toggle
-        self.root.bind("<F11>", self.toggle_fullscreen)
-        self.root.bind("<Escape>", self.exit_fullscreen)
-
+        self.stop_event = None
+        self._status_refresh_running = False
+        self._display_after_id = None
+        self._display_pending = False
+        self._reset_watcher_started = False
+        self._stop_in_progress = False
+        self._baseline_reset_running = False
+        self._start_pending = False
         self.global_settings_window = None
         self.autotuner_window = None
+        self.tree_items_by_ip = {}
+        self.miner_type_by_ip = {}
 
-        # UI Layout
-        tk.Label(self.root, text="- Bitaxe Multi-AutoTuner -", font=("Arial", 18, "bold"), bg="black", fg="gold").pack(
-            pady=10)
+        self._apply_theme()
+        self._build_header()
+        self._build_table()
+        self._build_chrome()
+        self._build_menu()
 
-        # Apply Themed Style for Treeview
+        self.root.bind_all("<F11>", self.toggle_fullscreen)
+        self.root.bind_all("<Escape>", self.exit_fullscreen)
+
+        self._sync_run_buttons()
+        self.load_miners_from_config()
+        self.root.after_idle(self._reflow_toolbars)
+
+    def _apply_icon(self, window):
+        if platform.system() != "Windows":
+            return
+        try:
+            window.iconbitmap(resource_path("bitaxe_icon.ico"))
+        except Exception:
+            pass
+
+    def _apply_theme(self):
         style = ttk.Style()
-        style.configure("Treeview.Heading", font=("Arial", 10, "bold"), background="black")
-        style.configure("Treeview", rowheight=25)
-        style.map("Treeview", background=[("selected", "gold")])
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        try:
+            style.layout("Miner.Treeview", style.layout("Treeview"))
+        except tk.TclError:
+            pass
+        style.configure(
+            "Miner.Treeview",
+            background=PANEL,
+            fieldbackground=PANEL,
+            foreground=TEXT,
+            rowheight=34,
+            font=FONT,
+            borderwidth=0,
+            relief="flat",
+        )
+        style.configure(
+            "Miner.Treeview.Heading",
+            background="#242424",
+            foreground=MUTED,
+            font=FONT_BOLD,
+            relief="flat",
+        )
+        style.map(
+            "Miner.Treeview",
+            background=[("selected", SELECTION)],
+            foreground=[("selected", TEXT)],
+        )
+        style.map("Miner.Treeview.Heading", background=[("active", "#242424")])
+        style.configure("Vertical.TScrollbar", background=QUIET, troughcolor=BG, borderwidth=0, arrowsize=14)
 
-        # Miner Configuration Table
-        self.tree = ttk.Treeview(self.root, columns=(
-            "Nickname", "Type", "IP", "Applied Freq", "Current Voltage mVA", "Current Temp",
-            "VR Temp", "Current Hash Rate", "Current Watts"
-        ), show="headings", height=5, style="Treeview")
-
-        # Add Column Headings
-        for col in self.tree["columns"]:
-            self.tree.heading(col, text=col, anchor="center")
-            self.tree.column(col, width=120, anchor="center")
-
-        self.tree.pack(pady=5, fill=tk.BOTH, expand=True)
-
-        # Row Striping
-        self.tree.tag_configure("evenrow", background="#f0f0f0")
-        self.tree.tag_configure("oddrow", background="white")
-
-        # Control Buttons Section (Frame for Scan, Settings, Add, Remove, Save, AutoTuner)
-        control_frame = tk.Frame(self.root, bg="black")
-        control_frame.pack(fill=tk.X, pady=5)
-
-        # Centering container for buttons
-        control_inner_frame = tk.Frame(control_frame, bg="black")
-        control_inner_frame.pack(expand=True)
-
-        button_style = {
-            "font": ("Arial", 10),
-            "width": 15,
-            "bg": "gold",
-            "highlightbackground": "black",
-            "relief": tk.FLAT
+    def _button(self, parent, text, command, kind="quiet"):
+        styles = {
+            "accent": (ACCENT, ACCENT_TEXT, "#f0b429"),
+            "danger": (DANGER, TEXT, "#8a3c3c"),
+            "quiet": (QUIET, TEXT, "#3a3a3a"),
         }
+        bg, fg, active = styles[kind]
+        return tk.Button(
+            parent,
+            text=text,
+            command=command,
+            font=FONT,
+            bg=bg,
+            fg=fg,
+            activebackground=active,
+            activeforeground=fg,
+            disabledforeground=fg,
+            relief=tk.FLAT,
+            bd=0,
+            padx=14,
+            pady=10,
+            highlightthickness=0,
+            cursor="hand2",
+        )
 
-        # Create buttons
-        self.scan_button = tk.Button(control_inner_frame, text="Scan Network", command=self.scan_network,
-                                     **button_style)
-        self.add_button = tk.Button(control_inner_frame, text="Add Miner", command=self.add_miner, **button_style)
-        self.delete_button = tk.Button(control_inner_frame, text="Remove Miner", command=self.delete_miner,
-                                       **button_style)
-        self.global_settings_button = tk.Button(control_inner_frame, text="Global Settings",
-                                                command=self.open_global_settings, **button_style)
-        self.autotuner_settings_button = tk.Button(control_inner_frame, text="AutoTuner Settings",
-                                                   command=self.open_autotuner_settings, **button_style)
-        self.save_settings_button = tk.Button(control_inner_frame, text="Save Settings", command=self.save_settings,
-                                              **button_style)
+    def _entry(self, parent, width=16):
+        return tk.Entry(
+            parent,
+            width=width,
+            font=FONT,
+            bg=FIELD_BG,
+            fg=TEXT,
+            insertbackground=TEXT,
+            relief=tk.FLAT,
+            highlightthickness=1,
+            highlightbackground="#3a3a3a",
+            highlightcolor=ACCENT,
+        )
 
-        # Use grid layout to center buttons
-        self.scan_button.grid(row=0, column=0, padx=5, pady=5)
-        self.add_button.grid(row=0, column=1, padx=5, pady=5)
-        self.delete_button.grid(row=0, column=2, padx=5, pady=5)
-        self.global_settings_button.grid(row=0, column=3, padx=5, pady=5)
-        self.autotuner_settings_button.grid(row=0, column=4, padx=5, pady=5)
-        self.save_settings_button.grid(row=0, column=5, padx=5, pady=5)
+    def _checkbutton(self, parent, text, variable):
+        return tk.Checkbutton(
+            parent,
+            text=text,
+            variable=variable,
+            font=FONT,
+            bg=BG,
+            fg=TEXT,
+            selectcolor=FIELD_BG,
+            activebackground=BG,
+            activeforeground=TEXT,
+            highlightthickness=0,
+        )
 
-        # Center the button container inside control_frame
-        control_inner_frame.pack(anchor="center")
+    def _dialog(self, title):
+        window = tk.Toplevel(self.root)
+        window.title(title)
+        window.configure(bg=BG)
+        window.transient(self.root)
+        self._apply_icon(window)
+        return window
 
-        # Start/Stop Buttons Section
-        start_stop_frame = tk.Frame(self.root, bg="black")
-        start_stop_frame.pack(fill=tk.X, pady=5)
+    def _fit_dialog(self, window, min_width, min_height):
+        window.update_idletasks()
+        width = max(window.winfo_reqwidth() + 12, min_width)
+        height = max(window.winfo_reqheight() + 12, min_height)
+        screen_w = max(320, window.winfo_screenwidth() - 40)
+        screen_h = max(240, window.winfo_screenheight() - 80)
+        width = min(width, screen_w)
+        height = min(height, screen_h)
+        x = self.root.winfo_rootx() + max(0, (self.root.winfo_width() - width) // 2)
+        y = self.root.winfo_rooty() + max(0, (self.root.winfo_height() - height) // 2)
+        window.geometry(f"{int(width)}x{int(height)}+{int(x)}+{int(y)}")
+        window.minsize(min(min_width, int(width)), min(min_height, int(height)))
 
-        start_stop_inner_frame = tk.Frame(start_stop_frame, bg="black")
-        start_stop_inner_frame.pack(expand=True)
+    def _section(self, parent, title):
+        tk.Label(parent, text=title, bg=BG, fg=TEXT, font=FONT_SECTION).pack(anchor="w", pady=(12, 4))
 
-        self.start_button = tk.Button(start_stop_inner_frame, text="Start Autotuner", command=self.start_autotuning,
-                                      font=("Arial", 10, "bold"), width=15, bg="gold")
-        self.stop_button = tk.Button(start_stop_inner_frame, text="Stop Autotuner", command=self.stop_autotuning,
-                                     font=("Arial", 10, "bold"), width=15, bg="gold")
+    def _hint(self, parent, text):
+        tk.Label(
+            parent, text=text, bg=BG, fg=MUTED, font=FONT_SMALL, wraplength=460, justify=tk.LEFT
+        ).pack(anchor="w", pady=(0, 6))
 
+    def _build_header(self):
+        header = tk.Frame(self.root, bg=BG)
+        header.pack(fill=tk.X, padx=16, pady=(14, 8))
+        self.fullscreen_button = self._button(header, "Fullscreen", self.toggle_fullscreen, "quiet")
+        self.fullscreen_button.pack(side=tk.RIGHT)
+        tk.Label(header, text="Bitaxe Gamma 601", bg=BG, fg=TEXT, font=FONT_TITLE).pack(side=tk.LEFT)
+        self.status_pill = tk.Label(header, text="Idle", bg=QUIET, fg=MUTED, font=FONT_BOLD, padx=10, pady=4)
+        self.status_pill.pack(side=tk.LEFT, padx=(16, 8))
+        self.updated_label = tk.Label(header, text="Updated --:--:--", bg=BG, fg=MUTED, font=FONT)
+        self.updated_label.pack(side=tk.LEFT)
 
-        # Use grid layout to center buttons
-        self.start_button.grid(row=0, column=0, padx=5, pady=5)
-        self.stop_button.grid(row=0, column=1, padx=5, pady=5)
+    def _build_table(self):
+        table_frame = tk.Frame(self.root, bg=BG)
+        table_frame.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 8))
+        self.tree = ttk.Treeview(
+            table_frame,
+            columns=TREE_COLUMNS,
+            show="headings",
+            style="Miner.Treeview",
+            selectmode="browse",
+        )
+        widths = {
+            "Name": 130, "IP": 130, "Freq": 70, "mV": 70, "ASIC": 70, "VR": 70,
+            "GH/s": 80, "W": 70, "Phase": 80, "Error": 70, "Setpoint": 150,
+        }
+        for column in TREE_COLUMNS:
+            self.tree.heading(column, text=column, anchor="center")
+            anchor = "w" if column in ("Name", "Setpoint") else "center"
+            self.tree.column(column, width=widths[column], minwidth=56, anchor=anchor, stretch=True)
+        scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scrollbar.set)
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        for name, color in (
+            ("idle", PANEL),
+            ("hold", HOLD),
+            ("climb", CLIMB),
+            ("trim", TRIM),
+            ("alert", ALERT),
+        ):
+            self.tree.tag_configure(name, background=color, foreground=TEXT)
+        self.tree.tag_configure("selected", background=SELECTION, foreground=TEXT)
+        self.empty_label = tk.Label(
+            table_frame,
+            text="No miners yet. Scan the network or add an IP.",
+            bg=PANEL,
+            fg=MUTED,
+            font=FONT,
+        )
+        self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
+        self.tree.bind("<Double-Button-1>", self._on_double_click)
+        self.tree.bind("<Button-3>", self.show_tree_menu)
 
-        # Center the button container
-        start_stop_inner_frame.pack(anchor="center")
+    def _build_chrome(self):
+        self.chrome = tk.Frame(self.root, bg=BG)
+        self.chrome.pack(fill=tk.X, padx=16, pady=(0, 12))
 
-        # Create a right-click menu for interacting with a miner
-        self.tree_menu = tk.Menu(self.root, tearoff=0)
-        self.tree_menu.add_command(label="Edit Miner Settings", command=self.edit_miner_settings)  # Added Edit Miner
+        self.miners_row = WrappingButtonRow(self.chrome, BG)
+        self.miners_row.pack(fill=tk.X)
+        self.scan_button = self._button(self.miners_row, "Scan Network", self.scan_network)
+        self.add_button = self._button(self.miners_row, "Add Miner", self.add_miner)
+        self.delete_button = self._button(self.miners_row, "Remove Miner", self.delete_miner, "danger")
+        self.global_settings_button = self._button(self.miners_row, "Global Settings", self.open_global_settings)
+        self.autotuner_settings_button = self._button(
+            self.miners_row, "AutoTuner Settings", self.open_autotuner_settings
+        )
+        for button in (
+            self.scan_button,
+            self.add_button,
+            self.delete_button,
+            self.global_settings_button,
+            self.autotuner_settings_button,
+        ):
+            self.miners_row.add(button)
+
+        self.tuner_row = WrappingButtonRow(self.chrome, BG)
+        self.tuner_row.pack(fill=tk.X)
+        self.start_button = self._button(self.tuner_row, "Start Autotuner", self.start_autotuning, "accent")
+        self.stop_button = self._button(self.tuner_row, "Stop Autotuner", self.stop_autotuning)
+        self.reset_baseline_button = self._button(
+            self.tuner_row, "Reset to Baseline", self.reset_to_baseline, "danger"
+        )
+        for button in (self.start_button, self.stop_button, self.reset_baseline_button):
+            self.tuner_row.add(button)
+
+        self.selected_row = WrappingButtonRow(self.chrome, BG)
+        self.selected_row.pack(fill=tk.X)
+        selected_label = tk.Label(self.selected_row, text="Selected miner", bg=BG, fg=MUTED, font=FONT)
+        self.selected_row.add(selected_label)
+        self.edit_button = self._button(self.selected_row, "Edit", self.edit_miner_settings)
+        self.refresh_button = self._button(self.selected_row, "Refresh", self.refresh_selected_miner)
+        self.restart_button = self._button(self.selected_row, "Restart", self.restart_selected_miner, "danger")
+        self.web_button = self._button(self.selected_row, "Open Web UI", self.open_miner_webpage)
+        for button in (self.edit_button, self.refresh_button, self.restart_button, self.web_button):
+            self.selected_row.add(button)
+
+        self.log_output = scrolledtext.ScrolledText(
+            self.chrome,
+            height=8,
+            bg=PANEL,
+            fg=TEXT,
+            insertbackground=TEXT,
+            font=("Segoe UI", 10),
+            relief=tk.FLAT,
+            highlightthickness=0,
+            wrap=tk.WORD,
+            padx=8,
+            pady=8,
+        )
+        self.log_output.pack(fill=tk.X)
+        self.log_output.tag_configure("success", foreground="#8fd19a")
+        self.log_output.tag_configure("warning", foreground="#e0b15a")
+        self.log_output.tag_configure("error", foreground="#f0a0a0")
+        self.log_output.tag_configure("info", foreground=TEXT)
+        self.log_output.bind("<Key>", self._log_key)
+        self.log_output.bind("<<Paste>>", lambda _event: "break")
+
+    def _build_menu(self):
+        self.tree_menu = tk.Menu(
+            self.root,
+            tearoff=0,
+            bg=PANEL,
+            fg=TEXT,
+            activebackground=SELECTION,
+            activeforeground=TEXT,
+        )
+        self.tree_menu.add_command(label="Edit Miner Settings", command=self.edit_miner_settings)
         self.tree_menu.add_command(label="Refresh", command=self.refresh_selected_miner)
         self.tree_menu.add_command(label="Restart Miner", command=self.restart_selected_miner)
         self.tree_menu.add_separator()
         self.tree_menu.add_command(label="Open Miner Web UI", command=self.open_miner_webpage)
 
-        # Bind right-click event to the miner table
-        self.tree.bind("<Button-3>", self.show_tree_menu)
+    def _reflow_toolbars(self):
+        for row in (self.miners_row, self.tuner_row, self.selected_row):
+            row.reflow()
 
-        # Log Output
-        self.log_output = scrolledtext.ScrolledText(self.root, width=100, height=15, bg="white")
-        self.log_output.pack(pady=5, fill=tk.BOTH, expand=True)
+    def _set_status(self, text, kind):
+        colors = {
+            "idle": (QUIET, MUTED),
+            "running": (HOLD, "#8fd19a"),
+            "stopping": (TRIM, "#e0b15a"),
+        }
+        bg, fg = colors[kind]
+        self.status_pill.configure(text=text, bg=bg, fg=fg)
 
-        self.tree_items_by_ip = {}  # map IP to Treeview row ID
+    def _sync_run_buttons(self):
+        if self._stop_in_progress:
+            self._set_status("Stopping", "stopping")
+        elif self.running:
+            self._set_status("Running", "running")
+        else:
+            self._set_status("Idle", "idle")
 
-        # Load miners from config.json on startup
-        self.load_miners_from_config()
+        start_locked = self.running or self._stop_in_progress or self._baseline_reset_running or self._start_pending
+        if self.running and not self._stop_in_progress:
+            self.start_button.configure(
+                text="Autotuner Running", state=tk.DISABLED, bg=HOLD, fg=TEXT, disabledforeground=TEXT
+            )
+            self.stop_button.configure(state=tk.NORMAL, fg=TEXT, disabledforeground=TEXT)
+        else:
+            self.start_button.configure(
+                text="Start Autotuner",
+                state=tk.DISABLED if start_locked else tk.NORMAL,
+                bg=QUIET if start_locked else ACCENT,
+                fg=MUTED if start_locked else ACCENT_TEXT,
+                disabledforeground=MUTED if start_locked else ACCENT_TEXT,
+            )
+            self.stop_button.configure(state=tk.DISABLED, fg=MUTED, disabledforeground=MUTED)
+        self.reset_baseline_button.configure(state=tk.DISABLED if self._baseline_reset_running else tk.NORMAL)
+        if hasattr(self, "tuner_row"):
+            self.tuner_row.reflow()
+
+    def _show_empty(self, show):
+        if show:
+            self.empty_label.place(relx=0.5, rely=0.5, anchor="center")
+            self.empty_label.lift()
+        else:
+            self.empty_label.place_forget()
+
+    def _set_row_tag(self, item, tag):
+        tags = [tag]
+        if item in self.tree.selection():
+            tags.append("selected")
+        self.tree.item(item, tags=tuple(tags))
+
+    def _on_tree_select(self, _event=None):
+        selected = set(self.tree.selection())
+        for item in self.tree.get_children():
+            current = [tag for tag in self.tree.item(item, "tags") if tag != "selected"] or ["idle"]
+            if item in selected:
+                current.append("selected")
+            self.tree.item(item, tags=tuple(current))
+
+    def _on_double_click(self, event):
+        item = self.tree.identify_row(event.y)
+        if not item:
+            return
+        self.tree.selection_set(item)
+        self.edit_miner_settings()
+
+    def _log_key(self, event):
+        control = (event.state & 0x4) != 0
+        navigation = {
+            "Left", "Right", "Up", "Down", "Home", "End", "Prior", "Next",
+            "Shift_L", "Shift_R", "Control_L", "Control_R", "Caps_Lock", "Alt_L", "Alt_R",
+        }
+        if event.keysym in navigation:
+            return None
+        if control and event.keysym.lower() in ("c", "a", "left", "right", "up", "down"):
+            return None
+        return "break"
+
+    def _touch_updated(self):
+        self.updated_label.configure(text=f"Updated {datetime.now().strftime('%H:%M:%S')}")
+
+    def _selected_miner(self, warning="Please select a miner first."):
+        selected = self.tree.selection()
+        if not selected:
+            messagebox.showwarning("No Selection", warning, parent=self.root)
+            return None, None
+        item = selected[0]
+        return item, self.tree.item(item, "values")
+
+    def _miner_type(self, ip, fallback="Unknown"):
+        return self.miner_type_by_ip.get(ip) or get_miner_defaults(ip).get("type") or fallback
 
     def open_miner_webpage(self):
         """Opens the selected miner's IP address in the default web browser."""
-        selected_item = self.tree.selection()
-        if not selected_item:
-            messagebox.showwarning("No Selection", "Please select a miner to open.")
+        _item, values = self._selected_miner("Please select a miner to open.")
+        if not values:
             return
-
-        values = self.tree.item(selected_item, "values")
-        ip = values[2]
-        url = f"http://{ip}"
+        ip = values[COL_IP]
         self.log_message(f"Opening web UI for miner at {ip}", "info")
-        webbrowser.open(url)
+        webbrowser.open(f"http://{ip}")
 
     def scan_network(self):
-        """Opens a window to allow the user to enter a custom IP range for scanning."""
-        scan_window = tk.Toplevel(self.root)
-        scan_window.title("Scan Network")
-        scan_window.geometry("400x200")
-        if platform.system() == "Windows":
-            try:
-                scan_window.iconbitmap(resource_path("bitaxe_icon.ico"))
-            except:
-                pass  # Icon loading can silently fail if not found or invalid
+        """Scan an IP range. The window stays open and shows how far the scan has gotten."""
+        if str(self.scan_button.cget("state")) == str(tk.DISABLED):
+            return
+        window = self._dialog("Scan Network")
+        tk.Label(window, text="Scan Network", bg=BG, fg=TEXT, font=FONT_SECTION).pack(anchor="w", padx=16, pady=(16, 4))
+        self._hint(window, "Only a Gamma 601 is added. Leave this window open to watch the scan.")
+        body = tk.Frame(window, bg=BG)
+        body.pack(fill=tk.X, padx=16)
+        start_entry = self._labeled_entry(body, "Starting IP")
+        end_entry = self._labeled_entry(body, "Ending IP")
+        progress_label = tk.Label(window, text="", bg=BG, fg=TEXT, font=FONT)
+        progress_label.pack(anchor="w", padx=16, pady=(8, 0))
 
-        scan_window.config(bg="white")
+        cancel_event = threading.Event()
+        scanning = {"on": False}
+        self.scan_button.configure(state=tk.DISABLED)
 
-        tk.Label(scan_window, text="Enter IP Range to Scan", font=("Arial", 12, "bold"), bg="white").pack(pady=10)
+        def finish(found, cancelled):
+            scanning["on"] = False
+            if self.root.winfo_exists():
+                self.scan_button.configure(state=tk.NORMAL)
+                self.load_miners_from_config()
+                if cancelled:
+                    self.log_message("Scan cancelled.", "warning")
+                else:
+                    self.log_message(f"Scan finished. Added {len(found)} miner(s).", "success")
+            if window.winfo_exists():
+                window.destroy()
 
-        # Input Fields
-        tk.Label(scan_window, text="Starting IP:", bg="white", font=("Arial", 10)).pack()
-        start_ip_entry = tk.Entry(scan_window, width=20)
-        start_ip_entry.pack(pady=2)
-
-        tk.Label(scan_window, text="Ending IP:", bg="white", font=("Arial", 10)).pack()
-        end_ip_entry = tk.Entry(scan_window, width=20)
-        end_ip_entry.pack(pady=2)
+        def on_close():
+            cancel_event.set()
+            if scanning["on"]:
+                progress_label.configure(text="Stopping scan...")
+                return
+            self.scan_button.configure(state=tk.NORMAL)
+            window.destroy()
 
         def start_scan():
-            """Starts the scan with user-defined IP range."""
-            start_ip = start_ip_entry.get().strip()
-            end_ip = end_ip_entry.get().strip()
-
-            if not start_ip or not end_ip:
-                messagebox.showerror("Error", "Both Starting IP and Ending IP are required.")
+            start_ip = start_entry.get().strip()
+            end_ip = end_entry.get().strip()
+            try:
+                start = ipaddress.IPv4Address(start_ip)
+                end = ipaddress.IPv4Address(end_ip)
+            except ipaddress.AddressValueError:
+                messagebox.showerror("Error", "Enter a valid starting IP and ending IP.", parent=window)
+                return
+            if int(end) < int(start):
+                messagebox.showerror("Error", "Ending IP must be the same as or after the starting IP.", parent=window)
                 return
 
+            scanning["on"] = True
+            cancel_event.clear()
+            start_button.configure(state=tk.DISABLED)
+            start_entry.configure(state=tk.DISABLED)
+            end_entry.configure(state=tk.DISABLED)
+            progress_label.configure(text="Starting scan...")
             self.log_message(f"Scanning network from {start_ip} to {end_ip}...", "info")
-            scan_window.destroy()  # Close the scan window
 
-            # Disable scan button while scanning
-            self.scan_button.config(state=tk.DISABLED)
+            def on_progress(index, total, _ip):
+                def update(index=index, total=total):
+                    if progress_label.winfo_exists():
+                        progress_label.configure(text=f"Checking {index} of {total}")
+                try:
+                    self.root.after(0, update)
+                except tk.TclError:
+                    cancel_event.set()
 
-            # Background scanning process
             def scan_task():
-                detect_miners(start_ip, end_ip)  # Call detect_miners() with the range
-                self.root.after(100, self.load_miners_from_config)  # Update UI safely
-                self.scan_button.config(state=tk.NORMAL)  # Re-enable button
+                found = detect_miners(start_ip, end_ip, on_progress=on_progress, should_cancel=cancel_event.is_set)
+                cancelled = cancel_event.is_set()
+                try:
+                    self.root.after(0, lambda: finish(found, cancelled))
+                except tk.TclError:
+                    return
 
             threading.Thread(target=scan_task, daemon=True).start()
 
-        tk.Button(scan_window, text="Start Scan", font=("Arial", 10), command=start_scan, bg="gold").pack(pady=10)
+        footer = tk.Frame(window, bg=BG)
+        footer.pack(fill=tk.X, padx=16, pady=16)
+        self._button(footer, "Cancel", on_close).pack(side=tk.RIGHT, padx=(8, 0))
+        start_button = self._button(footer, "Start Scan", start_scan, "accent")
+        start_button.pack(side=tk.RIGHT)
+        window.protocol("WM_DELETE_WINDOW", on_close)
+        self._fit_dialog(window, 420, 230)
+
+    def _labeled_entry(self, parent, label, width=18):
+        row = tk.Frame(parent, bg=BG)
+        row.pack(fill=tk.X, pady=4)
+        tk.Label(row, text=label, bg=BG, fg=MUTED, font=FONT).pack(side=tk.LEFT)
+        entry = self._entry(row, width)
+        entry.pack(side=tk.RIGHT)
+        return entry
 
     def load_miners_from_config(self):
         """Loads miners from config.json into the UI."""
-        self.tree.delete(*self.tree.get_children())  # Clear existing entries
+        self.tree.delete(*self.tree.get_children())
+        self.tree_items_by_ip = {}
+        self.miner_type_by_ip = {}
         miners = get_miners()
-
         for miner in miners:
-            values = (
-            miner.get("nickname", f"Miner-{miner['ip']}"), miner["type"], miner["ip"], "-", "-", "-", "-", "-", "-")
-            item_id = self.tree.insert("", "end", values=values)
-            self.tree_items_by_ip[miner["ip"]] = item_id
-
+            ip = miner["ip"]
+            nickname = miner.get("nickname", f"Miner-{ip}")
+            self.miner_type_by_ip[ip] = miner.get("type", "Unknown")
+            item_id = self.tree.insert("", "end", values=blank_miner_row(nickname, ip), tags=("idle",))
+            self.tree_items_by_ip[ip] = item_id
+        self._show_empty(not miners)
         self.log_message(f"Loaded {len(miners)} miners.", "success")
+        self._kick_miner_display()
 
     def add_miner(self):
         """Opens a window to manually add a miner."""
-        add_window = tk.Toplevel(self.root)
-        add_window.title("Add Miner")
-        add_window.geometry("400x200")
-        if platform.system() == "Windows":
-            try:
-                add_window.iconbitmap(resource_path("bitaxe_icon.ico"))
-            except:
-                pass  # Icon loading can silently fail if not found or invalid
+        window = self._dialog("Add Miner")
+        tk.Label(window, text="Add Miner", bg=BG, fg=TEXT, font=FONT_SECTION).pack(anchor="w", padx=16, pady=(16, 8))
+        body = tk.Frame(window, bg=BG)
+        body.pack(fill=tk.X, padx=16)
+        nickname_entry = self._labeled_entry(body, "Nickname")
+        ip_entry = self._labeled_entry(body, "IP Address")
+        add_button = None
 
-        add_window.config(bg="white")
-
-        tk.Label(add_window, text="Nickname:", bg="white", font=("Arial", 10)).grid(row=0, column=0, sticky="w",
-                                                                                    padx=10)
-        nickname_entry = tk.Entry(add_window, width=20)
-        nickname_entry.grid(row=0, column=1, padx=10, pady=2)
-
-        tk.Label(add_window, text="IP Address:", bg="white", font=("Arial", 10)).grid(row=1, column=0, sticky="w",
-                                                                                      padx=10)
-        ip_entry = tk.Entry(add_window, width=20)
-        ip_entry.grid(row=1, column=1, padx=10, pady=2)
+        def finish_error(text):
+            if not window.winfo_exists():
+                return
+            add_button.configure(state=tk.NORMAL, text="Add")
+            messagebox.showerror("Error", text, parent=window)
 
         def add_entry():
             nickname = nickname_entry.get().strip()
             ip = ip_entry.get().strip()
             if not ip:
-                messagebox.showerror("Error", "IP Address is required.")
+                messagebox.showerror("Error", "IP Address is required.", parent=window)
                 return
+            if any(miner["ip"] == ip for miner in get_miners()):
+                messagebox.showerror("Error", f"Miner with IP {ip} already exists.", parent=window)
+                return
+            add_button.configure(state=tk.DISABLED, text="Checking board...")
 
-            item_id = self.tree.insert("", "end", values=(nickname, "Unknown", ip, "-", "-", "-", "-", "-", "-"))
-            self.tree_items_by_ip[ip] = item_id  # ✅ Track the new item
-            add_miner("Unknown", ip, nickname)
-            messagebox.showinfo("Success", f"Miner {nickname} added successfully.")
-            add_window.destroy()
+            def check_and_add():
+                info = get_system_info(ip)
 
-        tk.Button(add_window, text="Add", font=("Arial", 10), command=add_entry, bg="white").grid(
-            row=2, column=0, columnspan=2, pady=10)
+                def finish():
+                    if not window.winfo_exists():
+                        return
+                    if isinstance(info, str):
+                        finish_error(info)
+                        return
+                    if not is_gamma_601(info):
+                        finish_error(f"{ip} is not a Bitaxe Gamma 601 (BM1370, board 601).")
+                        return
+                    miner_type = miner_type_from_info(info)
+                    add_miner(miner_type, ip, nickname)
+                    if not any(miner["ip"] == ip for miner in get_miners()):
+                        finish_error(f"Could not add miner at {ip}.")
+                        return
+                    self.miner_type_by_ip[ip] = miner_type
+                    item_id = self.tree.insert(
+                        "", "end", values=blank_miner_row(nickname, ip), tags=("idle",)
+                    )
+                    self.tree_items_by_ip[ip] = item_id
+                    self._show_empty(False)
+                    self._kick_miner_display()
+                    self.log_message(f"Miner {nickname or ip} added.", "success")
+                    messagebox.showinfo("Success", f"Miner {nickname or ip} added successfully.", parent=window)
+                    window.destroy()
+
+                try:
+                    self.root.after(0, finish)
+                except tk.TclError:
+                    return
+
+            threading.Thread(target=check_and_add, daemon=True).start()
+
+        footer = tk.Frame(window, bg=BG)
+        footer.pack(fill=tk.X, padx=16, pady=16)
+        self._button(footer, "Cancel", window.destroy).pack(side=tk.RIGHT, padx=(8, 0))
+        add_button = self._button(footer, "Add", add_entry, "accent")
+        add_button.pack(side=tk.RIGHT)
+        window.protocol("WM_DELETE_WINDOW", window.destroy)
+        self._fit_dialog(window, 420, 220)
 
     def delete_miner(self):
         """Deletes the selected miner from the UI and config.json."""
         selected_items = self.tree.selection()
-
         if not selected_items:
-            messagebox.showwarning("No Selection", "Please select a miner to delete.")
+            messagebox.showwarning("No Selection", "Please select a miner to delete.", parent=self.root)
             return
 
-        confirmation = messagebox.askyesno("Delete Miner", "Are you sure you want to remove the selected miner(s)?")
-        if not confirmation:
+        picked = []
+        for item in selected_items:
+            values = self.tree.item(item, "values")
+            picked.append((item, values[COL_NAME] or values[COL_IP], values[COL_IP]))
+        if len(picked) == 1:
+            prompt = f"Remove {picked[0][1]} ({picked[0][2]})?"
+        else:
+            lines = "\n".join(f"- {name} ({ip})" for _item, name, ip in picked)
+            prompt = f"Remove these miners?\n\n{lines}"
+        if not messagebox.askyesno("Delete Miner", prompt, parent=self.root):
             return
 
         config = load_config()
         miners = config.get("miners", [])
-
-        for item in selected_items:
-            values = self.tree.item(item, "values")
-            ip = values[2]
-
-            # Remove from treeview
+        for item, _name, ip in picked:
             self.tree.delete(item)
-
-            # ✅ Remove from IP-to-row map
-            if ip in self.tree_items_by_ip:
-                del self.tree_items_by_ip[ip]
-
-            # Remove from config
-            miners = [m for m in miners if m["ip"] != ip]
-
+            self.tree_items_by_ip.pop(ip, None)
+            self.miner_type_by_ip.pop(ip, None)
+            miners = [miner for miner in miners if miner["ip"] != ip]
         config["miners"] = miners
         save_config(config)
+        self._show_empty(not self.tree.get_children())
         self.log_message("Miner(s) removed successfully.", "success")
 
     def refresh_selected_miner(self):
         """Fetches and updates real-time data for the selected miner."""
-        selected_item = self.tree.selection()
-
-        if not selected_item:
-            messagebox.showwarning("No Selection", "Please select a miner to refresh.")
+        item, values = self._selected_miner()
+        if not values:
             return
-
-        values = self.tree.item(selected_item, "values")
-        ip = values[2]  # Extract miner's IP address
-
+        ip = values[COL_IP]
         self.log_message(f"Refreshing data for miner at {ip}...", "info")
 
-        # Fetch miner data
-        miner_data = get_system_info(ip)
-        if isinstance(miner_data, str):
-            self.log_message(f"Error fetching miner data from {ip}: {miner_data}", "error")
+        def fetch():
+            miner_data = get_system_info(ip)
+            try:
+                self.root.after(0, lambda: self._apply_selected_miner(item, ip, miner_data))
+            except tk.TclError:
+                return
+
+        threading.Thread(target=fetch, daemon=True).start()
+
+    def _live_row_values(self, ip, values, miner_data):
+        updated = list(values)
+        while len(updated) < len(TREE_COLUMNS):
+            updated.append("-")
+        updated[COL_FREQ] = format_number(miner_data.get("frequency"), 0)
+        updated[COL_MV] = format_number(miner_data.get("coreVoltage"), 0)
+        updated[COL_ASIC] = format_number(miner_data.get("temp"), 1)
+        updated[COL_VR] = format_number(miner_data.get("vrTemp"), 1)
+        updated[COL_HASH] = format_number(miner_data.get("hashRate"), 2)
+        updated[COL_WATTS] = format_number(miner_data.get("power"), 2)
+        status = get_miner_status(ip)
+        updated[COL_PHASE] = status.get("phase") or "-"
+        error = miner_data.get("errorPercentage", status.get("error_percentage"))
+        updated[COL_ERROR] = "-" if error in (None, "") else f"{format_number(error, 2)}%"
+        updated[COL_SETPOINT] = format_learned_wall(status, get_miner_defaults(ip))
+        return updated
+
+    def _tag_for_values(self, ip, values):
+        stored = get_miner_defaults(ip)
+        return row_state_tag(
+            values[COL_PHASE],
+            values[COL_ASIC],
+            values[COL_ERROR],
+            stored.get("max_temp"),
+            stored.get("max_error_percentage"),
+        )
+
+    def _mark_offline(self, item):
+        if item not in self.tree.get_children():
             return
+        values = list(self.tree.item(item, "values"))
+        while len(values) < len(TREE_COLUMNS):
+            values.append("-")
+        values[COL_PHASE] = "offline"
+        self.tree.item(item, values=values)
+        self._set_row_tag(item, "alert")
 
-        # Extract real-time values
-        new_frequency = miner_data.get("frequency", "-")
-        new_voltage = miner_data.get("coreVoltage", "-")
-        new_temp = f"{miner_data.get('temp', '-')}°C"
-        new_vr_temp = f"{miner_data.get('vrTemp', '-')}°C"
-        new_hashrate = f"{float(miner_data.get('hashRate', 0)):.2f} GH/s"
-        new_power = f"{float(miner_data.get('power', 0)):.2f} W"
-
-        # Update all 9 values in-place
-        updated_values = list(values)
-        updated_values[3] = new_frequency  # Applied Freq
-        updated_values[4] = new_voltage  # Voltage
-        updated_values[5] = new_temp  # Temp
-        updated_values[6] = new_vr_temp  # VR Temp
-        updated_values[7] = new_hashrate  # Hash Rate
-        updated_values[8] = new_power  # Power
-
-        self.tree.item(selected_item, values=updated_values)
-
+    def _apply_selected_miner(self, item, ip, miner_data):
+        if not self.root.winfo_exists() or item not in self.tree.get_children():
+            return
+        if isinstance(miner_data, str) or not isinstance(miner_data, dict):
+            self._mark_offline(item)
+            self.log_message(f"Error fetching miner data from {ip}: {miner_data}", "error")
+            self._touch_updated()
+            return
+        values = self.tree.item(item, "values")
+        updated = self._live_row_values(ip, values, miner_data)
+        self.tree.item(item, values=updated)
+        self._set_row_tag(item, self._tag_for_values(ip, updated))
+        self._touch_updated()
         self.log_message(f"Refreshed data for miner at {ip}.", "success")
 
     def edit_miner_settings(self):
-        """Opens a window to edit a miner's nickname, type, and IP address."""
-        selected_item = self.tree.selection()
-        if not selected_item:
-            messagebox.showwarning("No Selection", "Please select a miner first.")
+        """Opens a window to edit a miner's nickname and IP address."""
+        _item, values = self._selected_miner()
+        if not values:
             return
+        miner_nickname = values[COL_NAME]
+        miner_ip = values[COL_IP]
+        miner_type = self._miner_type(miner_ip)
 
-        values = self.tree.item(selected_item, "values")
-        miner_nickname = values[0]  # Nickname
-        miner_type = values[1]  # Type
-        miner_ip = values[2]  # IP Address
-
-        edit_window = tk.Toplevel(self.root)
-        edit_window.title("Edit Miner Settings")
-        edit_window.geometry("400x250")
-        edit_window.config(bg="white")
-
-        tk.Label(edit_window, text="Edit Miner Settings", font=("Arial", 12, "bold"), bg="white").pack(pady=10)
-
-        # Input Fields
-        tk.Label(edit_window, text="Nickname:", bg="white", font=("Arial", 10)).pack()
-        nickname_entry = tk.Entry(edit_window, width=30)
+        window = self._dialog("Edit Miner Settings")
+        tk.Label(window, text="Edit Miner", bg=BG, fg=TEXT, font=FONT_SECTION).pack(anchor="w", padx=16, pady=(16, 8))
+        body = tk.Frame(window, bg=BG)
+        body.pack(fill=tk.X, padx=16)
+        nickname_entry = self._labeled_entry(body, "Nickname", 24)
         nickname_entry.insert(0, miner_nickname)
-        nickname_entry.pack(pady=2)
-
-        tk.Label(edit_window, text="Miner Type:", bg="white", font=("Arial", 10)).pack()
-        type_entry = tk.Entry(edit_window, width=30)
-        type_entry.insert(0, miner_type)
-        type_entry.pack(pady=2)
-
-        tk.Label(edit_window, text="IP Address:", bg="white", font=("Arial", 10)).pack()
-        ip_entry = tk.Entry(edit_window, width=30)
+        ip_entry = self._labeled_entry(body, "IP Address", 24)
         ip_entry.insert(0, miner_ip)
-        ip_entry.pack(pady=2)
 
-        def save_miner_settings():
-            """Save the updated miner settings."""
-            new_nickname = nickname_entry.get().strip()
-            new_type = type_entry.get().strip()
-            new_ip = ip_entry.get().strip()
-
-            if not new_ip:
-                messagebox.showerror("Error", "IP Address is required.")
-                return
-
-            # Update the miner in config.json
+        def apply_miner_settings(new_nickname, new_ip, new_type):
             config = load_config()
             for miner in config["miners"]:
-                if miner["ip"] == miner_ip:  # Find the correct miner by IP
+                if miner["ip"] == miner_ip:
                     miner["nickname"] = new_nickname
                     miner["type"] = new_type
                     miner["ip"] = new_ip
                     break
-
             save_config(config)
             self.log_message(f"Updated miner settings: {new_nickname} ({new_type}) at {new_ip}", "success")
-            edit_window.destroy()
-            self.load_miners_from_config()  # Refresh UI
+            window.destroy()
+            self.load_miners_from_config()
 
-        tk.Button(edit_window, text="Save", font=("Arial", 10), command=save_miner_settings, bg="gold").pack(pady=10)
+        def save_miner_settings():
+            new_nickname = nickname_entry.get().strip()
+            new_ip = ip_entry.get().strip()
+            if not new_ip:
+                messagebox.showerror("Error", "IP Address is required.", parent=window)
+                return
+            if new_ip != miner_ip and any(miner["ip"] == new_ip for miner in get_miners()):
+                messagebox.showerror("Error", f"Miner with IP {new_ip} already exists.", parent=window)
+                return
+            if new_ip == miner_ip:
+                apply_miner_settings(new_nickname, new_ip, miner_type)
+                return
 
-    import platform  # Ensure this is imported at the top of your file
+            save_button.configure(state=tk.DISABLED, text="Checking board...")
+
+            def check_and_save():
+                info = get_system_info(new_ip)
+
+                def finish():
+                    if not window.winfo_exists():
+                        return
+                    save_button.configure(state=tk.NORMAL, text="Save")
+                    if isinstance(info, str):
+                        messagebox.showerror("Error", info, parent=window)
+                        return
+                    if not is_gamma_601(info):
+                        messagebox.showerror(
+                            "Not a Gamma 601",
+                            f"{new_ip} is not a Bitaxe Gamma 601 (BM1370, board 601).",
+                            parent=window,
+                        )
+                        return
+                    apply_miner_settings(new_nickname, new_ip, miner_type_from_info(info))
+
+                try:
+                    self.root.after(0, finish)
+                except tk.TclError:
+                    return
+
+            threading.Thread(target=check_and_save, daemon=True).start()
+
+        footer = tk.Frame(window, bg=BG)
+        footer.pack(fill=tk.X, padx=16, pady=16)
+        self._button(footer, "Cancel", window.destroy).pack(side=tk.RIGHT, padx=(8, 0))
+        save_button = self._button(footer, "Save", save_miner_settings, "accent")
+        save_button.pack(side=tk.RIGHT)
+        window.protocol("WM_DELETE_WINDOW", window.destroy)
+        self._fit_dialog(window, 440, 230)
+
+    def _singleton(self, attr):
+        window = getattr(self, attr)
+        if window is None:
+            return False
+        try:
+            if window.winfo_exists():
+                window.lift()
+                return True
+        except tk.TclError:
+            pass
+        setattr(self, attr, None)
+        return False
 
     def open_global_settings(self):
         """Opens a settings window for modifying global autotuner parameters."""
-        if self.global_settings_window and tk.Toplevel.winfo_exists(self.global_settings_window):
-            self.global_settings_window.lift()
+        if self._singleton("global_settings_window"):
             return
 
-        self.global_settings_window = tk.Toplevel(self.root)
-        self.global_settings_window.title("Global Settings")
-        self.global_settings_window.geometry("650x500")
-
-        # Platform-safe icon handling
-        if platform.system() == "Windows":
-            try:
-                self.global_settings_window.iconbitmap(resource_path("bitaxe_icon.ico"))
-            except:
-                pass  # Skip icon if loading fails
-
-
-        self.global_settings_window.config(bg="white")
+        window = self._dialog("Global Settings")
+        self.global_settings_window = window
+        config = load_config()
 
         def on_close():
-            self.global_settings_window.destroy()
             self.global_settings_window = None
+            if window.winfo_exists():
+                window.destroy()
+
+        tk.Label(window, text="Global Settings", bg=BG, fg=TEXT, font=FONT_SECTION).pack(
+            anchor="w", padx=16, pady=(16, 8)
+        )
+        body = tk.Frame(window, bg=BG)
+        body.pack(fill=tk.BOTH, expand=True, padx=16)
+
+        settings_entries = {}
+        groups = (
+            (
+                "Steps",
+                "How far each step moves, and how often the tuner checks the miner.",
+                (
+                    ("voltage_step", "Voltage step (mV)"),
+                    ("frequency_step", "Frequency step (MHz)"),
+                    ("monitor_interval", "Monitor interval (sec)"),
+                    ("refresh_interval", "Tune interval (sec)"),
+                ),
+            ),
+            (
+                "Temperature",
+                "Copied onto a miner when it is added.",
+                (
+                    ("default_target_temp", "Default max ASIC temp (°C)"),
+                    ("temp_tolerance", "Temp tolerance (°C)"),
+                ),
+            ),
+        )
+        for title, hint, fields in groups:
+            group = tk.LabelFrame(body, text=title, bg=BG, fg=TEXT, font=FONT_BOLD, padx=12, pady=8)
+            group.pack(fill=tk.X, pady=(0, 10))
+            self._hint(group, hint)
+            for key, label in fields:
+                entry = self._labeled_entry(group, label, 10)
+                entry.insert(0, str(config.get(key, "")))
+                settings_entries[key] = entry
+
+        schedule = tk.LabelFrame(body, text="Daily reset and flatline", bg=BG, fg=TEXT, font=FONT_BOLD, padx=12, pady=8)
+        schedule.pack(fill=tk.X, pady=(0, 10))
+        self._hint(schedule, "Restart every miner at a set time, or restart one whose hashrate stops changing.")
+
+        reset_var = tk.BooleanVar(value=config.get("daily_reset_enabled", False))
+        self._checkbutton(schedule, "Enable daily miner reset", reset_var).pack(anchor="w", pady=2)
+        time_entry = self._labeled_entry(schedule, "Daily reset time (HH:MM)", 10)
+        time_entry.insert(0, config.get("daily_reset_time", "03:00"))
+
+        flatline_var = tk.BooleanVar(value=config.get("flatline_detection_enabled", True))
+        self._checkbutton(schedule, "Enable flatline hashrate detection", flatline_var).pack(anchor="w", pady=2)
+        flatline_entry = self._labeled_entry(schedule, "Flatline repeat count", 10)
+        flatline_entry.insert(0, str(config.get("flatline_hashrate_repeat_count", 5)))
 
         def save_global_settings():
-            """Saves global settings to config.json."""
             try:
                 new_settings = {key: int(entry.get()) for key, entry in settings_entries.items()}
-                new_settings["enforce_safe_pairing"] = enforce_var.get()
                 new_settings["daily_reset_enabled"] = reset_var.get()
                 new_settings["daily_reset_time"] = time_entry.get().strip()
                 new_settings["flatline_detection_enabled"] = flatline_var.get()
                 new_settings["flatline_hashrate_repeat_count"] = int(flatline_entry.get())
-                config.update(new_settings)
-                save_config(config)
-                messagebox.showinfo("Success", "Settings updated successfully.")
-                self.global_settings_window.destroy()
-                self.log_message("Global settings updated.", "success")
             except ValueError:
-                messagebox.showerror("Error", "Please enter valid integer values.")
+                messagebox.showerror("Error", "Please enter valid integer values.", parent=window)
+                return
+            config.update(new_settings)
+            config.pop("enforce_safe_pairing", None)
+            save_config(config)
+            self.log_message("Global settings updated.", "success")
+            on_close()
 
-        self.global_settings_window.protocol("WM_DELETE_WINDOW", on_close)
-
-        tk.Label(
-            self.global_settings_window,
-            text="Modify Settings",
-            font=("Arial", 12, "bold"),
-            bg="white",
-            fg="black"
-        ).pack(pady=10)
-
-        config = load_config()
-
-        settings_entries = {}
-        settings_fields = {
-            "voltage_step": "Voltage Step (mV):",
-            "frequency_step": "Frequency Step (MHz):",
-            "monitor_interval": "Monitor Interval (sec):",
-            "default_target_temp": "Default Target Temp (°C):",
-            "temp_tolerance": "Temp Tolerance (°C):",
-            "refresh_interval": "Autotuner Update Interval (sec):"
-        }
-
-        input_frame = tk.Frame(self.global_settings_window, bg="white")
-        input_frame.pack(padx=20, pady=10, fill=tk.X)
-
-        for key, label_text in settings_fields.items():
-            row_frame = tk.Frame(input_frame, bg="white")
-            row_frame.pack(fill=tk.X, pady=2)
-
-            tk.Label(row_frame, text=label_text, font=("Arial", 11), bg="white", fg="black").pack(side=tk.LEFT)
-
-            entry = tk.Entry(row_frame, font=("Arial", 11), width=10, bg="white", fg="black", insertbackground="black")
-            entry.insert(0, str(config.get(key, "")))
-            entry.pack(side=tk.RIGHT, padx=10)
-            settings_entries[key] = entry
-
-        enforce_var = tk.BooleanVar(value=config.get("enforce_safe_pairing", False))
-        tier_checkbox = tk.Checkbutton(
-            self.global_settings_window,
-            text="Enforce Safe Frequency/Voltage Tiers (from 'cpu_voltage_scaling_safeguards.xlsx')",
-            variable=enforce_var,
-            font=("Arial", 10),
-            bg="white",
-            fg="black",
-            selectcolor="white",
-            activebackground="white",
-            activeforeground="black"
-        )
-        tier_checkbox.pack(pady=5)
-
-        reset_var = tk.BooleanVar(value=config.get("daily_reset_enabled", False))
-        reset_checkbox = tk.Checkbutton(
-            self.global_settings_window,
-            text="Enable Daily Miner Reset",
-            variable=reset_var,
-            font=("Arial", 10),
-            bg="white",
-            fg="black",
-            selectcolor="white",
-            activebackground="white",
-            activeforeground="black"
-        )
-        reset_checkbox.pack(pady=5)
-
-        tk.Label(
-            self.global_settings_window,
-            text="Daily Reset Time (HH:MM, 24-hour format):",
-            font=("Arial", 10),
-            bg="white",
-            fg="black"
-        ).pack()
-        time_entry = tk.Entry(self.global_settings_window, font=("Arial", 10), width=10, bg="white", fg="black",
-                              insertbackground="black")
-        time_entry.insert(0, config.get("daily_reset_time", "03:00"))
-        time_entry.pack(pady=2)
-
-        flatline_var = tk.BooleanVar(value=config.get("flatline_detection_enabled", True))
-        flatline_checkbox = tk.Checkbutton(
-            self.global_settings_window,
-            text="Enable Flatline Hashrate Detection",
-            variable=flatline_var,
-            font=("Arial", 10),
-            bg="white",
-            fg="black",
-            selectcolor="white",
-            activebackground="white",
-            activeforeground="black"
-        )
-        flatline_checkbox.pack(pady=5)
-
-        tk.Label(
-            self.global_settings_window,
-            text="Flatline Repeat Count (e.g. 5):",
-            font=("Arial", 10),
-            bg="white",
-            fg="black"
-        ).pack()
-        flatline_entry = tk.Entry(self.global_settings_window, font=("Arial", 10), width=10, bg="white", fg="black",
-                                  insertbackground="black")
-        flatline_entry.insert(0, str(config.get("flatline_hashrate_repeat_count", 5)))
-        flatline_entry.pack(pady=2)
-
-        tk.Button(
-            self.global_settings_window,
-            text="Save",
-            font=("Arial", 10),
-            width=10,
-            bg="gold",
-            command=save_global_settings
-        ).pack(pady=10)
-
-    import platform  # Ensure this is at the top of your file
+        footer = tk.Frame(window, bg=BG)
+        footer.pack(side=tk.BOTTOM, fill=tk.X, padx=16, pady=16)
+        self._button(footer, "Cancel", on_close).pack(side=tk.RIGHT, padx=(8, 0))
+        self._button(footer, "Save", save_global_settings, "accent").pack(side=tk.RIGHT)
+        body.pack_forget()
+        body.pack(fill=tk.BOTH, expand=True, padx=16)
+        window.protocol("WM_DELETE_WINDOW", on_close)
+        self._fit_dialog(window, 520, 560)
 
     def open_autotuner_settings(self):
-        """Opens a window to modify AutoTuner settings for all miners, with a scrollbar for large lists."""
+        """Edit one miner's limits at a time. Copy and Paste still move a whole form."""
         config = load_config()
         miners = config.get("miners", [])
-
         if not miners:
-            messagebox.showwarning("No Miners Found", "Please add a miner first before modifying AutoTuner settings.")
+            messagebox.showwarning(
+                "No Miners Found",
+                "Please add a miner first before modifying AutoTuner settings.",
+                parent=self.root,
+            )
+            return
+        if self._singleton("autotuner_window"):
             return
 
-        if self.autotuner_window and tk.Toplevel.winfo_exists(self.autotuner_window):
-            self.autotuner_window.lift()
-            return
-
-        self.autotuner_window = tk.Toplevel(self.root)
-        self.autotuner_window.title("AutoTuner Settings")
-        self.autotuner_window.geometry("1250x500")
-
-        if platform.system() == "Windows":
-            try:
-                self.autotuner_window.iconbitmap(resource_path("bitaxe_icon.ico"))
-            except:
-                pass  # Icon loading can silently fail if not found or invalid
-
-        self.autotuner_window.config(bg="white")
+        window = self._dialog("AutoTuner Settings")
+        self.autotuner_window = window
 
         def on_close():
-            self.autotuner_window.destroy()
             self.autotuner_window = None
+            if window.winfo_exists():
+                window.destroy()
 
-        self.autotuner_window.protocol("WM_DELETE_WINDOW", on_close)
-
-        tk.Label(self.autotuner_window, text="Modify AutoTuner Settings", font=("Arial", 12, "bold"), bg="white",
-                 fg="black").pack(pady=10)
-
-        container = tk.Frame(self.autotuner_window, bg="white")
-        container.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-
-        canvas = tk.Canvas(container, bg="white")
-        scrollbar = tk.Scrollbar(container, orient="vertical", command=canvas.yview)
-        scrollable_frame = tk.Frame(canvas, bg="white")
-
-        scrollable_frame.bind(
-            "<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        tk.Label(window, text="AutoTuner Settings", bg=BG, fg=TEXT, font=FONT_SECTION).pack(
+            anchor="w", padx=16, pady=(16, 8)
         )
+        body = tk.Frame(window, bg=BG)
+        body.pack(fill=tk.BOTH, expand=True, padx=16)
 
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
+        labels = [f"{miner.get('nickname') or miner['ip']} ({miner['ip']})" for miner in miners]
+        working = []
+        for miner in miners:
+            row = {"ip": miner["ip"], "enabled": bool(miner.get("enabled", False))}
+            for field in ALL_AUTOTUNE_FIELDS:
+                display = miner.get(field, "")
+                if display in ("", None) and field in GAMMA601_LIMITS:
+                    display = GAMMA601_LIMITS[field]
+                row[field] = "" if display is None else str(display)
+            working.append(row)
 
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
+        list_frame = tk.Frame(body, bg=BG)
+        list_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 16))
+        listbox = tk.Listbox(
+            list_frame,
+            bg=PANEL,
+            fg=TEXT,
+            selectbackground=SELECTION,
+            selectforeground=TEXT,
+            font=FONT,
+            activestyle="none",
+            highlightthickness=0,
+            relief=tk.FLAT,
+            width=28,
+            height=16,
+            exportselection=False,
+        )
+        list_scroll = ttk.Scrollbar(list_frame, orient="vertical", command=listbox.yview)
+        listbox.configure(yscrollcommand=list_scroll.set)
+        listbox.pack(side=tk.LEFT, fill=tk.Y)
+        list_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        for label in labels:
+            listbox.insert(tk.END, label)
 
-        headers = ["Enable", "Miner", "Min Freq", "Max Freq", "Start Freq", "Min Volt", "Max Volt", "Start Volt",
-                   "Max Temp", "Max Watts", "Max VR Temp", "Actions"]
+        form = tk.Frame(body, bg=BG)
+        form.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        form_title = tk.Label(form, text="", bg=BG, fg=TEXT, font=FONT_BOLD)
+        form_title.pack(anchor="w")
+        self._hint(form, "Limits for the selected miner.")
 
-        for col_idx, header in enumerate(headers):
-            tk.Label(scrollable_frame, text=header, font=("Arial", 10, "bold"), bg="white", fg="black").grid(
-                row=0, column=col_idx, padx=5, pady=5
-            )
+        enable_var = tk.BooleanVar(value=False)
+        enable_check = self._checkbutton(form, "Tune this miner", enable_var)
+        enable_check.pack(anchor="w", pady=(4, 0))
+        entries = {}
 
-        settings_entries = {}
-        selected_miners = {}
+        def add_trio(title, fields):
+            self._section(form, title)
+            row = tk.Frame(form, bg=BG)
+            row.pack(anchor="w")
+            for field, label in fields:
+                cell = tk.Frame(row, bg=BG)
+                cell.pack(side=tk.LEFT, padx=(0, 16))
+                tk.Label(cell, text=label, bg=BG, fg=MUTED, font=FONT_SMALL).pack(anchor="w")
+                entry = self._entry(cell, 8)
+                entry.pack(anchor="w", pady=(2, 0))
+                entries[field] = entry
+
+        add_trio("Frequency", FREQ_FIELDS)
+        add_trio("Voltage", VOLT_FIELDS)
+        self._section(form, "Limits")
+        for field, label in LIMIT_FIELDS:
+            entries[field] = self._labeled_entry(form, label, 10)
+
+        current = {"index": -1}
         clipboard = {}
-        enable_checkboxes = {}
+        guard = {"on": False}
 
-        def copy_row(row_idx):
-            nonlocal clipboard
-            clipboard = {field: settings_entries[row_idx][field].get() for field in settings_entries[row_idx]}
+        def validate_current():
+            empty = any(entry.get().strip() == "" for entry in entries.values())
+            if empty:
+                enable_var.set(False)
+                enable_check.configure(state=tk.DISABLED)
+            else:
+                enable_check.configure(state=tk.NORMAL)
 
-        def paste_row(row_idx):
-            if not clipboard:
-                messagebox.showwarning("No Data", "No row has been copied yet.")
+        def store_form():
+            index = current["index"]
+            if index < 0:
                 return
+            row = working[index]
+            row["enabled"] = bool(enable_var.get()) and str(enable_check.cget("state")) != str(tk.DISABLED)
+            for field, entry in entries.items():
+                row[field] = entry.get().strip()
 
-            for field, entry in settings_entries[row_idx].items():
+        def show_miner(index):
+            current["index"] = index
+            row = working[index]
+            form_title.configure(text=labels[index])
+            enable_var.set(bool(row["enabled"]))
+            for field, entry in entries.items():
+                entry.delete(0, tk.END)
+                entry.insert(0, row[field])
+            validate_current()
+
+        def on_select(_event=None):
+            if guard["on"]:
+                return
+            selection = listbox.curselection()
+            if not selection:
+                return
+            index = selection[0]
+            if index == current["index"]:
+                return
+            store_form()
+            show_miner(index)
+
+        def copy_row():
+            clipboard.clear()
+            clipboard.update({field: entry.get() for field, entry in entries.items()})
+
+        def paste_row():
+            if not clipboard:
+                messagebox.showwarning("No Data", "No row has been copied yet.", parent=window)
+                return
+            for field, entry in entries.items():
                 if field in clipboard:
                     entry.delete(0, tk.END)
                     entry.insert(0, clipboard[field])
+            validate_current()
+            store_form()
 
-            validate_miner_settings(row_idx)
-
-        def validate_miner_settings(row_idx):
-            has_empty_values = any(entry.get() == "" for entry in settings_entries[row_idx].values())
-            if has_empty_values:
-                selected_miners[row_idx].set(False)
-                enable_checkboxes[row_idx].config(state=tk.DISABLED)
-            else:
-                enable_checkboxes[row_idx].config(state=tk.NORMAL)
-
-        for row_idx, miner in enumerate(miners, start=1):
-            var = tk.BooleanVar(value=miner.get("enabled", False))
-            chk = tk.Checkbutton(scrollable_frame, variable=var, bg="white", fg="black", selectcolor="white",
-                                 activebackground="white", activeforeground="black")
-            chk.grid(row=row_idx, column=0, padx=5, pady=5)
-            selected_miners[row_idx] = var
-            enable_checkboxes[row_idx] = chk
-
-            tk.Label(scrollable_frame, text=f"{miner['nickname']} ({miner['ip']})", bg="white", fg="black",
-                     font=("Arial", 10)).grid(row=row_idx, column=1, padx=5, pady=5, sticky="w")
-
-            fields = ["min_freq", "max_freq", "start_freq", "min_volt", "max_volt",
-                      "start_volt", "max_temp", "max_watts", "max_vr_temp"]
-
-            miner_settings = {}
-
-            for col_idx, field in enumerate(fields, start=2):
-                entry = tk.Entry(scrollable_frame, bg="white", fg="black", insertbackground="black", width=10)
-                entry.insert(0, miner.get(field, ""))
-                entry.grid(row=row_idx, column=col_idx, padx=5, pady=5)
-                miner_settings[field] = entry
-                entry.bind("<KeyRelease>", lambda event, idx=row_idx: validate_miner_settings(idx))
-
-            settings_entries[row_idx] = miner_settings
-
-            copy_button = tk.Button(scrollable_frame, text="Copy", font=("Arial", 8), width=10,
-                                    command=lambda idx=row_idx: copy_row(idx))
-            paste_button = tk.Button(scrollable_frame, text="Paste", font=("Arial", 8), width=10,
-                                     command=lambda idx=row_idx: paste_row(idx))
-
-            copy_button.grid(row=row_idx, column=len(fields) + 2, padx=2, pady=5)
-            paste_button.grid(row=row_idx, column=len(fields) + 3, padx=2, pady=5)
-
-            validate_miner_settings(row_idx)
+        for entry in entries.values():
+            entry.bind("<KeyRelease>", lambda _event: validate_current())
+        listbox.bind("<<ListboxSelect>>", on_select)
+        guard["on"] = True
+        listbox.selection_set(0)
+        listbox.activate(0)
+        guard["on"] = False
+        show_miner(0)
 
         def save_autotuner_settings():
-            for idx, miner in enumerate(config["miners"], start=1):
-                if idx in settings_entries:
-                    for field, entry in settings_entries[idx].items():
-                        miner[field] = int(entry.get()) if entry.get().isdigit() else ""
-                miner["enabled"] = selected_miners[idx].get()
-
+            store_form()
+            by_ip = {miner["ip"]: miner for miner in config["miners"]}
+            for row in working:
+                miner = by_ip.get(row["ip"])
+                if miner is None:
+                    continue
+                for field in ALL_AUTOTUNE_FIELDS:
+                    try:
+                        miner[field] = parse_autotuner_value(field, row[field])
+                    except ValueError:
+                        messagebox.showerror(
+                            "Error",
+                            f"Enter a number for {field.replace('_', ' ')} on {row['ip']}.",
+                            parent=window,
+                        )
+                        return
+                if any(miner[field] == "" for field in ALL_AUTOTUNE_FIELDS):
+                    miner["enabled"] = False
+                else:
+                    miner["enabled"] = bool(row["enabled"])
             save_config(config)
             self.log_message("Updated AutoTuner settings for all miners.", "success")
-            messagebox.showinfo("Settings Saved", "AutoTuner settings have been successfully saved!")
-            self.autotuner_window.destroy()
+            on_close()
 
-        tk.Button(self.autotuner_window, text="Save", font=("Arial", 10), width=10, bg="gold",
-                  command=save_autotuner_settings).pack(pady=10)
-
-    def save_settings(self):
-        """Saves all miner tuning settings and miner details to config.json."""
-        config = load_config()  # Load existing config
-        existing_miners = config.get("miners", [])
-
-        updated_miners = []
-
-        # Get current values from the UI and update config.json
-        for item in self.tree.get_children():
-            values = self.tree.item(item, "values")
-            nickname = values[0]
-            miner_type = values[1]
-            ip = values[2]
-
-            # Retrieve tuning settings from stored config
-            miner_defaults = get_miner_defaults(ip)
-
-            # Preserve 'enabled' flag from existing config
-            matching_existing = next((m for m in existing_miners if m["ip"] == ip), {})
-            enabled = matching_existing.get("enabled", False)
-
-            updated_miner = {
-                "nickname": nickname,
-                "type": miner_type,
-                "ip": ip,
-                "min_freq": miner_defaults.get("min_freq", ""),
-                "max_freq": miner_defaults.get("max_freq", ""),
-                "start_freq": miner_defaults.get("start_freq", ""),
-                "min_volt": miner_defaults.get("min_volt", ""),
-                "max_volt": miner_defaults.get("max_volt", ""),
-                "start_volt": miner_defaults.get("start_volt", ""),
-                "max_temp": miner_defaults.get("max_temp", ""),
-                "max_watts": miner_defaults.get("max_watts", ""),
-                "max_vr_temp": miner_defaults.get("max_vr_temp", ""),
-                "enabled": enabled
-            }
-
-            updated_miners.append(updated_miner)
-
-        config["miners"] = updated_miners  # Replace old miner data with updated values
-
-        save_config(config)  # Save back to config.json
-
-        self.log_message("Tuning & miner settings have been saved to config.json.", "success")
-        messagebox.showinfo("Settings Saved", "All miner settings have been successfully saved!")
+        footer = tk.Frame(window, bg=BG)
+        footer.pack(side=tk.BOTTOM, fill=tk.X, padx=16, pady=16)
+        self._button(footer, "Copy", copy_row).pack(side=tk.LEFT)
+        self._button(footer, "Paste", paste_row).pack(side=tk.LEFT, padx=(8, 0))
+        self._button(footer, "Cancel", on_close).pack(side=tk.RIGHT, padx=(8, 0))
+        self._button(footer, "Save", save_autotuner_settings, "accent").pack(side=tk.RIGHT)
+        body.pack_forget()
+        body.pack(fill=tk.BOTH, expand=True, padx=16)
+        window.protocol("WM_DELETE_WINDOW", on_close)
+        self._fit_dialog(window, 760, 560)
 
     def toggle_fullscreen(self, event=None):
-        """Toggle full-screen mode."""
-        self.root.attributes("-fullscreen", not self.root.attributes("-fullscreen"))
+        """Toggle full-screen mode. The header stays so the tablet can leave it."""
+        self._set_fullscreen(not bool(self.root.attributes("-fullscreen")))
+        return "break"
 
     def exit_fullscreen(self, event=None):
         """Exit full-screen mode."""
-        self.root.attributes("-fullscreen", False)
+        self._set_fullscreen(False)
+        return "break"
+
+    def _set_fullscreen(self, enabled):
+        enabled = bool(enabled)
+        self.root.attributes("-fullscreen", enabled)
+        self.fullscreen_button.configure(text="Exit fullscreen" if enabled else "Fullscreen")
+        if enabled:
+            if self.chrome.winfo_ismapped():
+                self.chrome.pack_forget()
+        elif not self.chrome.winfo_ismapped():
+            self.chrome.pack(fill=tk.X, padx=16, pady=(0, 12))
+
+    def reset_to_baseline(self):
+        """Write factory clocks to every saved miner and forget the learned setpoint."""
+        if self._baseline_reset_running:
+            self.log_message("A baseline reset is already in progress.", "warning")
+            messagebox.showwarning("Reset in Progress", "A baseline reset is already in progress.", parent=self.root)
+            return
+        if self._autotuner_busy():
+            self.log_message("Stop the autotuner before resetting to baseline.", "warning")
+            messagebox.showwarning(
+                "Autotuner Running",
+                "Stop the autotuner before resetting miners to baseline.",
+                parent=self.root,
+            )
+            return
+
+        miners = list(get_miners())
+        if not miners:
+            messagebox.showwarning(
+                "No Miners Found",
+                "Please add a miner first before resetting to baseline.",
+                parent=self.root,
+            )
+            return
+
+        confirmed = messagebox.askyesno(
+            "Reset to Baseline",
+            f"Set every miner to the Gamma 601 stock clocks ({STOCK_FREQ} MHz / {STOCK_VOLT} mV) "
+            "and forget the saved setpoint?\n\n"
+            "The next Start Autotuner will climb or step down from there.",
+            parent=self.root,
+        )
+        if not confirmed:
+            return
+
+        self._baseline_reset_running = True
+        self._sync_run_buttons()
+        self.log_message(f"Resetting miners to {STOCK_FREQ} MHz / {STOCK_VOLT} mV.", "info")
+
+        def finish():
+            self._baseline_reset_running = False
+            if not self.root.winfo_exists():
+                return
+            self._sync_run_buttons()
+            self.log_message(
+                f"Baseline reset finished. Start Autotuner to tune from {STOCK_FREQ} MHz / {STOCK_VOLT} mV.",
+                "success",
+            )
+
+        def work():
+            try:
+                reset_miners_to_baseline(miners, self.log_message)
+            finally:
+                try:
+                    self.root.after(0, finish)
+                except tk.TclError:
+                    self._baseline_reset_running = False
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _autotuner_busy(self):
+        return self.running or self._stop_in_progress or any(thread.is_alive() for thread in self.threads)
 
     def start_autotuning(self):
         """Starts autotuning miners using the latest saved AutoTuner settings."""
-        self.running = True
-        self.threads.clear()
-
-        self.start_button.config(text="Autotuner Running", state=tk.DISABLED, bg="light green")
-
-        config = load_config()  # Reload latest settings including updated monitor_interval
-        interval = config.get("monitor_interval", 5)  # Refresh it here just once
-
-        self.log_message("Checking AutoTuner settings before starting...", "info")
-
-        missing_settings = []
-        required_fields = ["min_freq", "max_freq", "min_volt", "max_volt", "max_temp", "max_watts"]
-
-        # Validate that each miner has all required AutoTuner settings
-        for miner in config.get("miners", []):
-            if not miner.get("enabled", False):  # Skip miners that are disabled
-                continue
-
-            for field in required_fields:
-                if field not in miner or miner[field] == "" or miner[field] is None:
-                    missing_settings.append((miner["ip"], field))
-
-        # If missing settings are found, alert the user and prevent startup
-        if missing_settings:
-            error_message = "AutoTuner settings are incomplete. Please populate the following missing fields:\n\n"
-            for ip, field in missing_settings:
-                error_message += f"- Miner {ip}: Missing {field}\n"
-
-            self.log_message(error_message, "error")
-            messagebox.showerror("Incomplete Settings", error_message)
-            self.running = False
+        if self._baseline_reset_running:
+            self.log_message("Wait for the baseline reset to finish before starting.", "warning")
+            return
+        if self._start_pending or self.running or self._stop_in_progress or any(
+            thread.is_alive() for thread in self.threads
+        ):
+            self.log_message("Autotuner is already running.", "warning")
             return
 
-        self.log_message("Starting autotuning for selected miners...", "success")
+        self._start_pending = True
+        self._sync_run_buttons()
+        try:
+            config = load_config()
+            interval = config.get("monitor_interval", 5)
+            self.log_message("Checking AutoTuner settings before starting...", "info")
 
-        active_miners = [m for m in config.get("miners", []) if m.get("enabled", False)]
+            required_fields = ["min_freq", "max_freq", "min_volt", "max_volt", "max_temp", "max_watts", "max_vr_temp"]
+            enabled_miners = [miner for miner in config.get("miners", []) if miner.get("enabled", False)]
+            ready_miners = []
+            missing_settings = []
 
-        if not active_miners:
-            self.log_message("No miners are enabled for AutoTuning. Please enable at least one miner.", "error")
-            messagebox.showwarning("No Miners Enabled",
-                                   "No miners are enabled for AutoTuning. Please enable at least one miner in settings.")
-            self.running = False
-            return
+            for miner in enabled_miners:
+                missing = [
+                    field for field in required_fields
+                    if field not in miner or miner[field] == "" or miner[field] is None
+                ]
+                if missing:
+                    for field in missing:
+                        missing_settings.append((miner["ip"], field))
+                else:
+                    ready_miners.append(miner)
 
-        for miner in active_miners:
-            ip, bitaxe_type = miner["ip"], miner["type"]
+            if not enabled_miners:
+                self.log_message("No miners are enabled for AutoTuning. Please enable at least one miner.", "error")
+                messagebox.showwarning(
+                    "No Miners Enabled",
+                    "No miners are enabled for AutoTuning. Please enable at least one miner in settings.",
+                    parent=self.root,
+                )
+                return
 
-            min_freq = miner.get("min_freq", 0)
-            max_freq = miner.get("max_freq", 0)
-            min_volt = miner.get("min_volt", 0)
-            max_volt = miner.get("max_volt", 0)
-            max_temp = miner.get("max_temp", 0)
-            max_watts = miner.get("max_watts", 0)
-            max_vr_temp = miner.get("max_vr_temp", 0)
-            interval = config.get("monitor_interval", 10)  # Global setting
+            if missing_settings:
+                error_message = "These miners are missing AutoTuner settings and will be skipped:\n\n"
+                for ip, field in missing_settings:
+                    error_message += f"- Miner {ip}: Missing {field}\n"
+                self.log_message(error_message, "error")
+                if not ready_miners:
+                    messagebox.showerror("Incomplete Settings", error_message, parent=self.root)
+                    return
+                messagebox.showwarning("Some miners skipped", error_message, parent=self.root)
 
-            # Pass settings dynamically to `monitor_and_adjust`
-            start_freq = miner.get("start_freq", "")
-            start_volt = miner.get("start_volt", "")
+            self.stop_event = threading.Event()
+            self.running = True
+            self.threads = []
+            self.log_message("Starting autotuning for selected miners...", "success")
 
-            thread = threading.Thread(
-                target=monitor_and_adjust,
-                args=(ip, bitaxe_type, interval, self.log_message,
-                      min_freq, max_freq, min_volt, max_volt,
-                      max_temp, max_watts, start_freq, start_volt, max_vr_temp)
-            )
+            for index, miner in enumerate(ready_miners):
+                thread = threading.Thread(
+                    target=monitor_and_adjust,
+                    args=(
+                        miner["ip"],
+                        miner.get("type", "Unknown"),
+                        interval,
+                        self.log_message,
+                        miner.get("min_freq"),
+                        miner.get("max_freq"),
+                        miner.get("min_volt"),
+                        miner.get("max_volt"),
+                        miner.get("max_temp"),
+                        miner.get("max_watts"),
+                        miner.get("start_freq", ""),
+                        miner.get("start_volt", ""),
+                        miner.get("max_vr_temp"),
+                    ),
+                    kwargs={
+                        "stop_event": self.stop_event,
+                        "startup_delay": index * STARTUP_STAGGER_SECONDS,
+                    },
+                    daemon=True,
+                )
+                thread.start()
+                self.threads.append(thread)
 
-            thread.start()
-            self.threads.append(thread)
-
-        # Ensure UI updates based on monitor interval
-        self.update_miner_display(interval)
-
-        # Start a new thread that watches the time and resets all miners at the configured time
-        threading.Thread(target=self.daily_reset_watcher, daemon=True).start()
+            self._kick_miner_display()
+            if not self._reset_watcher_started:
+                self._reset_watcher_started = True
+                threading.Thread(target=self.daily_reset_watcher, daemon=True).start()
+        finally:
+            self._start_pending = False
+            self._sync_run_buttons()
 
     def stop_autotuning(self):
-        """Stops all autotuning processes."""
+        """Stops all autotuning processes and waits until those threads leave."""
+        if self._stop_in_progress:
+            return
+        if self.stop_event is None and not self.threads:
+            self.running = False
+            self._sync_run_buttons()
+            return
+
+        self._stop_in_progress = True
         self.running = False
-        stop_autotuning()
-
-        self.start_button.config(text="Start Autotuner", state=tk.NORMAL, bg="gold")
-
+        if self.stop_event is not None:
+            self.stop_event.set()
+        self._sync_run_buttons()
         self.log_message("Stopping autotuning...", "warning")
+        threads = list(self.threads)
+
+        def join_threads():
+            for thread in threads:
+                thread.join(timeout=12)
+            try:
+                self.root.after(0, self._finish_stop)
+            except tk.TclError:
+                self._stop_in_progress = False
+
+        threading.Thread(target=join_threads, daemon=True).start()
+
+    def _finish_stop(self):
+        self.threads = [thread for thread in self.threads if thread.is_alive()]
+        self._stop_in_progress = False
+        self.running = False
+        self._sync_run_buttons()
+        if self.threads:
+            self.log_message("Some tuner threads are still finishing a request.", "warning")
+        else:
+            self.log_message("Autotuning stopped.", "warning")
 
     def show_tree_menu(self, event):
         """Displays the right-click menu when a miner is selected."""
         selected_item = self.tree.identify_row(event.y)
         if selected_item:
-            self.tree.selection_set(selected_item)  # Select miner
-            self.tree_menu.post(event.x_root, event.y_root)  # Show right-click menu
+            self.tree.selection_set(selected_item)
+            self.tree_menu.post(event.x_root, event.y_root)
 
-    def update_miner_display(self, interval):
-        """Refresh miner status in the UI at the global monitor interval."""
-        if not self.running:
+    def update_miner_display(self):
+        """Refresh miner status off the Tk thread, then apply the rows on the UI thread."""
+        self._display_after_id = None
+        if not self.root.winfo_exists():
+            return
+        if self._status_refresh_running:
+            self._display_pending = True
+            return
+        if not self.tree_items_by_ip:
+            self._show_empty(True)
+            self._schedule_next_poll()
             return
 
-        for ip, item in self.tree_items_by_ip.items():
+        self._status_refresh_running = True
+        snapshot = list(self.tree_items_by_ip.items())
 
-            miner_data = get_system_info(ip)
-            if isinstance(miner_data, str):
-                self.log_message(f"Error fetching miner data from {ip}: {miner_data}", "error")
-                continue
+        def fetch():
+            results = []
+            try:
+                for ip, item in snapshot:
+                    results.append((ip, item, get_system_info(ip)))
+            finally:
+                try:
+                    self.root.after(0, lambda: self._apply_miner_display(results))
+                except tk.TclError:
+                    self._status_refresh_running = False
 
-            # Extract real-time values
-            new_frequency = miner_data.get("frequency", "-")
-            new_voltage = miner_data.get("coreVoltage", "-")
-            new_temp = f"{miner_data.get('temp', '-')}°C"
-            new_vr_temp = f"{miner_data.get('vrTemp', '-')}°C"
-            new_hashrate = f"{float(miner_data.get('hashRate', 0)):.2f} GH/s"
-            new_power = f"{float(miner_data.get('power', 0)):.2f} W"
+        threading.Thread(target=fetch, daemon=True).start()
 
-            # Update UI
-            values = self.tree.item(item, "values")
-            updated_values = list(values)
-            updated_values[3] = new_frequency  # Applied Frequency
-            updated_values[4] = new_voltage  # Current Voltage
-            updated_values[5] = new_temp  # Current Temp
-            updated_values[6] = new_vr_temp
-            updated_values[7] = new_hashrate  # Current Hashrate
-            updated_values[8] = new_power  # Current Power Usage
+    def _apply_miner_display(self, results):
+        self._status_refresh_running = False
+        if not self.root.winfo_exists():
+            return
+        try:
+            for ip, item, miner_data in results:
+                if item not in self.tree.get_children():
+                    continue
+                if isinstance(miner_data, str) or not isinstance(miner_data, dict):
+                    self._mark_offline(item)
+                    continue
+                values = self.tree.item(item, "values")
+                updated = self._live_row_values(ip, values, miner_data)
+                self.tree.item(item, values=updated)
+                self._set_row_tag(item, self._tag_for_values(ip, updated))
+            self._touch_updated()
+        finally:
+            if self.root.winfo_exists():
+                self._continue_display()
 
-            self.tree.item(item, values=updated_values)
+    def _continue_display(self):
+        if self._display_pending:
+            self._display_pending = False
+            self.update_miner_display()
+            return
+        self._schedule_next_poll()
 
-        # schedule the next update based on monitor interval
-        config = load_config()
-        interval = config.get("monitor_interval", 5)
-        self.root.after(interval * 1000, self.update_miner_display, interval)
+    def _schedule_next_poll(self):
+        if not self.root.winfo_exists():
+            return
+        if self.running:
+            try:
+                interval = float(load_config().get("monitor_interval", 5))
+            except (TypeError, ValueError):
+                interval = 5
+        else:
+            interval = IDLE_POLL_SECONDS
+        interval = max(1.0, interval)
+        self._display_after_id = self.root.after(int(interval * 1000), self.update_miner_display)
+
+    def _kick_miner_display(self):
+        if self._display_after_id is not None:
+            try:
+                self.root.after_cancel(self._display_after_id)
+            except tk.TclError:
+                pass
+            self._display_after_id = None
+        self.update_miner_display()
 
     def log_message(self, message, level="info"):
         """Logs messages to the UI, ensuring updates run on the main thread."""
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        timestamp = datetime.now().strftime("%H:%M:%S")
         message = f"[{timestamp}] {message}"
-    
-        def _update_log():
-            if not self.root.winfo_exists():  # Check if window is still open
-                return
+        if level not in ("success", "warning", "error", "info"):
+            level = "info"
 
-            colors = {"success": "green", "warning": "orange", "error": "red", "info": "black"}
+        def _update_log():
+            if not self.root.winfo_exists():
+                return
+            pinned = self.log_output.yview()[1] >= 0.98
             self.log_output.insert(tk.END, message + "\n", level)
-            self.log_output.tag_config(level, foreground=colors[level])
-            self.log_output.yview(tk.END)
-    
-        # Ensure Tkinter UI updates run on the main thread
-        if self.root.winfo_exists():  # Prevent calls after window is closed
+            line_count = int(self.log_output.index("end-1c").split(".")[0])
+            if line_count > 500:
+                self.log_output.delete("1.0", f"{line_count - 500 + 1}.0")
+            if pinned:
+                self.log_output.see(tk.END)
+
+        try:
             self.root.after(0, _update_log)
+        except tk.TclError:
+            return
 
     def daily_reset_watcher(self):
         while True:
@@ -907,22 +1614,35 @@ class BitaxeAutotuningApp:
                         ip = miner["ip"]
                         msg = restart_bitaxe(ip)
                         self.log_message(msg, "warning")
-                    time.sleep(60)  # Prevent multiple resets in one minute
+                    time.sleep(60)
             time.sleep(10)
 
     def restart_selected_miner(self):
         """Restarts the selected miner via API."""
-        selected_item = self.tree.selection()
-        if not selected_item:
-            messagebox.showwarning("No Selection", "Please select a miner to restart.")
+        _item, values = self._selected_miner()
+        if not values:
+            return
+        name = values[COL_NAME] or values[COL_IP]
+        ip = values[COL_IP]
+        if not messagebox.askyesno("Restart Miner", f"Restart {name} ({ip})?", parent=self.root):
             return
 
-        values = self.tree.item(selected_item, "values")
-        ip = values[2]
         self.log_message(f"Restarting miner at {ip}...", "warning")
-        msg = restart_bitaxe(ip)
-        self.log_message(msg, "warning")
-        messagebox.showinfo("Restart Triggered", msg)
+
+        def restart():
+            msg = restart_bitaxe(ip)
+            self.log_message(msg, "warning")
+
+            def show_result():
+                if self.root.winfo_exists():
+                    messagebox.showinfo("Restart Triggered", msg, parent=self.root)
+
+            try:
+                self.root.after(0, show_result)
+            except tk.TclError:
+                return
+
+        threading.Thread(target=restart, daemon=True).start()
 
     def run(self):
         """Runs the Tkinter event loop."""

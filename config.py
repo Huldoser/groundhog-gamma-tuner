@@ -1,12 +1,76 @@
+import copy
 import json
 import os
-import requests
+import tempfile
+import threading
+
 import ipaddress
+import requests
 
-CONFIG_FILE = "config.json"
+CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+_config_lock = threading.RLock()
+_last_good_config = None
 
-def detect_miners(start_ip, end_ip):
-    """Scan a user-defined IP range and detect Bitaxe miners."""
+# Gamma 601 hard range. The UI and the tuner both stay inside this.
+HARD_MIN_FREQ = 400
+HARD_MAX_FREQ = 1100
+HARD_MIN_VOLT = 1000
+HARD_MAX_VOLT = 1400
+DEFAULT_MIN_INPUT_VOLTAGE = 4.9
+DEFAULT_MAX_ERROR_PERCENTAGE = 2.0
+DEFAULT_MAX_DROOP_MV = 40
+DEFAULT_CEILING_SOAK_SECONDS = 30 * 60
+
+# Gamma 601 clocks as they ship from the factory.
+STOCK_FREQ = 525
+STOCK_VOLT = 1150
+
+# Per-miner caps for a custom-cooled Gamma 601. Still editable per chip.
+# The tuner holds near 65°C on the ASIC and 85°C on the regulator, and steps
+# down above 68°C / 88°C. max_watts is a runaway guard, not the performance limit.
+# max_freq is the hard cap so a strong chip is not stopped early.
+GAMMA601_LIMITS = {
+    "min_freq": HARD_MIN_FREQ,
+    "max_freq": HARD_MAX_FREQ,
+    "start_freq": STOCK_FREQ,
+    "min_volt": HARD_MIN_VOLT,
+    "max_volt": 1300,
+    "start_volt": STOCK_VOLT,
+    "max_temp": 68,
+    "max_watts": 50,
+    "max_vr_temp": 88,
+    "min_input_voltage": DEFAULT_MIN_INPUT_VOLTAGE,
+    "max_error_percentage": DEFAULT_MAX_ERROR_PERCENTAGE,
+    "max_droop_mv": DEFAULT_MAX_DROOP_MV,
+}
+
+
+def is_gamma_601(miner_info):
+    """True only for a single-ASIC BM1370 on board version 601."""
+    if not isinstance(miner_info, dict):
+        return False
+    asic = str(miner_info.get("ASICModel") or "").strip().upper()
+    board = str(miner_info.get("boardVersion") or "").strip()
+    return asic == "BM1370" and board == "601"
+
+
+def miner_type_from_info(miner_info):
+    """Build a display type from the fields AxeOS actually returns."""
+    asic = str(miner_info.get("ASICModel") or "").strip()
+    board = str(miner_info.get("boardVersion") or "").strip()
+    if asic and board:
+        return f"{asic} {board}"
+    if asic or board:
+        return asic or board
+    device = str(miner_info.get("deviceModel") or miner_info.get("model") or "").strip()
+    return device or "Unknown"
+
+def detect_miners(start_ip, end_ip, on_progress=None, should_cancel=None):
+    """Scan a user-defined IP range and detect Bitaxe miners.
+
+    on_progress(index, total, ip) runs before each address.
+    should_cancel() stops the scan before the next address. Miners already found are saved.
+    """
 
     # Convert IPs to IPv4 objects
     try:
@@ -18,30 +82,28 @@ def detect_miners(start_ip, end_ip):
 
     detected_miners = []
     config = load_config()
+    addresses = list(range(int(start_ip), int(end_ip) + 1))
+    total = len(addresses)
 
-    for ip in range(int(start_ip), int(end_ip) + 1):
+    for index, ip in enumerate(addresses, start=1):
+        if should_cancel is not None and should_cancel():
+            break
         ip_str = str(ipaddress.IPv4Address(ip))
+        if on_progress is not None:
+            on_progress(index, total, ip_str)
         try:
             response = requests.get(f"http://{ip_str}/api/system/info", timeout=1)
             if response.status_code == 200:
                 miner_info = response.json()
-                model = miner_info.get("model", "Unknown")
+                if not is_gamma_601(miner_info):
+                    print(f"Skipping {ip_str}: not a Bitaxe Gamma 601.")
+                    continue
+                model = miner_type_from_info(miner_info)
 
                 # Prevent duplicate miner entries
                 if not any(m["ip"] == ip_str for m in config["miners"]):
-                    detected_miners.append({
-                        "nickname": f"Miner-{ip_str}",
-                        "ip": ip_str,
-                        "type": model,
-                        "min_freq": miner_info.get("min_freq", ""),
-                        "max_freq": miner_info.get("max_freq", ""),
-                        "min_volt": miner_info.get("min_volt", ""),
-                        "max_volt": miner_info.get("max_volt", ""),
-                        "max_temp": miner_info.get("max_temp", ""),
-                        "max_watts": miner_info.get("max_watts", ""),
-                        "max_vr_temp": miner_info.get("max_vr_temp", ""),  # <- ADD THIS
-                        "target_hashrate": miner_info.get("target_hashrate", "")
-                    })
+                    detected = new_miner_record(model, ip_str, f"Miner-{ip_str}", config)
+                    detected_miners.append(detected)
                     print(f"Detected miner: {model} at {ip_str}, added as {detected_miners[-1]['nickname']}")
 
         except requests.exceptions.RequestException:
@@ -54,31 +116,97 @@ def detect_miners(start_ip, end_ip):
     return detected_miners
 
 def load_config():
-    """Load configuration settings from config.json."""
-    if not os.path.exists(CONFIG_FILE):
-        save_config(get_default_config())
+    """Load configuration settings from config.json.
 
-    try:
-        with open(CONFIG_FILE, "r") as file:
-            return json.load(file)
-    except (json.JSONDecodeError, FileNotFoundError):
-        save_config(get_default_config())
-        return get_default_config()
+    A partial or corrupt file does not replace the last config that parsed.
+    """
+    global _last_good_config
+    with _config_lock:
+        if not os.path.exists(CONFIG_FILE):
+            default = get_default_config()
+            _write_config(default)
+            _last_good_config = copy.deepcopy(default)
+            return default
+
+        try:
+            with open(CONFIG_FILE, "r") as file:
+                loaded = json.load(file)
+        except json.JSONDecodeError:
+            if _last_good_config is not None:
+                return copy.deepcopy(_last_good_config)
+            return get_default_config()
+        except FileNotFoundError:
+            default = get_default_config()
+            _write_config(default)
+            _last_good_config = copy.deepcopy(default)
+            return default
+
+        _last_good_config = copy.deepcopy(loaded)
+        return loaded
 
 def save_config(config):
-    """Save configuration settings to config.json."""
-    with open(CONFIG_FILE, "w") as file:
-        json.dump(config, file, indent=4)
+    """Save configuration settings to config.json atomically."""
+    global _last_good_config
+    with _config_lock:
+        _write_config(config)
+        _last_good_config = copy.deepcopy(config)
+
+def _write_config(config):
+    """Write config.json via a temp file in the same directory, then rename it."""
+    config_path = os.path.abspath(CONFIG_FILE)
+    directory = os.path.dirname(config_path) or "."
+    fd, temp_path = tempfile.mkstemp(dir=directory, prefix=".config-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w") as file:
+            json.dump(config, file, indent=4)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temp_path, config_path)
+    except Exception:
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
+        raise
+
+def gamma_601_limits(config=None):
+    """Caps for a new Gamma 601. Max temp follows Default Max Temp when that is set."""
+    limits = dict(GAMMA601_LIMITS)
+    if config is not None and config.get("default_target_temp") not in (None, ""):
+        limits["max_temp"] = config.get("default_target_temp")
+    return limits
+
+
+def new_miner_record(miner_type, ip, nickname, config=None):
+    """A miner row with empty learned fields. Limits are filled by gamma_601_limits."""
+    record = {
+        "nickname": nickname,
+        "type": miner_type,
+        "ip": ip,
+        "enabled": False,
+        "last_good_freq": "",
+        "last_good_volt": "",
+        "wall_type": "",
+        "wall_timestamp": "",
+        "target_hashrate": "",
+    }
+    for key in GAMMA601_LIMITS:
+        record.setdefault(key, "")
+    if config is not None:
+        record.update(gamma_601_limits(config))
+    return record
+
 
 def get_default_config():
     return {
         "voltage_step": 10,
         "frequency_step": 5,
         "monitor_interval": 5,
-        "default_target_temp": 50,
-        "temp_tolerance": 2,
-        "refresh_interval": 5,
-        "enforce_safe_pairing": True,
+        "default_target_temp": 68,
+        "temp_tolerance": 3,
+        "vr_temp_tolerance": 3,
+        "refresh_interval": 180,
+        "ceiling_soak_seconds": DEFAULT_CEILING_SOAK_SECONDS,
         "daily_reset_enabled": False,
         "daily_reset_time": "03:00",
         "miners": []
@@ -101,21 +229,7 @@ def add_miner(miner_type, ip, nickname=""):
         print(f"Error: Miner with IP {ip} already exists.")
         return
 
-    new_miner = {
-        "nickname": nickname,
-        "type": miner_type,
-        "ip": ip,
-        "min_freq": "",
-        "max_freq": "",
-        "start_freq": "",
-        "min_volt": "",
-        "max_volt": "",
-        "start_volt": "",
-        "max_temp": "",
-        "max_watts": "",
-        "max_vr_temp": "",  # <- ADD THIS
-        "target_hashrate": ""
-    }
+    new_miner = new_miner_record(miner_type, ip, nickname, config)
 
     config["miners"].append(new_miner)
     save_config(config)
@@ -135,21 +249,24 @@ def remove_miner(ip):
     print(f"Removed miner with IP: {ip}")
 
 def update_miner(ip, new_settings):
-    """Updates an existing miner's settings in config.json."""
-    config = load_config()
-    updated = False
+    """Updates an existing miner's settings in config.json under one lock."""
+    global _last_good_config
+    with _config_lock:
+        config = load_config()
+        updated = False
+        for miner in config.get("miners", []):
+            if miner.get("ip") == ip:
+                miner.update(new_settings)
+                updated = True
+                break
 
-    for miner in config["miners"]:
-        if miner["ip"] == ip:
-            miner.update(new_settings)
-            updated = True
-            break
+        if not updated:
+            print(f"Error: Miner {ip} not found.")
+            return
 
-    if updated:
-        save_config(config)
+        _write_config(config)
+        _last_good_config = copy.deepcopy(config)
         print(f"Updated miner {ip} settings successfully.")
-    else:
-        print(f"Error: Miner {ip} not found.")
 
 def get_miners():
     """Returns the list of configured miners."""
