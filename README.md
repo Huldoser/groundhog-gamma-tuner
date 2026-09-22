@@ -6,7 +6,7 @@ It runs as a local dashboard window, watches the miner's AxeOS API, and adjusts 
 
 ## Credit
 
-This project is a heavily modified fork of [bitaxe-temp-monitor](https://github.com/Hurllz/bitaxe-temp-monitor) by [Hurllz](https://github.com/Hurllz). Copyright in the original work remains with Hurllz. Copyright in these modifications is held by Andrey Rychkov. This copy is published at [Huldoser/bitaxe-temp-monitor](https://github.com/Huldoser/bitaxe-temp-monitor).
+This project is a heavily modified fork of [bitaxe-temp-monitor](https://github.com/Hurllz/bitaxe-temp-monitor) by [Hurllz](https://github.com/Hurllz). Copyright in the original work remains with Hurllz. Copyright in these modifications is held by Andrey Rychkov. This copy is published at [Huldoser/groundhog-gamma-tuner](https://github.com/Huldoser/groundhog-gamma-tuner).
 
 The upstream project also includes work by [DeanCollier](https://github.com/DeanCollier), Andrew Kuehne ([andewkuehne](https://github.com/andewkuehne)), [mrv777](https://github.com/mrv777), and GUI work credited to Birdman332. The headless web server, Docker setup, and Linux, macOS, and Raspberry Pi launch paths from that project are not in this fork.
 
