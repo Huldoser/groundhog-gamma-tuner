@@ -45,8 +45,8 @@ from config import (
     is_gamma_601,
     load_config,
     miner_type_from_info,
+    modify_config,
     remove_miner,
-    save_config,
     update_miner,
 )
 
@@ -55,7 +55,9 @@ LOG_LIMIT = 500
 WEAK_WIFI_DBM = -70
 NETWORK_REFRESH_SECONDS = 60
 DIFFICULTY_URL = "https://mempool.space/api/v1/mining/hashrate/3d"
-FIRMWARE_RELEASES_URL = "https://api.github.com/repos/bitaxeorg/ESP-Miner/releases?per_page=100"
+FIRMWARE_RELEASES_URL = (
+    "https://api.github.com/repos/bitaxeorg/ESP-Miner/releases?per_page=100"
+)
 _STABLE_TAG = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
 _INSTALLED_VERSION = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)")
 # Stratum V2 listeners. CK Pool is stratum.ckpool.org:3336. Public Pool solo is :23330.
@@ -74,7 +76,9 @@ LIMIT_FIELDS = (
     ("max_error_percentage", "Error %"),
     ("max_droop_mv", "Droop (mV)"),
 )
-ALL_AUTOTUNE_FIELDS = tuple(field for field, _label in (*FREQ_FIELDS, *VOLT_FIELDS, *LIMIT_FIELDS))
+ALL_AUTOTUNE_FIELDS = tuple(
+    field for field, _label in (*FREQ_FIELDS, *VOLT_FIELDS, *LIMIT_FIELDS)
+)
 GLOBAL_INT_FIELDS = (
     "voltage_step",
     "frequency_step",
@@ -96,6 +100,20 @@ START_REQUIRED_FIELDS = (
 )
 
 
+def format_log_line(message, moment=None):
+    """One activity line: [YYYY-MM-DD HH:MM:SS] [hostname] message.
+
+    Tuner lines arrive as ``hostname -> message``. Other lines have no host.
+    """
+    moment = moment or datetime.now()
+    stamp = moment.strftime("%Y-%m-%d %H:%M:%S")
+    text = "" if message is None else str(message)
+    host, separator, body = text.partition(" -> ")
+    if separator and host.strip() and "\n" not in host:
+        return f"[{stamp}] [{host.strip()}] {body}"
+    return f"[{stamp}] {text}"
+
+
 def replace_ips_with_names(message, names):
     """Swap known miner IPs for nicknames. Longer addresses are replaced first.
 
@@ -109,7 +127,11 @@ def replace_ips_with_names(message, names):
         name = str(names.get(ip) or "").strip()
         if not ip or not name or name == ip or ip in name:
             continue
-        text = re.sub(rf"\b{re.escape(str(ip))}\b", lambda _match, replacement=name: replacement, text)
+        text = re.sub(
+            rf"\b{re.escape(str(ip))}\b",
+            lambda _match, replacement=name: replacement,
+            text,
+        )
     return text
 
 
@@ -146,7 +168,14 @@ def format_learned_wall(status, stored):
 def parse_display_number(value):
     if value in (None, "", "-"):
         return None
-    cleaned = str(value).replace("°C", "").replace("°", "").replace("%", "").replace(",", "").strip()
+    cleaned = (
+        str(value)
+        .replace("°C", "")
+        .replace("°", "")
+        .replace("%", "")
+        .replace(",", "")
+        .strip()
+    )
     try:
         return float(cleaned)
     except ValueError:
@@ -237,7 +266,11 @@ def format_input_voltage(value):
 
 def format_minute_hashrate(info):
     """The 1-minute rate the tuner trusts. Live rate stays in the tooltip."""
-    if not isinstance(info, dict) or "hashRate_1m" not in info or info.get("hashRate_1m") is None:
+    if (
+        not isinstance(info, dict)
+        or "hashRate_1m" not in info
+        or info.get("hashRate_1m") is None
+    ):
         return "-"
     return format_number(info.get("hashRate_1m"), 2)
 
@@ -302,7 +335,9 @@ def format_core_voltage_title(setpoint, actual):
     actual_mv = _plain_number(actual)
     if droop is None or actual_mv is None:
         return ""
-    return f"Measured {format_number(actual_mv, 0)} mV, droop {format_number(droop, 0)} mV"
+    return (
+        f"Measured {format_number(actual_mv, 0)} mV, droop {format_number(droop, 0)} mV"
+    )
 
 
 def droop_limit_mv(stored):
@@ -444,7 +479,8 @@ def fleet_summary(rows):
             offline += 1
             continue
         has_reading = (
-            _plain_number(row.get("hash")) is not None or _plain_number(row.get("freq")) is not None
+            _plain_number(row.get("hash")) is not None
+            or _plain_number(row.get("freq")) is not None
         )
         if phase in live_phases or has_reading:
             online += 1
@@ -503,14 +539,17 @@ def show_windows_toast(title, message):
     """A local Windows toast. Other systems do nothing."""
     if platform.system() != "Windows":
         return
-    heading = xml_escape(str(title or "Groundhog Gamma Tuner").replace("\r", " ").replace("\n", " "))
+    heading = xml_escape(
+        str(title or "Groundhog Gamma Tuner").replace("\r", " ").replace("\n", " ")
+    )
     body = xml_escape(str(message or "").replace("\r", " ").replace("\n", " "))
     toast_xml = (
-        "<toast><visual><binding template=\"ToastGeneric\">"
+        '<toast><visual><binding template="ToastGeneric">'
         f"<text>{heading}</text><text>{body}</text>"
         "</binding></visual></toast>"
     )
-    script = """
+    script = (
+        """
 [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
 [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null
 $xml = New-Object Windows.Data.Xml.Dom.XmlDocument
@@ -520,7 +559,9 @@ $xml.LoadXml(@'
 $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
 $app = '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe'
 [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($app).Show($toast)
-""" % toast_xml
+"""
+        % toast_xml
+    )
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     subprocess.Popen(
         ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
@@ -559,10 +600,12 @@ def read_network_status(get=None, connect=None):
         difficulty = None
     pools = []
     for host, port in POOLS:
-        pools.append({
-            "name": host,
-            "online": stratum_port_open(host, port, connect=connect),
-        })
+        pools.append(
+            {
+                "name": host,
+                "online": stratum_port_open(host, port, connect=connect),
+            }
+        )
     return {"difficulty": difficulty, "pools": pools}
 
 
@@ -807,7 +850,9 @@ def _windows_short_time(moment):
     get_time.restype = ctypes.c_int
     buffer = ctypes.create_unicode_buffer(64)
     # TIME_NOSECONDS: the taskbar short time, without a forced seconds field.
-    written = get_time(None, 0x00000002, ctypes.byref(system_time), None, buffer, len(buffer))
+    written = get_time(
+        None, 0x00000002, ctypes.byref(system_time), None, buffer, len(buffer)
+    )
     if written <= 0:
         return ""
     return buffer.value
@@ -860,7 +905,9 @@ class TunerDashboard:
             raise SystemExit(message) from exc
 
         self.start_background()
-        page = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web", "index.html")
+        page = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "web", "index.html"
+        )
         # An absolute file path loads in the window directly. A relative path would
         # make pywebview start its own local server, which this app does not use.
         window = webview.create_window(
@@ -923,16 +970,17 @@ class TunerDashboard:
     def log_message(self, message, level="info"):
         """Append one activity line. Tuner threads call this directly."""
         message = replace_ips_with_names(message, self._miner_names())
-        timestamp = datetime.now().strftime("%H:%M:%S")
         if level not in ("success", "warning", "error", "info"):
             level = "info"
         with self._lock:
             self._log_seq += 1
-            self._log.append({
-                "id": self._log_seq,
-                "text": f"[{timestamp}] {message}",
-                "level": level,
-            })
+            self._log.append(
+                {
+                    "id": self._log_seq,
+                    "text": format_log_line(message),
+                    "level": level,
+                }
+            )
 
     def get_snapshot(self, since_log_id=0, focused=None):
         """Table, button state, scan progress, and log lines after since_log_id.
@@ -949,7 +997,9 @@ class TunerDashboard:
             miners = []
             for row in self._rows:
                 item = dict(row)
-                item["firmware_update"] = firmware_update_version(item.get("name_title"), latest)
+                item["firmware_update"] = firmware_update_version(
+                    item.get("name_title"), latest
+                )
                 miners.append(item)
             return {
                 "updated": self._updated,
@@ -1019,17 +1069,23 @@ class TunerDashboard:
     def start_autotuner(self):
         """Start one tuner thread per enabled miner that has the required limits."""
         with self._lock:
+            self._reap_threads_locked()
             if self._baseline_reset_running:
                 blocked = "baseline"
-            elif self._start_pending or self.running or self._stop_in_progress or any(
-                thread.is_alive() for thread in self.threads
+            elif (
+                self._start_pending
+                or self.running
+                or self._stop_in_progress
+                or any(thread.is_alive() for thread in self.threads)
             ):
                 blocked = "running"
             else:
                 blocked = None
                 self._start_pending = True
         if blocked == "baseline":
-            self.log_message("Wait for the baseline reset to finish before starting.", "warning")
+            self.log_message(
+                "Wait for the baseline reset to finish before starting.", "warning"
+            )
             return _fail(
                 "Wait for the baseline reset to finish before starting.",
                 "Reset in Progress",
@@ -1037,7 +1093,9 @@ class TunerDashboard:
             )
         if blocked == "running":
             self.log_message("Autotuner is already running.", "warning")
-            return _fail("Autotuner is already running.", "Autotuner Running", "warning")
+            return _fail(
+                "Autotuner is already running.", "Autotuner Running", "warning"
+            )
 
         notice = None
         try:
@@ -1045,12 +1103,17 @@ class TunerDashboard:
             interval = config.get("monitor_interval", 5)
             self.log_message("Checking AutoTuner settings before starting...", "info")
 
-            enabled_miners = [miner for miner in config.get("miners", []) if miner.get("enabled", False)]
+            enabled_miners = [
+                miner
+                for miner in config.get("miners", [])
+                if miner.get("enabled", False)
+            ]
             ready_miners = []
             missing_settings = []
             for miner in enabled_miners:
                 missing = [
-                    field for field in START_REQUIRED_FIELDS
+                    field
+                    for field in START_REQUIRED_FIELDS
                     if field not in miner or miner[field] == "" or miner[field] is None
                 ]
                 if missing:
@@ -1071,7 +1134,9 @@ class TunerDashboard:
                 self.log_message(error_message, "error")
                 if not ready_miners:
                     return _fail(error_message.strip(), "Incomplete Settings", "error")
-                notice = _notice("warning", "Some miners skipped", error_message.strip())
+                notice = _notice(
+                    "warning", "Some miners skipped", error_message.strip()
+                )
 
             stop_event = threading.Event()
             miner_stops = {}
@@ -1113,7 +1178,13 @@ class TunerDashboard:
                 thread.start()
             with self._lock:
                 self.threads = threads
-                self.running = True
+                # Stop can land after the events are published and before the
+                # threads are stored. Leave Running clear when that stop won.
+                stopped = self._stop_in_progress or stop_event.is_set()
+                self.running = not stopped
+                if stopped:
+                    for event in miner_stops.values():
+                        event.set()
             self._wake.set()
             result = {"ok": True}
             if notice is not None:
@@ -1151,7 +1222,9 @@ class TunerDashboard:
             if self._baseline_reset_running:
                 blocked = "reset"
             elif (
-                self.running or self._stop_in_progress or self._start_pending
+                self.running
+                or self._stop_in_progress
+                or self._start_pending
                 or any(thread.is_alive() for thread in self.threads)
             ):
                 blocked = "busy"
@@ -1166,7 +1239,9 @@ class TunerDashboard:
                 "warning",
             )
         if blocked == "busy":
-            self.log_message("Stop the autotuner before resetting to baseline.", "warning")
+            self.log_message(
+                "Stop the autotuner before resetting to baseline.", "warning"
+            )
             return _fail(
                 "Stop the autotuner before resetting miners to baseline.",
                 "Autotuner Running",
@@ -1183,11 +1258,13 @@ class TunerDashboard:
                 "warning",
             )
 
-        self.log_message(f"Resetting miners to {STOCK_FREQ} MHz / {STOCK_VOLT} mV.", "info")
+        self.log_message(
+            f"Resetting miners to {STOCK_FREQ} MHz / {STOCK_VOLT} mV.", "info"
+        )
 
         def work():
             try:
-                reset_miners_to_baseline(miners, self.log_message, parallel=True)
+                reset_miners_to_baseline(miners, self.log_message)
             finally:
                 with self._lock:
                     self._baseline_reset_running = False
@@ -1257,7 +1334,9 @@ class TunerDashboard:
             elif cancelled:
                 self.log_message("Scan cancelled.", "warning")
             else:
-                self.log_message(f"Scan finished. Added {len(found)} miner(s).", "success")
+                self.log_message(
+                    f"Scan finished. Added {len(found)} miner(s).", "success"
+                )
 
         threading.Thread(target=scan_task, daemon=True).start()
         return {"ok": True}
@@ -1315,8 +1394,13 @@ class TunerDashboard:
             self._signal_miner_stop(current_ip)
 
         self._apply_miner_edit(current_ip, nickname, new_ip, miner_type)
-        self.log_message(f"Updated miner settings: {nickname} ({miner_type}) at {new_ip}", "success")
-        return {"ok": True, "message": f"Updated miner settings: {nickname} ({miner_type}) at {new_ip}"}
+        self.log_message(
+            f"Updated miner settings: {nickname} ({miner_type}) at {new_ip}", "success"
+        )
+        return {
+            "ok": True,
+            "message": f"Updated miner settings: {nickname} ({miner_type}) at {new_ip}",
+        }
 
     def restart_miner(self, ip):
         """Restart one miner. The page confirms before it calls this."""
@@ -1326,14 +1410,22 @@ class TunerDashboard:
         self.log_message(f"Restarting miner at {ip}...", "warning")
         message = restart_bitaxe(ip)
         self.log_message(message, "warning")
-        return {"ok": True, "message": message, "notice": _notice("info", "Restart Triggered", message)}
+        return {
+            "ok": True,
+            "message": message,
+            "notice": _notice("info", "Restart Triggered", message),
+        }
 
     def get_global_settings(self):
         """Global steps, temperatures, and flatline detection."""
         config = load_config()
         settings = {key: config.get(key, "") for key in GLOBAL_INT_FIELDS}
-        settings["flatline_detection_enabled"] = bool(config.get("flatline_detection_enabled", True))
-        settings["flatline_hashrate_repeat_count"] = config.get("flatline_hashrate_repeat_count", 5)
+        settings["flatline_detection_enabled"] = bool(
+            config.get("flatline_detection_enabled", True)
+        )
+        settings["flatline_hashrate_repeat_count"] = config.get(
+            "flatline_hashrate_repeat_count", 5
+        )
         return {"ok": True, "settings": settings}
 
     def save_global_settings(self, settings):
@@ -1342,14 +1434,19 @@ class TunerDashboard:
             return _fail("Please enter valid integer values.")
         try:
             new_settings = {key: int(settings[key]) for key in GLOBAL_INT_FIELDS}
-            new_settings["flatline_detection_enabled"] = _as_bool(settings.get("flatline_detection_enabled"))
-            new_settings["flatline_hashrate_repeat_count"] = int(settings["flatline_hashrate_repeat_count"])
+            new_settings["flatline_detection_enabled"] = _as_bool(
+                settings.get("flatline_detection_enabled")
+            )
+            new_settings["flatline_hashrate_repeat_count"] = int(
+                settings["flatline_hashrate_repeat_count"]
+            )
         except (KeyError, TypeError, ValueError):
             return _fail("Please enter valid integer values.")
-        config = load_config()
-        config.update(new_settings)
-        config.pop("enforce_safe_pairing", None)
-        save_config(config)
+        def mutate(config):
+            config.update(new_settings)
+            config.pop("enforce_safe_pairing", None)
+
+        modify_config(mutate)
         self.log_message("Global settings updated.", "success")
         return {"ok": True}
 
@@ -1371,40 +1468,49 @@ class TunerDashboard:
                     display = GAMMA601_LIMITS[field]
                 fields[field] = "" if display is None else str(display)
             nickname = miner.get("nickname") or miner["ip"]
-            rows.append({
-                "ip": miner["ip"],
-                "name": nickname,
-                "label": f"{nickname} ({miner['ip']})",
-                "enabled": bool(miner.get("enabled", False)),
-                "fields": fields,
-            })
+            rows.append(
+                {
+                    "ip": miner["ip"],
+                    "name": nickname,
+                    "label": f"{nickname} ({miner['ip']})",
+                    "enabled": bool(miner.get("enabled", False)),
+                    "fields": fields,
+                }
+            )
         return {"ok": True, "miners": rows}
 
     def save_autotuner_settings(self, rows):
         """Save every miner's limits. A blank cell turns that miner off."""
         if not isinstance(rows, list):
             return _fail("Enter a number for each limit.")
-        config = load_config()
-        by_ip = {miner["ip"]: miner for miner in config.get("miners", [])}
+        parsed = []
         for row in rows:
             if not isinstance(row, dict):
                 return _fail("Enter a number for each limit.")
-            miner = by_ip.get(row.get("ip"))
-            if miner is None:
-                continue
             incoming = row.get("fields") if isinstance(row.get("fields"), dict) else row
+            fields = {}
             for field in ALL_AUTOTUNE_FIELDS:
                 try:
-                    miner[field] = parse_autotuner_value(field, incoming.get(field, ""))
+                    fields[field] = parse_autotuner_value(field, incoming.get(field, ""))
                 except (TypeError, ValueError):
                     return _fail(
                         f"Enter a number for {field.replace('_', ' ')} on {row.get('ip')}."
                     )
-            if any(miner[field] == "" for field in ALL_AUTOTUNE_FIELDS):
-                miner["enabled"] = False
-            else:
-                miner["enabled"] = _as_bool(row.get("enabled"))
-        save_config(config)
+            parsed.append((row, fields))
+
+        def mutate(config):
+            by_ip = {miner["ip"]: miner for miner in config.get("miners", [])}
+            for row, fields in parsed:
+                miner = by_ip.get(row.get("ip"))
+                if miner is None:
+                    continue
+                miner.update(fields)
+                if any(miner[field] == "" for field in ALL_AUTOTUNE_FIELDS):
+                    miner["enabled"] = False
+                else:
+                    miner["enabled"] = _as_bool(row.get("enabled"))
+
+        modify_config(mutate)
         self.log_message("Updated AutoTuner settings for all miners.", "success")
         return {"ok": True}
 
@@ -1474,7 +1580,9 @@ class TunerDashboard:
             return
         self._maybe_adopt_hostname(ip, miner_data, row)
         stored = get_miner_defaults(ip)
-        minute_hash = miner_data.get("hashRate_1m") if "hashRate_1m" in miner_data else None
+        minute_hash = (
+            miner_data.get("hashRate_1m") if "hashRate_1m" in miner_data else None
+        )
         row["freq"] = format_number(miner_data.get("frequency"), 0)
         row["mv"] = format_number(miner_data.get("coreVoltage"), 0)
         row["mv_title"] = format_core_voltage_title(
@@ -1489,12 +1597,16 @@ class TunerDashboard:
         row["hash"] = format_minute_hashrate(miner_data)
         row["hash_title"] = format_hash_title(miner_data)
         row["watts"] = format_number(miner_data.get("power"), 2)
-        row["jth"] = format_efficiency(miner_data.get("power"), minute_hash, miner_data.get("power_fault"))
+        row["jth"] = format_efficiency(
+            miner_data.get("power"), minute_hash, miner_data.get("power_fault")
+        )
         row["best"] = format_difficulty(miner_data.get("bestDiff"))
         row["best_title"] = difficulty_title(miner_data.get("bestDiff"))
         row["session"] = format_difficulty(miner_data.get("bestSessionDiff"))
         row["session_title"] = difficulty_title(miner_data.get("bestSessionDiff"))
-        row["shares"] = format_shares(miner_data.get("sharesAccepted"), miner_data.get("sharesRejected"))
+        row["shares"] = format_shares(
+            miner_data.get("sharesAccepted"), miner_data.get("sharesRejected")
+        )
         row["shares_title"] = format_share_title(miner_data)
         row["up"], row["up_seconds"] = format_uptime(miner_data.get("uptimeSeconds"))
         row["name_title"] = format_version_title(miner_data)
@@ -1519,15 +1631,22 @@ class TunerDashboard:
         row["best_exact"] = _plain_number(miner_data.get("bestDiff"))
         settings = load_config()
         row["asic_level"] = limit_level(
-            miner_data.get("temp"), stored.get("max_temp"), _configured_tolerance(settings, "temp_tolerance")
+            miner_data.get("temp"),
+            stored.get("max_temp"),
+            _configured_tolerance(settings, "temp_tolerance"),
         )
         row["vr_level"] = limit_level(
-            miner_data.get("vrTemp"), stored.get("max_vr_temp"), _configured_tolerance(settings, "vr_temp_tolerance")
+            miner_data.get("vrTemp"),
+            stored.get("max_vr_temp"),
+            _configured_tolerance(settings, "vr_temp_tolerance"),
         )
         row["error_alert"] = over_limit(error, stored.get("max_error_percentage"))
-        row["watts_alert"] = over_limit(miner_data.get("power"), stored.get("max_watts"))
+        row["watts_alert"] = over_limit(
+            miner_data.get("power"), stored.get("max_watts")
+        )
         row["vin_alert"] = under_limit(
-            normalize_input_voltage(miner_data.get("voltage")), stored.get("min_input_voltage")
+            normalize_input_voltage(miner_data.get("voltage")),
+            stored.get("min_input_voltage"),
         )
         row["tag"] = row_state_tag(
             row["phase"],
@@ -1558,7 +1677,9 @@ class TunerDashboard:
                 pass
 
     def _maybe_adopt_hostname(self, ip, miner_data, row):
-        stored_name = str(get_miner_defaults(ip).get("nickname") or row.get("name") or "")
+        stored_name = str(
+            get_miner_defaults(ip).get("nickname") or row.get("name") or ""
+        )
         hostname = adopted_hostname(stored_name, ip, miner_data)
         if not hostname:
             return
@@ -1566,14 +1687,15 @@ class TunerDashboard:
         row["name"] = hostname
 
     def _apply_miner_edit(self, current_ip, nickname, new_ip, miner_type):
-        config = load_config()
-        for miner in config.get("miners", []):
-            if miner["ip"] == current_ip:
-                miner["nickname"] = nickname
-                miner["type"] = miner_type
-                miner["ip"] = new_ip
-                break
-        save_config(config)
+        def mutate(config):
+            for miner in config.get("miners", []):
+                if miner["ip"] == current_ip:
+                    miner["nickname"] = nickname
+                    miner["type"] = miner_type
+                    miner["ip"] = new_ip
+                    break
+
+        modify_config(mutate)
         self.load_rows()
 
     def _miner_type(self, ip, fallback="Unknown"):
@@ -1612,11 +1734,20 @@ class TunerDashboard:
         self.threads = [thread for thread in self.threads if thread.is_alive()]
         if finished:
             self._publish_stopped_phases(finished)
+        if (
+            finished
+            and not self.threads
+            and not self._stop_in_progress
+            and not self._start_pending
+        ):
+            self.running = False
 
     def _controls_locked(self):
         self._reap_threads_locked()
         alive = bool(self.threads)
-        if self._stop_in_progress or (alive and not self.running and not self._baseline_reset_running):
+        if self._stop_in_progress or (
+            alive and not self.running and not self._baseline_reset_running
+        ):
             status, label = "stopping", "Stopping"
         elif self._baseline_reset_running:
             status, label = "resetting", "Resetting"
@@ -1673,7 +1804,9 @@ class TunerDashboard:
             self.running = False
             still_running = bool(self.threads)
         if still_running:
-            self.log_message("Some tuner threads are still finishing a request.", "warning")
+            self.log_message(
+                "Some tuner threads are still finishing a request.", "warning"
+            )
         else:
             self.log_message("Autotuning stopped.", "warning")
         self._publish_stopped_phases(finished)

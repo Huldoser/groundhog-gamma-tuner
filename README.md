@@ -80,6 +80,28 @@ Use Task Scheduler so the window opens after you sign in.
 5. Program: the full path to `run.bat`. Example: `C:\Users\YourName\groundhog-gamma-tuner\run.bat`
 6. On **Conditions**, clear **Start the task only if the computer is on AC power**.
 
+## Checks
+
+Install the checkers with the same interpreter you use for this repo. They are not part of the window install.
+
+```bat
+python -m pip install -r requirements-dev.txt
+pre-commit install
+```
+
+`pre-commit install` adds a push hook. `git push` then runs the checks and stops if they fail. `git push --no-verify` skips the hook. Run the same checks by hand with:
+
+```bat
+pre-commit run --all-files --hook-stage pre-push
+```
+
+That runs `ruff check`, `ruff format --check`, and `python -m unittest`. To rewrite formatting and apply Ruff's safe fixes:
+
+```bat
+python -m ruff check --fix .
+python -m ruff format .
+```
+
 ## Disclaimer
 
 This program writes frequency, voltage, fan, and overclock settings to a miner. The limits in this repository were chosen for the author's custom-cooled Gamma 601 boards and oversized power supply. They are above stock clocks. They are for that cooling and that power, not for someone else's board.

@@ -14,7 +14,7 @@ Miner traffic is these three calls:
 
 `get_system_info` returns a dict or an error string. `patch_system` returns `(ok, error_text)`. A missing `errorPercentage` skips that miner. Read `ASICModel` and `boardVersion` through `is_gamma_601`.
 
-The mempool difficulty fetch stays a read of `DIFFICULTY_URL`.
+Two other HTTP reads stay as they are, and they are not miner endpoints: `DIFFICULTY_URL` for mempool difficulty, and `FIRMWARE_RELEASES_URL` for the official stable-tag notice. Both live in `dashboard.py`.
 
 ```python
 # BAD — extra endpoint

@@ -1,10 +1,10 @@
 import copy
+import ipaddress
 import json
 import os
 import tempfile
 import threading
 
-import ipaddress
 import requests
 
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
@@ -103,6 +103,7 @@ def adopted_hostname(nickname, ip, miner_info):
         return None
     return hostname
 
+
 def detect_miners(start_ip, end_ip, on_progress=None, should_cancel=None):
     """Scan a user-defined IP range and detect Bitaxe miners.
 
@@ -140,9 +141,13 @@ def detect_miners(start_ip, end_ip, on_progress=None, should_cancel=None):
 
                 # Prevent duplicate miner entries
                 if not any(m["ip"] == ip_str for m in config["miners"]):
-                    detected = new_miner_record(model, ip_str, miner_name_from_info(miner_info, ip_str), config)
+                    detected = new_miner_record(
+                        model, ip_str, miner_name_from_info(miner_info, ip_str), config
+                    )
                     detected_miners.append(detected)
-                    print(f"Detected miner: {model} at {ip_str}, added as {detected_miners[-1]['nickname']}")
+                    print(
+                        f"Detected miner: {model} at {ip_str}, added as {detected_miners[-1]['nickname']}"
+                    )
 
         except requests.exceptions.RequestException:
             continue
@@ -161,6 +166,7 @@ def detect_miners(start_ip, end_ip, on_progress=None, should_cancel=None):
         fresh.setdefault("miners", []).extend(added)
         save_config(fresh)
     return added
+
 
 def load_config():
     """Load configuration settings from config.json.
@@ -192,6 +198,7 @@ def load_config():
         _last_good_config = copy.deepcopy(loaded)
         return loaded
 
+
 def save_config(config):
     """Save configuration settings to config.json atomically."""
     global _last_good_config
@@ -201,11 +208,27 @@ def save_config(config):
         _last_good_config = copy.deepcopy(config)
 
 
+def modify_config(mutator):
+    """Load, change, and save config.json while holding the config lock.
+
+    `mutator` receives the config dict and may change it in place. Return False
+    to leave the file unchanged. A setpoint learned on another thread cannot
+    land between this load and this save.
+    """
+    with _config_lock:
+        config = load_config()
+        if mutator(config) is False:
+            return None
+        save_config(config)
+        return config
+
+
 def _drop_daily_reset(config):
     """Daily reset is no longer a setting. Drop leftover keys on load and save."""
     if isinstance(config, dict):
         config.pop("daily_reset_enabled", None)
         config.pop("daily_reset_time", None)
+
 
 def _write_config(config):
     """Write config.json via a temp file in the same directory, then rename it."""
@@ -224,6 +247,7 @@ def _write_config(config):
         except OSError:
             pass
         raise
+
 
 def gamma_601_limits(config=None):
     """Caps for a new Gamma 601. Max temp follows Default Max Temp when that is set."""
@@ -263,8 +287,9 @@ def get_default_config():
         "vr_temp_tolerance": 3,
         "refresh_interval": 180,
         "ceiling_soak_seconds": DEFAULT_CEILING_SOAK_SECONDS,
-        "miners": []
+        "miners": [],
     }
+
 
 def get_miner_defaults(miner_ip):
     """Returns the AutoTuner settings for a given miner's IP address."""
@@ -274,33 +299,36 @@ def get_miner_defaults(miner_ip):
             return miner  # Return the miner's settings
     return {}  # Return empty dict if not found
 
+
 def add_miner(miner_type, ip, nickname=""):
     """Adds a new miner with default settings based on type, including nickname."""
-    config = load_config()
 
-    # Prevent duplicate miner entries
-    if any(miner["ip"] == ip for miner in config["miners"]):
-        print(f"Error: Miner with IP {ip} already exists.")
+    def mutate(config):
+        if any(miner["ip"] == ip for miner in config["miners"]):
+            print(f"Error: Miner with IP {ip} already exists.")
+            return False
+        config["miners"].append(new_miner_record(miner_type, ip, nickname, config))
+
+    if modify_config(mutate) is None:
         return
-
-    new_miner = new_miner_record(miner_type, ip, nickname, config)
-
-    config["miners"].append(new_miner)
-    save_config(config)
     print(f"Added new miner: ({miner_type}) at {ip} with nickname '{nickname}'")
+
 
 def remove_miner(ip):
     """Removes a miner from the config by IP address."""
-    config = load_config()
-    new_miners = [miner for miner in config["miners"] if miner["ip"] != ip]
 
-    if len(new_miners) == len(config["miners"]):
-        print(f"Error: Miner with IP {ip} not found.")
+    def mutate(config):
+        miners = config.get("miners", [])
+        kept = [miner for miner in miners if miner["ip"] != ip]
+        if len(kept) == len(miners):
+            print(f"Error: Miner with IP {ip} not found.")
+            return False
+        config["miners"] = kept
+
+    if modify_config(mutate) is None:
         return
-
-    config["miners"] = new_miners
-    save_config(config)
     print(f"Removed miner with IP: {ip}")
+
 
 def update_miner(ip, new_settings):
     """Updates an existing miner's settings in config.json under one lock."""
@@ -322,14 +350,17 @@ def update_miner(ip, new_settings):
         _last_good_config = copy.deepcopy(config)
         print(f"Updated miner {ip} settings successfully.")
 
+
 def get_miners():
     """Returns the list of configured miners."""
     return load_config().get("miners", [])
+
 
 def reset_config():
     """Resets configuration to default settings."""
     save_config(get_default_config())
     print("Configuration reset to default.")
+
 
 if __name__ == "__main__":
     print("Scanning for Bitaxe miners...")

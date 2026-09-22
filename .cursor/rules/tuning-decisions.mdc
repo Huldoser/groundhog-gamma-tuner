@@ -8,7 +8,7 @@ alwaysApply: false
 
 `decide_adjustment` stays pure: inputs in, `(frequency, voltage, reason)` out. It does not call HTTP, read `config.json`, or start threads.
 
-Frequency steps down on heat, power, input voltage, or droop. Voltage rises only when the error percentage is over budget. The session sets the fan once with `{"autofanspeed": 0, "fanspeed": 100}`.
+Frequency steps down on heat, power, input sag, power fault, core-voltage droop, and rejected shares. It also steps down when quality is bad (error percentage, short hashrate, or above-target) and voltage cannot rise. Voltage rises when quality is bad and it is under the cap. At the ceiling, trim lowers voltage. The session sets the fan once with `{"autofanspeed": 0, "fanspeed": 100}`.
 
 Leave `GAMMA601_LIMITS`, `HARD_*`, and `STOCK_*` in `config.py` unchanged unless the user asks. Those numbers match this cooling and this supply. `HARD_MIN_FREQ` is 350 MHz, the lowest BM1370 preset in AxeOS v2.15.1. `HARD_MIN_VOLT` stays 1000 mV, the lowest BM1370 voltage preset, because voltage is stepped down only after frequency is already at its floor.
 

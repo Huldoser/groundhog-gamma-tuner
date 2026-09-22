@@ -8,8 +8,6 @@ alwaysApply: false
 
 Tests use `unittest.TestCase` and `unittest.mock`. Session tests patch miner I/O with `patched_io` in `test_autotune.py`. Leave the network and live miners out of tests.
 
-Run `python -m unittest`.
-
 ```python
 # BAD
 import pytest

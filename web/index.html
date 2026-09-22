@@ -9,14 +9,13 @@
 <body>
   <div class="app">
     <header class="header">
-      <div class="brand">
-        <h1 class="brand-title">
-          <img class="logo" src="logo.png" alt="Groundhog Gamma Tuner">
-        </h1>
-      </div>
-      <div class="status">
+      <div class="identity">
+        <div class="brand">
+          <h1 class="brand-title">
+            <img class="logo" src="logo.png" alt="Groundhog Gamma Tuner">
+          </h1>
+        </div>
         <span id="status-pill" class="pill idle" aria-live="polite">Idle</span>
-        <span id="updated" class="updated">Updated --:--:--</span>
       </div>
       <div class="commands">
         <button type="button" id="run" class="accent" data-action="start" aria-busy="false">Start Autotuner</button>
@@ -48,18 +47,10 @@
       </div>
     </header>
 
-    <div class="network" id="network">
-      <span class="network-diff" title="Difficulty a share must beat to find a block">
-        Network <strong id="network-diff">--</strong>
-      </span>
-      <span class="pool unknown" data-pool="stratum.ckpool.org" title="Checking">stratum.ckpool.org</span>
-      <span class="pool unknown" data-pool="public-pool.io" title="Checking">public-pool.io</span>
+    <main class="workspace">
       <div id="summary" class="summary" hidden>
         <span id="fleet"></span>
       </div>
-    </div>
-
-    <main class="workspace">
       <section class="card table-card">
         <div class="table-x">
           <div id="table-scroll" class="table-scroll">
@@ -95,6 +86,16 @@
         <div id="log" class="log" aria-live="polite"></div>
       </section>
     </main>
+    <footer class="statusbar">
+      <span id="updated" class="updated">Updated --:--:--</span>
+      <div class="network" id="network">
+        <span class="network-diff" title="Difficulty a share must beat to find a block">
+          Network <strong id="network-diff">--</strong>
+        </span>
+        <span class="pool unknown" data-pool="stratum.ckpool.org" title="Checking">stratum.ckpool.org</span>
+        <span class="pool unknown" data-pool="public-pool.io" title="Checking">public-pool.io</span>
+      </div>
+    </footer>
   </div>
 
   <div id="settings-menu" class="menu" hidden>

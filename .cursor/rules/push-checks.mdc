@@ -1,0 +1,31 @@
+---
+description: Run Ruff and unittest after every change
+alwaysApply: true
+---
+
+# Push checks
+
+After every change, run the push check before you finish:
+
+```bat
+pre-commit run --all-files --hook-stage pre-push
+```
+
+If `pre-commit` is not on PATH, run `.venv/bin/pre-commit` with the same arguments. The check is `ruff check`, `ruff format --check`, and `python -m unittest`. It only reports. It does not rewrite files.
+
+No Ruff or test issues are allowed in code this change owns. A failure is related when it is in a file you changed, or it started because of your change. Fix it and run the check again. Apply Ruff's safe fixes and the formatter only to those files:
+
+```bat
+python -m ruff check --fix path/to/file.py
+python -m ruff format path/to/file.py
+```
+
+A failure in a file you did not change can be another agent's in-progress edit. Leave that file alone. Do not revert it, reformat it, or weaken the check to make the run green.
+
+```python
+# BAD — silence a finding in code you just edited
+value = limits["max_freq"]  # noqa: F841
+
+# GOOD — remove the unused name, then run the check again
+climb_cap = limits["max_freq"]
+```

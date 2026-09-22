@@ -98,27 +98,22 @@ button.is-busy:disabled {
 }
 
 .header {
-  justify-content: flex-start;
+  justify-content: space-between;
   gap: 16px;
-  flex-wrap: wrap;
+}
+
+.identity {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  min-width: 0;
 }
 
 .brand { flex: 0 0 auto; }
 
-.status {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  justify-content: center;
-  gap: 4px;
-  min-width: 0;
-}
-
 .commands {
-  flex: 1 1 auto;
   flex-wrap: wrap;
   justify-content: flex-end;
-  margin-left: auto;
   min-width: 0;
 }
 
@@ -155,13 +150,26 @@ h1 { font-size: 22px; letter-spacing: -0.02em; }
 
 .header-tools { flex-shrink: 0; }
 
+.statusbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px 16px;
+  padding: 6px 0 8px;
+  border-top: 1px solid var(--edge);
+  color: var(--muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
 .network {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 8px 18px;
-  color: var(--muted);
-  font-size: 13px;
+  justify-content: flex-end;
+  gap: 8px 16px;
+  min-width: 0;
 }
 
 .network-diff strong {
@@ -188,22 +196,26 @@ h1 { font-size: 22px; letter-spacing: -0.02em; }
 .pool.offline { color: var(--bad); }
 .pool.offline::before { background: var(--bad); }
 
-.summary {
-  flex-basis: 100%;
+#summary {
   display: flex;
   flex-wrap: wrap;
   align-items: baseline;
-  gap: 8px 18px;
+  gap: 8px 16px;
+  padding-left: 14px;
+  color: var(--muted);
+  font-size: 13px;
   font-variant-numeric: tabular-nums;
 }
 
-.summary[hidden] { display: none; }
+#summary[hidden] { display: none; }
 
 #fleet {
   display: flex;
+  flex: 1 1 auto;
   flex-wrap: wrap;
   align-items: baseline;
-  gap: 8px 18px;
+  gap: 8px 16px;
+  min-width: 0;
 }
 
 #fleet[hidden] { display: none; }
@@ -252,10 +264,10 @@ h1 { font-size: 22px; letter-spacing: -0.02em; }
 .workspace {
   flex: 1;
   min-height: 0;
+  overflow: hidden;
   display: flex;
   flex-direction: column;
   gap: 12px;
-  padding-bottom: 16px;
 }
 
 .card {
