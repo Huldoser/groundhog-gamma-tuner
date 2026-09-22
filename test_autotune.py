@@ -182,7 +182,7 @@ class DecisionTests(unittest.TestCase):
         self.assertEqual(voltage, 1100)
         self.assertIn("frequency", reason)
 
-    def test_regulator_band_holds_while_the_chip_is_still_cool(self):
+    def test_regulator_under_its_cap_still_climbs(self):
         frequency, voltage, reason = autotune.decide_adjustment(**_limits(
             temp=45,
             vr_temp=86,
@@ -193,8 +193,8 @@ class DecisionTests(unittest.TestCase):
             error_percentage=0.2,
             hash_rate=1400,
         ))
-        self.assertEqual((frequency, voltage), (500, 1100))
-        self.assertIn("holding", reason)
+        self.assertEqual((frequency, voltage), (505, 1100))
+        self.assertIn("frequency", reason)
 
     def test_regulator_far_over_its_cap_takes_three_frequency_steps(self):
         frequency, voltage, reason = autotune.decide_adjustment(**_limits(
@@ -270,10 +270,24 @@ class DecisionTests(unittest.TestCase):
         self.assertEqual(voltage, 1079)
         self.assertIn("frequency", reason)
 
-    def test_inside_temperature_band_holds(self):
-        frequency, voltage, reason = autotune.decide_adjustment(**_limits(temp=59, hash_rate=100))
-        self.assertEqual((frequency, voltage), (500, 1100))
-        self.assertIn("holding", reason)
+    def test_under_the_cap_climbs_and_a_retreat_hold_does_not(self):
+        climbed = autotune.decide_adjustment(**_limits(temp=59, hash_rate=100))
+        self.assertEqual(climbed[:2], (505, 1100))
+        self.assertIn("frequency", climbed[2])
+
+        held = autotune.decide_adjustment(**_limits(
+            temp=59,
+            hash_rate=1400,
+            error_percentage=0.2,
+            thermal_hold=True,
+        ))
+        self.assertEqual(held[:2], (500, 1100))
+        self.assertIn("thermal retreat", held[2])
+
+        self.assertFalse(autotune.cooled_after_retreat(67, 40, 68, 88, 3, 3))
+        self.assertTrue(autotune.cooled_after_retreat(65, 40, 68, 88, 3, 3))
+        self.assertFalse(autotune.cooled_after_retreat(60, 86, 68, 88, 3, 3))
+        self.assertTrue(autotune.cooled_after_retreat(60, 85, 68, 88, 3, 3))
 
     def test_healthy_chip_near_expected_hashrate_steps_frequency_up(self):
         frequency, voltage, reason = autotune.decide_adjustment(**_limits(
@@ -287,15 +301,81 @@ class DecisionTests(unittest.TestCase):
         self.assertEqual(voltage, 1100)
         self.assertIn("frequency", reason)
 
-    def test_pool_reject_without_asic_errors_holds(self):
-        frequency, voltage, reason = autotune.decide_adjustment(**_limits(
+    def test_reject_share_steps_down_only_above_one_percent(self):
+        kept = autotune.decide_adjustment(**_limits(
             current_frequency=500,
             temp=45,
-            shares_rejected_delta=1,
+            reject_share=0.01,
             error_percentage=0.2,
+            hash_rate=1400,
         ))
-        self.assertEqual((frequency, voltage), (500, 1100))
-        self.assertIn("holding", reason)
+        self.assertEqual(kept[:2], (505, 1100))
+        self.assertIn("frequency", kept[2])
+
+        dropped = autotune.decide_adjustment(**_limits(
+            current_frequency=500,
+            temp=45,
+            reject_share=0.02,
+            error_percentage=0.2,
+            hash_rate=1400,
+        ))
+        self.assertEqual(dropped[:2], (495, 1100))
+        self.assertIn("rejected shares", dropped[2])
+
+        self.assertEqual(autotune.reject_share(99, 1, 0), 0.01)
+        self.assertAlmostEqual(autotune.reject_share(90, 12, 10), 2 / 92)
+        self.assertEqual(autotune.reject_share(90, 10, 10), 0)
+        self.assertIsNone(autotune.reject_share(0, 0, 0))
+        self.assertEqual(
+            autotune.stale_reject_delta(
+                [{"message": "Job not found", "count": 4}],
+                [
+                    {"message": "Job not found", "count": 7},
+                    {"message": "Above target", "count": 2},
+                    {"message": "Invalid", "count": 1},
+                ],
+            ),
+            3,
+        )
+        classes = autotune.reject_class_deltas(
+            [{"message": "Job not found", "count": 4}],
+            [
+                {"message": "Job not found", "count": 7},
+                {"message": "Above target", "count": 2},
+                {"message": "Invalid", "count": 1},
+                {"message": "Duplicate share", "count": 4},
+                {"message": "Ntime out of range", "count": 1},
+            ],
+        )
+        self.assertEqual(classes["stale"], 3)
+        self.assertEqual(classes["above"], 2)
+        self.assertEqual(classes["hardware"], 1)
+        self.assertEqual(classes["ignore"], 5)
+        self.assertEqual(autotune.reject_reason_class("Worker mismatch"), "ignore")
+        self.assertEqual(autotune.reject_reason_class("low difficulty share"), "above")
+
+        sample = autotune.RejectSample()
+        sample.add(10, 5, 0)
+        self.assertEqual(sample.judge(autotune.MIN_JUDGED_SHARES, 0.01), (None, False))
+        sample.add(80, 5, 0)
+        hardware_share, above_high = sample.judge(autotune.MIN_JUDGED_SHARES, 0.01)
+        self.assertAlmostEqual(hardware_share, 0.1)
+        self.assertFalse(above_high)
+
+        burst = autotune.RejectSample()
+        burst.add(80, 0, 20)
+        _, first_burst = burst.judge(autotune.MIN_JUDGED_SHARES, 0.01)
+        self.assertFalse(first_burst)
+        burst.add(100, 0, 0)
+        _, after_clean = burst.judge(autotune.MIN_JUDGED_SHARES, 0.01)
+        self.assertFalse(after_clean)
+
+        sustained = autotune.RejectSample()
+        sustained.add(80, 0, 20)
+        sustained.judge(autotune.MIN_JUDGED_SHARES, 0.01)
+        sustained.add(80, 0, 20)
+        _, second_window = sustained.judge(autotune.MIN_JUDGED_SHARES, 0.01)
+        self.assertTrue(second_window)
 
     def test_input_sag_steps_frequency_down_without_raising_voltage(self):
         frequency, voltage, reason = autotune.decide_adjustment(**_limits(
@@ -415,15 +495,15 @@ class DecisionTests(unittest.TestCase):
 
     def test_equal_to_a_cap_does_not_retreat_and_one_past_does(self):
         at_temp = autotune.decide_adjustment(**_limits(temp=60, max_temp=60, temp_tolerance=2))
-        self.assertEqual(at_temp[:2], (500, 1100))
+        self.assertEqual(at_temp[:2], (505, 1100))
         past_temp = autotune.decide_adjustment(**_limits(temp=61, max_temp=60, temp_tolerance=2))
         self.assertEqual(past_temp[:2], (495, 1100))
 
         at_vr = autotune.decide_adjustment(**_limits(
             temp=45, vr_temp=85, max_vr_temp=85, vr_temp_tolerance=3, max_temp=68,
         ))
-        self.assertEqual(at_vr[:2], (500, 1100))
-        self.assertIn("holding", at_vr[2])
+        self.assertEqual(at_vr[:2], (505, 1100))
+        self.assertIn("frequency", at_vr[2])
         past_vr = autotune.decide_adjustment(**_limits(
             temp=45, vr_temp=86, max_vr_temp=85, vr_temp_tolerance=3, max_temp=68,
         ))
@@ -465,12 +545,18 @@ class DecisionTests(unittest.TestCase):
         self.assertEqual(past_error[:2], (500, 1110))
         self.assertIn("voltage", past_error[2])
 
-    def test_high_error_in_band_or_hold_steps_down_without_raising_voltage(self):
-        in_band = autotune.decide_adjustment(**_limits(
+    def test_high_error_near_the_cap_raises_voltage_until_a_retreat_hold(self):
+        near_cap = autotune.decide_adjustment(**_limits(
             temp=59, max_temp=60, temp_tolerance=2, error_percentage=5,
         ))
-        self.assertEqual(in_band[:2], (495, 1100))
-        self.assertIn("silicon", in_band[2])
+        self.assertEqual(near_cap[:2], (500, 1110))
+        self.assertIn("voltage", near_cap[2])
+
+        after_retreat = autotune.decide_adjustment(**_limits(
+            temp=59, max_temp=60, temp_tolerance=2, error_percentage=5, thermal_hold=True,
+        ))
+        self.assertEqual(after_retreat[:2], (495, 1100))
+        self.assertIn("silicon", after_retreat[2])
 
         holding = autotune.decide_adjustment(**_limits(
             phase="hold", temp=45, error_percentage=5,
@@ -529,7 +615,24 @@ class DecisionTests(unittest.TestCase):
             hash_rate=0, temp=45, error_percentage=0.2,
         ))
         self.assertEqual((frequency, voltage), (500, 1100))
-        self.assertEqual(reason, "holding")
+        self.assertEqual(reason, "holding at zero hashrate")
+
+        short = autotune.decide_adjustment(**_limits(
+            hashrate_short=True, error_percentage=0.2, hash_rate=1400, temp=45,
+        ))
+        self.assertEqual(short[:2], (500, 1110))
+        self.assertIn("voltage", short[2])
+        short_max = autotune.decide_adjustment(**_limits(
+            hashrate_short=True, error_percentage=0.2, hash_rate=1400, current_voltage=1400,
+        ))
+        self.assertEqual(short_max[:2], (495, 1400))
+        self.assertIn("low hashrate", short_max[2])
+        self.assertTrue(autotune.hashrate_well_below_expected(800, 1000))
+        self.assertFalse(autotune.hashrate_well_below_expected(900, 1000))
+        self.assertEqual(autotune.average_error([1, 3, None]), 2)
+        self.assertIsNone(autotune.average_error([]))
+        self.assertEqual(autotune.rounded_pll_frequency(527.6), 528)
+        self.assertIsNone(autotune.rounded_pll_frequency(0))
 
         self.assertEqual(
             autotune.expected_hashrate_from_info(
@@ -556,6 +659,78 @@ class DecisionTests(unittest.TestCase):
         self.assertEqual(autotune.wall_type_from_reason(droop[2]), "power")
         self.assertEqual(autotune.wall_type_from_reason(thermal[2]), "thermal")
         self.assertEqual(autotune.wall_type_from_reason("increase frequency"), "")
+        self.assertEqual(
+            autotune.wall_type_from_reason("step frequency down after good hashrate"),
+            "hash",
+        )
+        self.assertEqual(autotune.wall_type_from_reason("step frequency down"), "thermal")
+
+    def test_good_hashrate_discounts_invalid_jobs(self):
+        self.assertAlmostEqual(autotune.good_hashrate(1638, 0.4), 1638 * 0.996)
+        self.assertAlmostEqual(autotune.good_hashrate(1649, 1.9), 1649 * 0.981)
+        self.assertIsNone(autotune.good_hashrate(None, 0.4))
+        self.assertIsNone(autotune.good_hashrate(1638, None))
+        self.assertIsNone(autotune.good_hashrate(0, 0.4))
+
+    def test_frequency_step_pays_unless_good_hashrate_falls_past_the_step(self):
+        before = autotune.good_hashrate(1638, 0.4)
+        worse = autotune.good_hashrate(1649, 1.9)
+        better = autotune.good_hashrate(1700, 0.4)
+        self.assertGreater(before - worse, autotune.expected_step_gain(5))
+        self.assertFalse(autotune.frequency_step_paid(before, worse, 800, 805))
+        self.assertTrue(autotune.frequency_step_paid(before, better, 800, 805))
+        self.assertTrue(autotune.frequency_step_paid(before, before, 800, 805))
+        self.assertTrue(autotune.frequency_step_paid(before, before - 5, 800, 805))
+        self.assertFalse(autotune.frequency_step_paid(before, before - 20, 800, 805))
+        self.assertFalse(autotune.frequency_step_paid(before, better, 800, 800))
+        self.assertIsNone(autotune.frequency_step_paid(before, None, 800, 805))
+        self.assertTrue(autotune.frequency_step_paid(before, better, None, None))
+
+    def test_blocked_frequency_does_not_climb_back(self):
+        held = autotune.decide_adjustment(**_limits(
+            current_frequency=495,
+            blocked_frequency=500,
+            error_percentage=0.2,
+            hash_rate=1400,
+        ))
+        self.assertEqual(held[:2], (495, 1100))
+        self.assertIn("frequency retreat", held[2])
+
+        below = autotune.decide_adjustment(**_limits(
+            current_frequency=490,
+            blocked_frequency=500,
+            error_percentage=0.2,
+            hash_rate=1400,
+        ))
+        self.assertEqual(below[:2], (495, 1100))
+
+    def test_sustained_above_target_raises_voltage_first(self):
+        raised = autotune.decide_adjustment(**_limits(
+            above_target_high=True,
+            error_percentage=0.2,
+            hash_rate=1400,
+            reject_share=0.2,
+        ))
+        self.assertEqual(raised[:2], (500, 1110))
+        self.assertIn("voltage", raised[2])
+
+        at_max = autotune.decide_adjustment(**_limits(
+            above_target_high=True,
+            current_voltage=1400,
+            error_percentage=0.2,
+            hash_rate=1400,
+        ))
+        self.assertEqual(at_max[:2], (495, 1400))
+        self.assertIn("above target", at_max[2])
+
+    def test_measured_hashrate_prefers_the_one_minute_rate(self):
+        self.assertEqual(
+            autotune.measured_hashrate({"hashRate_1m": 1100, "hashRate": 900}),
+            1100,
+        )
+        self.assertEqual(autotune.measured_hashrate({"hashRate": 900}), 900)
+        self.assertIsNone(autotune.measured_hashrate({"hashRate_1m": 0, "hashRate": 900}))
+        self.assertIsNone(autotune.measured_hashrate({}))
 
     def test_immediate_retreat_includes_watts_but_not_idle_or_overheat(self):
         self.assertTrue(_retreat(power=26))
@@ -694,24 +869,42 @@ class SessionTests(unittest.TestCase):
         runtime["flatline_detection_enabled"] = True
         runtime["flatline_hashrate_repeat_count"] = 3
 
-        with patched_io(lambda ip: _info(hashRate=100, temp=59), lambda ip, volt, freq: f"{ip} -> Applied settings: Voltage = {volt}mV, Frequency = {freq}MHz", restart, runtime):
-            thread = _start_miner("miner", stop_event, lambda *args: None)
+        with patched_io(lambda ip: _info(hashRate=100, frequency=400, voltage=1100, temp=40, vrTemp=30), lambda ip, volt, freq: f"{ip} -> Applied settings: Voltage = {volt}mV, Frequency = {freq}MHz", restart, runtime):
+            thread = _start_miner(
+                "miner",
+                stop_event,
+                lambda *args: None,
+                max_freq=400,
+                min_volt=1100,
+                start_freq=400,
+                start_volt=1100,
+            )
+            thread.join(2)
+            stop_event.set()
             thread.join(2)
         self.assertEqual(restarts, ["miner"])
 
         restarts.clear()
+        logs = []
         idle = threading.Event()
 
         def no_restart(ip):
             restarts.append(ip)
             return f"{ip} -> Restart initiated."
 
-        with patched_io(lambda ip: _info(hashRate=0, temp=59), lambda ip, volt, freq: f"{ip} -> Applied settings: Voltage = {volt}mV, Frequency = {freq}MHz", no_restart, runtime):
-            thread = _start_miner("miner", idle, lambda *args: None)
-            self.assertFalse(idle.wait(0.35))
+        def log(message, level="info"):
+            logs.append(message)
+            if "still 0" in message:
+                idle.set()
+
+        with patched_io(lambda ip: _info(hashRate=0, temp=40, vrTemp=30), lambda ip, volt, freq: f"{ip} -> Applied settings: Voltage = {volt}mV, Frequency = {freq}MHz", no_restart, runtime):
+            thread = _start_miner("miner", idle, log)
+            self.assertTrue(idle.wait(2))
             idle.set()
             thread.join(2)
-        self.assertEqual(restarts, [])
+        self.assertEqual(restarts, ["miner"])
+        self.assertTrue(any("0 GH/s after settle" in message for message in logs))
+        self.assertTrue(any("still 0 GH/s after restart" in message for message in logs))
 
     def test_non_gamma_and_missing_error_percentage_are_skipped(self):
         calls = []
@@ -741,6 +934,65 @@ class SessionTests(unittest.TestCase):
         self.assertFalse(thread.is_alive())
         self.assertEqual(calls, [])
         self.assertTrue(any("errorPercentage" in message for message in logs))
+
+    def test_stopped_tuner_saves_the_confirmed_clocks(self):
+        runtime = dict(FAST_CONFIG)
+        runtime["miners"] = [{"ip": "miner", "wall_type": "thermal"}]
+        runtime["refresh_interval"] = 30
+        updates = []
+        stop_event = threading.Event()
+
+        def log(message, level="info"):
+            if "Confirmed" in message:
+                stop_event.set()
+
+        def update(ip, settings):
+            updates.append((ip, dict(settings)))
+
+        with patched_io(
+            lambda ip: _info(frequency=400, voltage=1100, temp=40, vrTemp=30),
+            lambda ip, volt, freq: f"{ip} -> Applied settings: Voltage = {volt}mV, Frequency = {freq}MHz",
+            runtime_config=runtime,
+        ), mock.patch.object(autotune, "update_miner", update):
+            thread = _start_miner(
+                "miner",
+                stop_event,
+                log,
+                max_freq=400,
+                start_freq=400,
+                start_volt=1100,
+            )
+            thread.join(2)
+
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(updates)
+        ip, saved = updates[-1]
+        self.assertEqual(ip, "miner")
+        self.assertEqual(saved["last_good_freq"], 400)
+        self.assertEqual(saved["last_good_volt"], 1100)
+        self.assertEqual(saved["wall_type"], "thermal")
+        self.assertTrue(saved["wall_timestamp"])
+
+    def test_stop_before_confirm_does_not_save_clocks(self):
+        runtime = dict(FAST_CONFIG)
+        runtime["miners"] = [{"ip": "miner", "wall_type": "thermal"}]
+        updates = []
+        stop_event = threading.Event()
+
+        def set_settings(ip, volt, freq):
+            stop_event.set()
+            return f"{ip} -> Applied settings: Voltage = {volt}mV, Frequency = {freq}MHz"
+
+        def update(ip, settings):
+            updates.append((ip, dict(settings)))
+
+        with patched_io(lambda ip: _info(), set_settings, runtime_config=runtime), \
+                mock.patch.object(autotune, "update_miner", update):
+            thread = _start_miner("miner", stop_event, lambda *args: None)
+            thread.join(2)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(updates, [])
 
     def test_resume_uses_saved_setpoint(self):
         calls = []
@@ -802,6 +1054,551 @@ class SessionTests(unittest.TestCase):
         runtime = dict(FAST_CONFIG)
         runtime["refresh_interval"] = 30
         with patched_io(lambda ip: _info(temp=40, vrTemp=30), set_settings, runtime_config=runtime):
+            thread = _start_miner("miner", stop_event, lambda *args: None)
+            self.assertFalse(stop_event.wait(0.4))
+            stop_event.set()
+            thread.join(2)
+        self.assertEqual(calls, [(400, 1100)])
+
+    def test_frequency_step_stays_when_good_hashrate_rises(self):
+        state = {"frequency": 400, "voltage": 1100, "hash": 1000.0, "calls": []}
+        stop_event = threading.Event()
+
+        def set_settings(ip, volt, freq):
+            freq = int(freq)
+            volt = int(volt)
+            state["calls"].append((freq, volt))
+            if freq >= 410:
+                stop_event.set()
+                return f"{ip} -> Applied settings: Voltage = {volt}mV, Frequency = {freq}MHz"
+            state["frequency"] = freq
+            state["voltage"] = volt
+            if freq == 405:
+                state["hash"] = 1040.0
+            return f"{ip} -> Applied settings: Voltage = {volt}mV, Frequency = {freq}MHz"
+
+        def get_info(ip):
+            return _info(
+                frequency=state["frequency"],
+                voltage=state["voltage"],
+                hashRate=state["hash"],
+                hashRate_1m=state["hash"],
+                errorPercentage=0.2,
+                actualFrequency=state["frequency"],
+                temp=40,
+                vrTemp=30,
+            )
+
+        with patched_io(get_info, set_settings):
+            thread = _start_miner("miner", stop_event, lambda *args: None)
+            thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(state["calls"][0], (400, 1100))
+        self.assertIn((405, 1100), state["calls"])
+        self.assertIn((410, 1100), state["calls"])
+
+    def test_small_hashrate_dip_keeps_the_frequency_step(self):
+        state = {"frequency": 400, "voltage": 1100, "calls": []}
+        stop_event = threading.Event()
+
+        def set_settings(ip, volt, freq):
+            freq = int(freq)
+            volt = int(volt)
+            state["calls"].append((freq, volt))
+            if freq >= 410:
+                stop_event.set()
+            state["frequency"] = freq
+            state["voltage"] = volt
+            return f"{ip} -> Applied settings: Voltage = {volt}mV, Frequency = {freq}MHz"
+
+        def get_info(ip):
+            rate = 1000 if state["frequency"] <= 400 else 995
+            return _info(
+                frequency=state["frequency"],
+                voltage=state["voltage"],
+                hashRate=rate,
+                hashRate_1m=rate,
+                errorPercentage=0.4,
+                actualFrequency=state["frequency"],
+                temp=40,
+                vrTemp=30,
+            )
+
+        with patched_io(get_info, set_settings):
+            thread = _start_miner("miner", stop_event, lambda *args: None)
+            thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertIn((405, 1100), state["calls"])
+        self.assertIn((410, 1100), state["calls"])
+
+    def test_frequency_miss_raises_voltage_before_locking_the_ceiling(self):
+        state = {"frequency": 400, "voltage": 1100, "calls": []}
+        stop_event = threading.Event()
+
+        def set_settings(ip, volt, freq):
+            freq = int(freq)
+            volt = int(volt)
+            state["calls"].append((freq, volt))
+            if freq == 405 and volt > 1100:
+                stop_event.set()
+            if freq == 400 and volt < 1100:
+                stop_event.set()
+            state["frequency"] = freq
+            state["voltage"] = volt
+            return f"{ip} -> Applied settings: Voltage = {volt}mV, Frequency = {freq}MHz"
+
+        def get_info(ip):
+            rate = 1000 if state["frequency"] <= 400 else 800
+            return _info(
+                frequency=state["frequency"],
+                voltage=state["voltage"],
+                hashRate=rate,
+                hashRate_1m=rate,
+                errorPercentage=0.4,
+                actualFrequency=state["frequency"],
+                temp=40,
+                vrTemp=30,
+            )
+
+        with patched_io(get_info, set_settings):
+            thread = _start_miner("miner", stop_event, lambda *args: None)
+            thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertIn((405, 1100), state["calls"])
+        self.assertIn((405, 1110), state["calls"])
+        self.assertFalse(any(freq == 400 and volt != 1100 for freq, volt in state["calls"]))
+
+    def test_frequency_miss_at_max_voltage_steps_back(self):
+        state = {"frequency": 400, "voltage": 1400, "calls": []}
+        stop_event = threading.Event()
+
+        def set_settings(ip, volt, freq):
+            freq = int(freq)
+            volt = int(volt)
+            state["calls"].append((freq, volt))
+            if freq == 400 and volt < 1400:
+                stop_event.set()
+            state["frequency"] = freq
+            state["voltage"] = volt
+            return f"{ip} -> Applied settings: Voltage = {volt}mV, Frequency = {freq}MHz"
+
+        def get_info(ip):
+            rate = 1000 if state["frequency"] <= 400 else 800
+            return _info(
+                frequency=state["frequency"],
+                voltage=state["voltage"],
+                hashRate=rate,
+                hashRate_1m=rate,
+                errorPercentage=0.4,
+                actualFrequency=state["frequency"],
+                temp=40,
+                vrTemp=30,
+            )
+
+        with patched_io(get_info, set_settings):
+            thread = _start_miner(
+                "miner",
+                stop_event,
+                lambda *args: None,
+                start_volt=1400,
+                max_volt=1400,
+            )
+            thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertIn((405, 1400), state["calls"])
+        self.assertIn((400, 1400), state["calls"])
+        self.assertTrue(any(freq == 400 and volt < 1400 for freq, volt in state["calls"]))
+        self.assertFalse(any(freq > 405 for freq, _volt in state["calls"]))
+
+    def test_frequency_step_reverts_when_the_pll_clock_does_not_rise(self):
+        state = {"frequency": 400, "voltage": 1100, "hash": 1000.0, "calls": []}
+        stop_event = threading.Event()
+
+        def set_settings(ip, volt, freq):
+            freq = int(freq)
+            volt = int(volt)
+            state["calls"].append((freq, volt))
+            if freq == 405:
+                state["hash"] = 1200.0
+            if len(state["calls"]) >= 3:
+                stop_event.set()
+            state["frequency"] = freq
+            state["voltage"] = volt
+            return f"{ip} -> Applied settings: Voltage = {volt}mV, Frequency = {freq}MHz"
+
+        def get_info(ip):
+            return _info(
+                frequency=state["frequency"],
+                voltage=state["voltage"],
+                hashRate=state["hash"],
+                hashRate_1m=state["hash"],
+                errorPercentage=0.2,
+                actualFrequency=400,
+                temp=40,
+                vrTemp=30,
+            )
+
+        with patched_io(get_info, set_settings):
+            thread = _start_miner("miner", stop_event, lambda *args: None)
+            thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(state["calls"][:3], [(400, 1100), (405, 1100), (400, 1100)])
+
+    def test_climb_uses_the_pll_frequency(self):
+        state = {"frequency": 400, "voltage": 1100, "hash": 1000.0, "calls": []}
+        stop_event = threading.Event()
+
+        def set_settings(ip, volt, freq):
+            freq = int(freq)
+            volt = int(volt)
+            state["calls"].append((freq, volt))
+            if freq >= 408:
+                stop_event.set()
+            state["frequency"] = freq
+            state["voltage"] = volt
+            if freq >= 405:
+                state["hash"] = 1100.0
+            return f"{ip} -> Applied settings: Voltage = {volt}mV, Frequency = {freq}MHz"
+
+        def get_info(ip):
+            requested = state["frequency"]
+            actual = requested if requested <= 400 else requested - 2
+            return _info(
+                frequency=requested,
+                voltage=state["voltage"],
+                hashRate=state["hash"],
+                hashRate_1m=state["hash"],
+                errorPercentage=0.2,
+                actualFrequency=actual,
+                temp=40,
+                vrTemp=30,
+            )
+
+        with patched_io(get_info, set_settings):
+            thread = _start_miner("miner", stop_event, lambda *args: None)
+            thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertIn((405, 1100), state["calls"])
+        self.assertIn((408, 1100), state["calls"])
+        self.assertNotIn((410, 1100), state["calls"])
+
+    def test_under_cap_climbs_then_holds_until_the_retreat_band_clears(self):
+        state = {"temp": 67, "frequency": 500, "voltage": 1100, "calls": []}
+        stop_event = threading.Event()
+        logs = []
+
+        def set_settings(ip, volt, freq):
+            freq = int(freq)
+            volt = int(volt)
+            state["calls"].append((freq, volt))
+            state["frequency"] = freq
+            state["voltage"] = volt
+            if freq == 505:
+                state["temp"] = 70
+            elif freq < 505 and state["temp"] == 70:
+                state["temp"] = 67
+            if sum(1 for seen, _volt in state["calls"] if seen > 500) >= 2:
+                stop_event.set()
+            return f"{ip} -> Applied settings: Voltage = {volt}mV, Frequency = {freq}MHz"
+
+        def log(message, level="info"):
+            logs.append(message)
+            if "thermal retreat" in message and state["temp"] == 67:
+                state["temp"] = 65
+            if "increase frequency" in message and state["temp"] == 65:
+                stop_event.set()
+
+        def get_info(ip):
+            return _info(
+                frequency=state["frequency"],
+                voltage=state["voltage"],
+                temp=state["temp"],
+                vrTemp=40,
+                hashRate=1000,
+                hashRate_1m=1000,
+                errorPercentage=0.2,
+            )
+
+        runtime = dict(FAST_CONFIG)
+        runtime["temp_tolerance"] = 3
+        runtime["vr_temp_tolerance"] = 3
+        runtime["refresh_interval"] = 0.05
+        with patched_io(get_info, set_settings, runtime_config=runtime):
+            thread = _start_miner(
+                "miner",
+                stop_event,
+                log,
+                max_temp=68,
+                max_vr_temp=88,
+                start_freq=500,
+                start_volt=1100,
+            )
+            thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertIn((505, 1100), state["calls"])
+        self.assertTrue(any(freq < 505 for freq, _volt in state["calls"]))
+        self.assertTrue(any("thermal retreat" in message for message in logs))
+        climbed_after_hold = [freq for freq, _volt in state["calls"] if freq > 500]
+        self.assertGreaterEqual(len(climbed_after_hold), 2)
+
+    def test_error_window_uses_the_settle_samples(self):
+        errors = []
+        calls = []
+        stop_event = threading.Event()
+
+        def get_info(ip):
+            error = 0 if len(errors) >= 8 else 9
+            errors.append(error)
+            return _info(
+                frequency=400,
+                voltage=1100,
+                temp=40,
+                vrTemp=30,
+                hashRate=1000,
+                hashRate_1m=1000,
+                errorPercentage=error,
+            )
+
+        def set_settings(ip, volt, freq):
+            calls.append((int(freq), int(volt)))
+            if len(calls) >= 2:
+                stop_event.set()
+            return f"{ip} -> Applied settings: Voltage = {volt}mV, Frequency = {freq}MHz"
+
+        runtime = dict(FAST_CONFIG)
+        runtime["refresh_interval"] = 0.25
+        runtime["monitor_interval"] = 0.02
+        with patched_io(get_info, set_settings, runtime_config=runtime):
+            thread = _start_miner("miner", stop_event, lambda *args: None)
+            thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertGreaterEqual(len(errors), 8)
+        self.assertEqual(errors[-1], 0)
+        self.assertEqual(calls[0], (400, 1100))
+        self.assertEqual(calls[1][0], 400)
+        self.assertGreater(calls[1][1], 1100)
+
+    def test_stale_pool_rejects_do_not_step_down(self):
+        state = {"accepted": 0, "rejected": 0, "stale": 0, "calls": []}
+        stop_event = threading.Event()
+
+        def get_info(ip):
+            state["accepted"] += 10
+            state["rejected"] += 4
+            state["stale"] += 4
+            return _info(
+                frequency=400,
+                voltage=1100,
+                temp=40,
+                vrTemp=30,
+                hashRate=1000,
+                hashRate_1m=1000,
+                errorPercentage=0.2,
+                sharesAccepted=state["accepted"],
+                sharesRejected=state["rejected"],
+                sharesRejectedReasons=[{"message": "Job not found", "count": state["stale"]}],
+            )
+
+        def set_settings(ip, volt, freq):
+            freq = int(freq)
+            volt = int(volt)
+            state["calls"].append((freq, volt))
+            if freq >= 405:
+                stop_event.set()
+            return f"{ip} -> Applied settings: Voltage = {volt}mV, Frequency = {freq}MHz"
+
+        with patched_io(get_info, set_settings):
+            thread = _start_miner("miner", stop_event, lambda *args: None)
+            thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertIn((405, 1100), state["calls"])
+        self.assertFalse(any(freq < 400 for freq, _volt in state["calls"]))
+
+    def test_voltage_trim_restores_when_good_hashrate_falls(self):
+        state = {"frequency": 400, "voltage": 1100, "calls": [], "ceiling": False}
+        stop_event = threading.Event()
+
+        def set_settings(ip, volt, freq):
+            freq = int(freq)
+            volt = int(volt)
+            state["calls"].append((freq, volt))
+            if any(seen_volt < 1100 for _seen_freq, seen_volt in state["calls"][:-1]) and volt == 1100:
+                stop_event.set()
+            state["frequency"] = freq
+            state["voltage"] = volt
+            return f"{ip} -> Applied settings: Voltage = {volt}mV, Frequency = {freq}MHz"
+
+        def get_info(ip):
+            if state["frequency"] >= 800:
+                state["ceiling"] = True
+            rate = 1000 if state["voltage"] >= 1100 else 900
+            return _info(
+                frequency=state["frequency"],
+                voltage=state["voltage"],
+                hashRate=rate,
+                hashRate_1m=rate,
+                errorPercentage=0.2,
+                actualFrequency=state["frequency"],
+                temp=40,
+                vrTemp=30,
+                expectedHashrate=1000,
+            )
+
+        with patched_io(get_info, set_settings):
+            thread = _start_miner("miner", stop_event, lambda *args: None, max_freq=400)
+            thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertIn((400, 1090), state["calls"])
+        self.assertIn((400, 1100), state["calls"])
+        self.assertFalse(any(volt < 1090 for _freq, volt in state["calls"]))
+
+    def test_error_retreat_does_not_climb_straight_back(self):
+        state = {"frequency": 500, "voltage": 1400, "calls": [], "polls_after_drop": 0}
+        stop_event = threading.Event()
+
+        def set_settings(ip, volt, freq):
+            freq = int(freq)
+            volt = int(volt)
+            state["calls"].append((freq, volt))
+            if any(seen < 500 for seen, _volt in state["calls"][:-1]) and freq >= 500:
+                stop_event.set()
+            state["frequency"] = freq
+            state["voltage"] = volt
+            return f"{ip} -> Applied settings: Voltage = {volt}mV, Frequency = {freq}MHz"
+
+        def get_info(ip):
+            if state["frequency"] < 500:
+                state["polls_after_drop"] += 1
+                if state["polls_after_drop"] > 40:
+                    stop_event.set()
+            error = 8 if state["frequency"] >= 500 else 0.2
+            return _info(
+                frequency=state["frequency"],
+                voltage=state["voltage"],
+                hashRate=1000,
+                hashRate_1m=1000,
+                errorPercentage=error,
+                actualFrequency=state["frequency"],
+                temp=40,
+                vrTemp=30,
+            )
+
+        with patched_io(get_info, set_settings):
+            thread = _start_miner(
+                "miner",
+                stop_event,
+                lambda *args: None,
+                start_freq=500,
+                start_volt=1400,
+                max_volt=1400,
+            )
+            thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(any(freq < 500 for freq, _volt in state["calls"]))
+        self.assertFalse(any(freq >= 500 and volt == 1400 for freq, volt in state["calls"][2:]))
+
+    def test_sustained_reject_share_steps_frequency_down(self):
+        state = {
+            "accepted": 0,
+            "rejected": 0,
+            "frequency": 500,
+            "voltage": 1100,
+            "hash": 1000.0,
+            "calls": [],
+        }
+        stop_event = threading.Event()
+
+        def get_info(ip):
+            state["accepted"] += 8
+            state["rejected"] += 2
+            return _info(
+                frequency=state["frequency"],
+                voltage=state["voltage"],
+                temp=40,
+                vrTemp=30,
+                hashRate=state["hash"],
+                hashRate_1m=state["hash"],
+                errorPercentage=0.2,
+                sharesAccepted=state["accepted"],
+                sharesRejected=state["rejected"],
+                sharesRejectedReasons=[{"message": "Invalid", "count": state["rejected"]}],
+            )
+
+        def set_settings(ip, volt, freq):
+            freq = int(freq)
+            volt = int(volt)
+            state["calls"].append((freq, volt))
+            if freq > state["frequency"]:
+                state["hash"] += 200
+            if freq < state["frequency"]:
+                stop_event.set()
+            state["frequency"] = freq
+            state["voltage"] = volt
+            return f"{ip} -> Applied settings: Voltage = {volt}mV, Frequency = {freq}MHz"
+
+        with patched_io(get_info, set_settings):
+            thread = _start_miner(
+                "miner",
+                stop_event,
+                lambda *args: None,
+                start_freq=500,
+                start_volt=1100,
+            )
+            thread.join(3)
+        self.assertFalse(thread.is_alive())
+        peak = max(freq for freq, _volt in state["calls"])
+        peak_at = max(index for index, (freq, _volt) in enumerate(state["calls"]) if freq == peak)
+        self.assertGreater(peak, 500)
+        self.assertTrue(any(freq < peak for freq, _volt in state["calls"][peak_at + 1:]))
+
+    def test_low_ten_minute_hashrate_is_a_silicon_wall(self):
+        calls = []
+        stop_event = threading.Event()
+
+        def set_settings(ip, volt, freq):
+            calls.append((int(freq), int(volt)))
+            if len(calls) >= 2:
+                stop_event.set()
+            return f"{ip} -> Applied settings: Voltage = {volt}mV, Frequency = {freq}MHz"
+
+        runtime = dict(FAST_CONFIG)
+        with patched_io(
+            lambda ip: _info(
+                frequency=400,
+                voltage=1100,
+                temp=40,
+                vrTemp=30,
+                hashRate=1000,
+                hashRate_1m=1000,
+                hashRate_10m=1000,
+                expectedHashrate=5000,
+                errorPercentage=0.2,
+            ),
+            set_settings,
+            runtime_config=runtime,
+        ), mock.patch.object(autotune, "HASHRATE_10M_SETTLE_SECONDS", 0):
+            thread = _start_miner("miner", stop_event, lambda *args: None)
+            thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(calls[0], (400, 1100))
+        self.assertEqual(calls[1][0], 400)
+        self.assertGreater(calls[1][1], 1100)
+
+    def test_missing_good_hashrate_does_not_climb(self):
+        calls = []
+        stop_event = threading.Event()
+
+        def set_settings(ip, volt, freq):
+            calls.append((int(freq), int(volt)))
+            return f"{ip} -> Applied settings: Voltage = {volt}mV, Frequency = {freq}MHz"
+
+        def get_info(ip):
+            info = _info(frequency=400, voltage=1100, temp=40, vrTemp=30, errorPercentage=0.2)
+            info["hashRate"] = 0
+            info.pop("hashRate_1m", None)
+            return info
+
+        with patched_io(get_info, set_settings):
             thread = _start_miner("miner", stop_event, lambda *args: None)
             self.assertFalse(stop_event.wait(0.4))
             stop_event.set()
@@ -1519,16 +2316,34 @@ class InstallAndConfigTests(unittest.TestCase):
                 config._last_good_config = old_last
 
     def test_row_color_follows_phase_and_limits(self):
-        try:
-            from gui import blank_miner_row, row_state_tag
-        except ModuleNotFoundError as error:
-            if error.name != "tkinter":
-                raise
-            self.skipTest("tkinter is not installed")
+        from dashboard import blank_miner_row, row_state_tag
 
-        self.assertEqual(blank_miner_row("gamma", "10.0.0.8"), (
-            "gamma", "10.0.0.8", "-", "-", "-", "-", "-", "-", "-", "-",
-        ))
+        self.assertEqual(blank_miner_row("gamma", "10.0.0.8"), {
+            "name": "gamma",
+            "ip": "10.0.0.8",
+            "freq": "-",
+            "mv": "-",
+            "vin": "-",
+            "asic": "-",
+            "vr": "-",
+            "hash": "-",
+            "watts": "-",
+            "jth": "-",
+            "best": "-",
+            "session": "-",
+            "shares": "-",
+            "up": "-",
+            "phase": "-",
+            "error": "-",
+            "setpoint": "-",
+            "tag": "idle",
+            "up_seconds": None,
+            "mv_alert": False,
+            "name_title": "",
+            "mv_title": "",
+            "hash_title": "",
+            "shares_title": "",
+        })
         self.assertEqual(row_state_tag("hold", "60", "1.00%", 66, 2), "hold")
         self.assertEqual(row_state_tag("climb", "60", "1", 66, 2), "climb")
         self.assertEqual(row_state_tag("trim", "60", "1", 66, 2), "trim")
@@ -1538,12 +2353,7 @@ class InstallAndConfigTests(unittest.TestCase):
         self.assertEqual(row_state_tag("-", "-", "-", None, None), "idle")
 
     def test_log_replaces_longer_ip_before_shorter_prefix(self):
-        try:
-            from gui import replace_ips_with_names
-        except ModuleNotFoundError as error:
-            if error.name != "tkinter":
-                raise
-            self.skipTest("tkinter is not installed")
+        from dashboard import replace_ips_with_names
 
         names = {
             "192.168.8.10": "short",
@@ -1559,73 +2369,96 @@ class InstallAndConfigTests(unittest.TestCase):
             "long -> holding\nshort -> holding\n192.168.8.101 -> holding",
         )
 
-    def test_main_window_keeps_table_and_log(self):
-        try:
-            import tkinter as tk
-            from gui import BitaxeAutotuningApp
-        except ModuleNotFoundError as error:
-            if error.name != "tkinter":
-                raise
-            self.skipTest("tkinter is not installed")
+    def test_dashboard_page_keeps_table_and_log(self):
+        root = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(root, "web", "index.html"), encoding="utf-8") as handle:
+            html = handle.read()
+        with open(os.path.join(root, "web", "app.js"), encoding="utf-8") as handle:
+            script = handle.read()
+        with open(os.path.join(root, "web", "app.css"), encoding="utf-8") as handle:
+            styles = handle.read()
+        self.assertIn('id="miner-body"', html)
+        self.assertIn('id="log"', html)
+        self.assertIn("log.children.length > 500", script)
+        self.assertIn("Reset All to Baseline", html)
+        self.assertIn("class=\"toolbar\"", html)
+        self.assertNotIn('class="danger"', html)
+        menu = html.split('id="settings-menu"', 1)[1].split('id="row-menu"', 1)[0]
+        self.assertLess(menu.find("AutoTuner Settings"), menu.find("Global Settings"))
+        self.assertLess(menu.find("Global Settings"), menu.find("Reset All to Baseline"))
+        self.assertIn('id="reset"', menu)
+        for label in (
+            "Edit Miner Settings",
+            "Restart Miner",
+            "Remove Miner",
+        ):
+            self.assertIn(label, html)
+        self.assertNotIn("Open Miner Web UI", html)
+        self.assertNotIn(">Refresh<", html)
+        self.assertNotIn("open_miner_page", script)
+        self.assertNotIn("refresh_miner", script)
+        self.assertIn('data-sort="best"', html)
+        self.assertEqual(html.count("data-sort="), 10)
+        for label in (
+            "Name",
+            "Clock",
+            "Temp",
+            "Hash",
+            "Power",
+            "Best",
+            "Shares",
+            "Up",
+            "Phase",
+            "Setpoint",
+        ):
+            self.assertIn(f">{label}</button>", html)
+        for column in ("name", "freq", "asic", "hash", "watts", "best", "shares", "up", "phase", "setpoint"):
+            self.assertIn(f'data-sort="{column}"', html)
+        for column in ("ip", "mv", "vin", "vr", "jth", "session", "error"):
+            self.assertNotIn(f'data-sort="{column}"', html)
+        self.assertIn("°C", script)
+        self.assertIn("MHz", script)
+        self.assertNotIn("min-width: 1480px", styles)
+        self.assertNotIn("daily_reset", html)
+        self.assertNotIn("daily_reset", script)
+        self.assertIn("flatline_detection_enabled", html)
+        self.assertIn("Groundhog Gamma Tuner", html)
+        self.assertIn('id="settings-menu"', html)
+        self.assertIn('id="scan-open"', html)
+        self.assertIn('id="network-diff"', html)
+        self.assertIn("stratum.ckpool.org", html)
+        self.assertIn("public-pool.io", html)
+        self.assertNotIn('id="add-menu"', html)
+        self.assertNotIn("Add Miner", html)
+        self.assertNotIn("add_miner_address", script)
+        self.assertNotIn('id="row-actions"', html)
+        self.assertIn('classList.toggle("fullscreen"', script)
+        self.assertIn("body.fullscreen .toolbar", styles)
+        self.assertNotIn("miner-body", styles.split("body.fullscreen")[1])
 
+    def test_saved_config_drops_daily_reset_and_keeps_flatline(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "config.json")
             old_path = config.CONFIG_FILE
             old_last = config._last_good_config
-            app = None
             try:
                 config.CONFIG_FILE = path
                 config._last_good_config = None
-                config.save_config(config.get_default_config())
-                try:
-                    app = BitaxeAutotuningApp()
-                except tk.TclError as error:
-                    self.skipTest(f"no display: {error}")
-                app.root.update_idletasks()
-                self.assertEqual(str(app.reset_baseline_button.cget("text")), "Reset All to Baseline")
-                self.assertTrue(app.tree.winfo_ismapped())
-                self.assertTrue(app.log_output.winfo_ismapped())
-                self.assertTrue(app.toolbar.winfo_ismapped())
-                self.assertFalse(hasattr(app, "selected_row"))
-                labels = []
-                last = app.tree_menu.index("end")
-                for index in range(last + 1):
-                    if app.tree_menu.type(index) == "command":
-                        labels.append(app.tree_menu.entrycget(index, "label"))
-                self.assertEqual(labels, [
-                    "Edit Miner Settings",
-                    "Refresh",
-                    "Restart Miner",
-                    "Open Miner Web UI",
-                    "Remove Miner",
-                ])
-                app._set_fullscreen(True)
-                app.root.update_idletasks()
-                self.assertFalse(app.toolbar.winfo_ismapped())
-                self.assertTrue(app.tree.winfo_ismapped())
-                self.assertTrue(app.log_output.winfo_ismapped())
-                app._set_fullscreen(False)
-                app.root.update_idletasks()
-                self.assertTrue(app.toolbar.winfo_ismapped())
-                self.assertTrue(app.log_output.winfo_ismapped())
+                saved = config.get_default_config()
+                saved["daily_reset_enabled"] = True
+                saved["daily_reset_time"] = "03:00"
+                saved["flatline_detection_enabled"] = True
+                config.save_config(saved)
+                loaded = config.load_config()
+                self.assertNotIn("daily_reset_enabled", loaded)
+                self.assertNotIn("daily_reset_time", loaded)
+                self.assertTrue(loaded["flatline_detection_enabled"])
             finally:
-                if app is not None:
-                    try:
-                        if app._display_after_id is not None:
-                            app.root.after_cancel(app._display_after_id)
-                        app.root.destroy()
-                    except tk.TclError:
-                        pass
                 config.CONFIG_FILE = old_path
                 config._last_good_config = old_last
 
     def test_parse_autotuner_value_clamps_frequency_and_voltage(self):
-        try:
-            from gui import parse_autotuner_value
-        except ModuleNotFoundError as error:
-            if error.name != "tkinter":
-                raise
-            self.skipTest("tkinter is not installed")
+        from dashboard import parse_autotuner_value
 
         self.assertEqual(parse_autotuner_value("min_freq", "50"), 400)
         self.assertEqual(parse_autotuner_value("max_freq", "2000"), 1100)

@@ -175,6 +175,7 @@ def load_config():
             _last_good_config = copy.deepcopy(default)
             return default
 
+        _drop_daily_reset(loaded)
         _last_good_config = copy.deepcopy(loaded)
         return loaded
 
@@ -182,8 +183,16 @@ def save_config(config):
     """Save configuration settings to config.json atomically."""
     global _last_good_config
     with _config_lock:
+        _drop_daily_reset(config)
         _write_config(config)
         _last_good_config = copy.deepcopy(config)
+
+
+def _drop_daily_reset(config):
+    """Daily reset is no longer a setting. Drop leftover keys on load and save."""
+    if isinstance(config, dict):
+        config.pop("daily_reset_enabled", None)
+        config.pop("daily_reset_time", None)
 
 def _write_config(config):
     """Write config.json via a temp file in the same directory, then rename it."""
@@ -241,8 +250,6 @@ def get_default_config():
         "vr_temp_tolerance": 3,
         "refresh_interval": 180,
         "ceiling_soak_seconds": DEFAULT_CEILING_SOAK_SECONDS,
-        "daily_reset_enabled": False,
-        "daily_reset_time": "03:00",
         "miners": []
     }
 
