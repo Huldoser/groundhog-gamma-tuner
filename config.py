@@ -65,6 +65,40 @@ def miner_type_from_info(miner_info):
     device = str(miner_info.get("deviceModel") or miner_info.get("model") or "").strip()
     return device or "Unknown"
 
+
+def placeholder_nickname(ip):
+    """Name used until AxeOS reports a hostname."""
+    return f"Miner-{ip}"
+
+
+def is_placeholder_nickname(nickname, ip):
+    """True when the saved name is blank or still the generated fallback."""
+    text = str(nickname or "").strip()
+    return text == "" or text == placeholder_nickname(ip)
+
+
+def miner_name_from_info(miner_info, ip, nickname=""):
+    """Prefer a typed nickname, then the AxeOS hostname, then Miner-{ip}."""
+    typed = str(nickname or "").strip()
+    if typed:
+        return typed
+    hostname = ""
+    if isinstance(miner_info, dict):
+        hostname = str(miner_info.get("hostname") or "").strip()
+    return hostname or placeholder_nickname(ip)
+
+
+def adopted_hostname(nickname, ip, miner_info):
+    """Hostname to store when the saved name is still a placeholder. Otherwise None."""
+    if not isinstance(miner_info, dict):
+        return None
+    hostname = str(miner_info.get("hostname") or "").strip()
+    if not hostname or not is_placeholder_nickname(nickname, ip):
+        return None
+    if str(nickname or "").strip() == hostname:
+        return None
+    return hostname
+
 def detect_miners(start_ip, end_ip, on_progress=None, should_cancel=None):
     """Scan a user-defined IP range and detect Bitaxe miners.
 
@@ -102,7 +136,7 @@ def detect_miners(start_ip, end_ip, on_progress=None, should_cancel=None):
 
                 # Prevent duplicate miner entries
                 if not any(m["ip"] == ip_str for m in config["miners"]):
-                    detected = new_miner_record(model, ip_str, f"Miner-{ip_str}", config)
+                    detected = new_miner_record(model, ip_str, miner_name_from_info(miner_info, ip_str), config)
                     detected_miners.append(detected)
                     print(f"Detected miner: {model} at {ip_str}, added as {detected_miners[-1]['nickname']}")
 
@@ -183,7 +217,7 @@ def new_miner_record(miner_type, ip, nickname, config=None):
         "nickname": nickname,
         "type": miner_type,
         "ip": ip,
-        "enabled": False,
+        "enabled": True,
         "last_good_freq": "",
         "last_good_volt": "",
         "wall_type": "",

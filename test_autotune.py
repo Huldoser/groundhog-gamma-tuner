@@ -1000,6 +1000,31 @@ class SessionTests(unittest.TestCase):
             self.assertNotIn("min_freq", settings)
             self.assertNotIn("max_watts", settings)
 
+    def test_parallel_baseline_reset_writes_every_miner_at_once(self):
+        miners = [
+            {"ip": "10.0.0.1", "last_good_freq": 640, "start_freq": 700, "start_volt": 1250},
+            {"ip": "10.0.0.2", "last_good_freq": 800, "start_freq": 600, "start_volt": 1200},
+        ]
+        calls = []
+        cleared = []
+        started = threading.Barrier(2)
+
+        def set_settings(ip, volt, freq):
+            calls.append(ip)
+            started.wait(timeout=2)
+            return f"{ip} -> Applied settings: Voltage = {volt}mV, Frequency = {freq}MHz"
+
+        def update(ip, settings):
+            cleared.append(ip)
+
+        with mock.patch.object(autotune, "set_system_settings", set_settings), \
+                mock.patch.object(autotune, "update_miner", update):
+            autotune.reset_miners_to_baseline(miners, lambda *args: None, parallel=True)
+
+        self.assertEqual(set(calls), {"10.0.0.1", "10.0.0.2"})
+        self.assertEqual(set(cleared), {"10.0.0.1", "10.0.0.2"})
+        self.assertEqual(len(calls), 2)
+
     def test_overclock_flag_is_sent_with_the_setpoint(self):
         class FakeResponse:
             def raise_for_status(self):
@@ -1394,6 +1419,7 @@ class InstallAndConfigTests(unittest.TestCase):
                 self.assertEqual(miners[0]["min_input_voltage"], 4.9)
                 self.assertEqual(miners[0]["max_error_percentage"], 2.0)
                 self.assertEqual(miners[0]["nickname"], "gamma-1")
+                self.assertTrue(miners[0]["enabled"])
                 autotune.remember_setpoint("10.0.0.6", 800, 1250, "silicon")
                 stored = config.get_miners()[0]
                 self.assertEqual(stored["last_good_freq"], 800)
@@ -1417,7 +1443,11 @@ class InstallAndConfigTests(unittest.TestCase):
             if url.endswith("192.168.0.2/api/system/info"):
                 return FakeResponse({"ASICModel": "BM1366", "boardVersion": "601"})
             if url.endswith("192.168.0.3/api/system/info"):
-                return FakeResponse({"ASICModel": "BM1370", "boardVersion": "601"})
+                return FakeResponse({
+                    "ASICModel": "BM1370",
+                    "boardVersion": "601",
+                    "hostname": "goose",
+                })
             raise config.requests.exceptions.RequestException("no miner")
 
         with tempfile.TemporaryDirectory() as directory:
@@ -1432,6 +1462,8 @@ class InstallAndConfigTests(unittest.TestCase):
                     found = config.detect_miners("192.168.0.2", "192.168.0.3")
                 self.assertEqual([miner["ip"] for miner in found], ["192.168.0.3"])
                 self.assertEqual(found[0]["type"], "BM1370 601")
+                self.assertEqual(found[0]["nickname"], "goose")
+                self.assertTrue(found[0]["enabled"])
                 self.assertEqual(found[0]["max_freq"], 1100)
                 self.assertEqual(found[0]["start_volt"], 1150)
                 stored = config.get_miners()
@@ -1439,6 +1471,18 @@ class InstallAndConfigTests(unittest.TestCase):
             finally:
                 config.CONFIG_FILE = old_path
                 config._last_good_config = old_last
+
+    def test_name_prefers_typed_nickname_then_hostname(self):
+        info = {"hostname": "goose", "ASICModel": "BM1370", "boardVersion": "601"}
+        self.assertEqual(config.miner_name_from_info(info, "10.0.0.4"), "goose")
+        self.assertEqual(config.miner_name_from_info(info, "10.0.0.4", "  custom "), "custom")
+        self.assertEqual(config.miner_name_from_info({}, "10.0.0.4"), "Miner-10.0.0.4")
+        self.assertEqual(config.adopted_hostname("Miner-10.0.0.4", "10.0.0.4", info), "goose")
+        self.assertEqual(config.adopted_hostname("", "10.0.0.4", info), "goose")
+        self.assertIsNone(config.adopted_hostname("custom", "10.0.0.4", info))
+        self.assertIsNone(config.adopted_hostname("goose", "10.0.0.4", info))
+        self.assertIsNone(config.adopted_hostname("Miner-10.0.0.4", "10.0.0.4", {}))
+        self.assertTrue(config.new_miner_record("BM1370 601", "10.0.0.4", "goose")["enabled"])
 
     def test_scan_reports_progress_and_stops_when_cancelled(self):
         calls = []
@@ -1492,6 +1536,88 @@ class InstallAndConfigTests(unittest.TestCase):
         self.assertEqual(row_state_tag("hold", "60", "3%", 66, 2), "alert")
         self.assertEqual(row_state_tag("offline", "40", "0", 66, 2), "alert")
         self.assertEqual(row_state_tag("-", "-", "-", None, None), "idle")
+
+    def test_log_replaces_longer_ip_before_shorter_prefix(self):
+        try:
+            from gui import replace_ips_with_names
+        except ModuleNotFoundError as error:
+            if error.name != "tkinter":
+                raise
+            self.skipTest("tkinter is not installed")
+
+        names = {
+            "192.168.8.10": "short",
+            "192.168.8.100": "long",
+            "192.168.8.101": "Miner-192.168.8.101",
+        }
+        text = replace_ips_with_names(
+            "192.168.8.100 -> holding\n192.168.8.10 -> holding\n192.168.8.101 -> holding",
+            names,
+        )
+        self.assertEqual(
+            text,
+            "long -> holding\nshort -> holding\n192.168.8.101 -> holding",
+        )
+
+    def test_main_window_keeps_table_and_log(self):
+        try:
+            import tkinter as tk
+            from gui import BitaxeAutotuningApp
+        except ModuleNotFoundError as error:
+            if error.name != "tkinter":
+                raise
+            self.skipTest("tkinter is not installed")
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "config.json")
+            old_path = config.CONFIG_FILE
+            old_last = config._last_good_config
+            app = None
+            try:
+                config.CONFIG_FILE = path
+                config._last_good_config = None
+                config.save_config(config.get_default_config())
+                try:
+                    app = BitaxeAutotuningApp()
+                except tk.TclError as error:
+                    self.skipTest(f"no display: {error}")
+                app.root.update_idletasks()
+                self.assertEqual(str(app.reset_baseline_button.cget("text")), "Reset All to Baseline")
+                self.assertTrue(app.tree.winfo_ismapped())
+                self.assertTrue(app.log_output.winfo_ismapped())
+                self.assertTrue(app.toolbar.winfo_ismapped())
+                self.assertFalse(hasattr(app, "selected_row"))
+                labels = []
+                last = app.tree_menu.index("end")
+                for index in range(last + 1):
+                    if app.tree_menu.type(index) == "command":
+                        labels.append(app.tree_menu.entrycget(index, "label"))
+                self.assertEqual(labels, [
+                    "Edit Miner Settings",
+                    "Refresh",
+                    "Restart Miner",
+                    "Open Miner Web UI",
+                    "Remove Miner",
+                ])
+                app._set_fullscreen(True)
+                app.root.update_idletasks()
+                self.assertFalse(app.toolbar.winfo_ismapped())
+                self.assertTrue(app.tree.winfo_ismapped())
+                self.assertTrue(app.log_output.winfo_ismapped())
+                app._set_fullscreen(False)
+                app.root.update_idletasks()
+                self.assertTrue(app.toolbar.winfo_ismapped())
+                self.assertTrue(app.log_output.winfo_ismapped())
+            finally:
+                if app is not None:
+                    try:
+                        if app._display_after_id is not None:
+                            app.root.after_cancel(app._display_after_id)
+                        app.root.destroy()
+                    except tk.TclError:
+                        pass
+                config.CONFIG_FILE = old_path
+                config._last_good_config = old_last
 
     def test_parse_autotuner_value_clamps_frequency_and_voltage(self):
         try:

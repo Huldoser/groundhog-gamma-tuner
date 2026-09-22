@@ -1,6 +1,7 @@
 import ipaddress
 import os
 import platform
+import re
 import sys
 import threading
 import time
@@ -26,17 +27,21 @@ from config import (
     STOCK_FREQ,
     STOCK_VOLT,
     add_miner,
+    adopted_hostname,
     detect_miners,
     get_miner_defaults,
     get_miners,
     is_gamma_601,
     load_config,
+    miner_name_from_info,
     miner_type_from_info,
     save_config,
+    update_miner,
 )
 
 BG = "#141414"
 PANEL = "#1c1c1c"
+EDGE = "#3a3a3a"
 TEXT = "#f2f2f2"
 MUTED = "#9a9a9a"
 ACCENT = "#e0a100"
@@ -45,10 +50,10 @@ SELECTION = "#8a5a00"
 DANGER = "#6e3030"
 QUIET = "#2a2a2a"
 FIELD_BG = "#2a2a2a"
-HOLD = "#1e3a2a"
-CLIMB = "#1a2e44"
-TRIM = "#3a3018"
-ALERT = "#3a1e1e"
+HOLD = "#1a4a32"
+CLIMB = "#1a3d5c"
+TRIM = "#4a3c18"
+ALERT = "#4a2222"
 
 FONT = ("Segoe UI", 11)
 FONT_SMALL = ("Segoe UI", 9)
@@ -99,6 +104,23 @@ def fit_window_to_work_area(root):
 def blank_miner_row(nickname, ip):
     """Tree row: name, address, then live readings. Board type is kept beside the row."""
     return (nickname, ip, "-", "-", "-", "-", "-", "-", "-", "-", "-")
+
+
+def replace_ips_with_names(message, names):
+    """Swap known miner IPs for nicknames. Longer addresses are replaced first.
+
+    A nickname that already contains its IP is left alone so Miner-192.168.8.10
+    does not become Miner-Miner-192.168.8.10.
+    """
+    text = "" if message is None else str(message)
+    if not text or not names:
+        return text
+    for ip in sorted(names, key=len, reverse=True):
+        name = str(names.get(ip) or "").strip()
+        if not ip or not name or name == ip or ip in name:
+            continue
+        text = re.sub(rf"\b{re.escape(str(ip))}\b", lambda _match, replacement=name: replacement, text)
+    return text
 
 
 def parse_autotuner_value(field, raw):
@@ -256,8 +278,8 @@ class BitaxeAutotuningApp:
 
         self._apply_theme()
         self._build_header()
-        self._build_table()
-        self._build_chrome()
+        self._build_toolbar()
+        self._build_split()
         self._build_menu()
 
         self.root.bind_all("<F11>", self.toggle_fullscreen)
@@ -266,6 +288,7 @@ class BitaxeAutotuningApp:
         self._sync_run_buttons()
         self.load_miners_from_config()
         self.root.after_idle(self._reflow_toolbars)
+        self.root.after_idle(self._place_split)
 
     def _apply_icon(self, window):
         if platform.system() != "Windows":
@@ -331,7 +354,9 @@ class BitaxeAutotuningApp:
             bd=0,
             padx=14,
             pady=10,
-            highlightthickness=0,
+            highlightthickness=1,
+            highlightbackground=EDGE,
+            highlightcolor=ACCENT,
             cursor="hand2",
         )
 
@@ -403,9 +428,34 @@ class BitaxeAutotuningApp:
         self.updated_label = tk.Label(header, text="Updated --:--:--", bg=BG, fg=MUTED, font=FONT)
         self.updated_label.pack(side=tk.LEFT)
 
+    def _build_split(self):
+        self.split = tk.PanedWindow(
+            self.root,
+            orient=tk.VERTICAL,
+            bg=BG,
+            bd=0,
+            sashwidth=8,
+            sashrelief=tk.FLAT,
+            sashpad=0,
+            opaqueresize=True,
+            showhandle=False,
+        )
+        self.split.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 12))
+        self._split_placed = False
+        self.split.bind("<Map>", lambda _event: self.root.after_idle(self._place_split))
+        self._build_table()
+        self._build_log()
+
     def _build_table(self):
-        table_frame = tk.Frame(self.root, bg=BG)
-        table_frame.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 8))
+        table_frame = tk.Frame(
+            self.split,
+            bg=PANEL,
+            highlightthickness=1,
+            highlightbackground=EDGE,
+            highlightcolor=EDGE,
+        )
+        self.table_frame = table_frame
+        self.split.add(table_frame, minsize=120, stretch="never")
         self.tree = ttk.Treeview(
             table_frame,
             columns=TREE_COLUMNS,
@@ -445,11 +495,11 @@ class BitaxeAutotuningApp:
         self.tree.bind("<Double-Button-1>", self._on_double_click)
         self.tree.bind("<Button-3>", self.show_tree_menu)
 
-    def _build_chrome(self):
-        self.chrome = tk.Frame(self.root, bg=BG)
-        self.chrome.pack(fill=tk.X, padx=16, pady=(0, 12))
+    def _build_toolbar(self):
+        self.toolbar = tk.Frame(self.root, bg=BG)
+        self.toolbar.pack(fill=tk.X, padx=16, pady=(0, 8))
 
-        self.miners_row = WrappingButtonRow(self.chrome, BG)
+        self.miners_row = WrappingButtonRow(self.toolbar, BG)
         self.miners_row.pack(fill=tk.X)
         self.scan_button = self._button(self.miners_row, "Scan Network", self.scan_network)
         self.add_button = self._button(self.miners_row, "Add Miner", self.add_miner)
@@ -467,30 +517,31 @@ class BitaxeAutotuningApp:
         ):
             self.miners_row.add(button)
 
-        self.tuner_row = WrappingButtonRow(self.chrome, BG)
+        self.tuner_row = WrappingButtonRow(self.toolbar, BG)
         self.tuner_row.pack(fill=tk.X)
         self.start_button = self._button(self.tuner_row, "Start Autotuner", self.start_autotuning, "accent")
         self.stop_button = self._button(self.tuner_row, "Stop Autotuner", self.stop_autotuning)
         self.reset_baseline_button = self._button(
-            self.tuner_row, "Reset to Baseline", self.reset_to_baseline, "danger"
+            self.tuner_row, "Reset All to Baseline", self.reset_to_baseline, "danger"
         )
         for button in (self.start_button, self.stop_button, self.reset_baseline_button):
             self.tuner_row.add(button)
 
-        self.selected_row = WrappingButtonRow(self.chrome, BG)
-        self.selected_row.pack(fill=tk.X)
-        selected_label = tk.Label(self.selected_row, text="Selected miner", bg=BG, fg=MUTED, font=FONT)
-        self.selected_row.add(selected_label)
-        self.edit_button = self._button(self.selected_row, "Edit", self.edit_miner_settings)
-        self.refresh_button = self._button(self.selected_row, "Refresh", self.refresh_selected_miner)
-        self.restart_button = self._button(self.selected_row, "Restart", self.restart_selected_miner, "danger")
-        self.web_button = self._button(self.selected_row, "Open Web UI", self.open_miner_webpage)
-        for button in (self.edit_button, self.refresh_button, self.restart_button, self.web_button):
-            self.selected_row.add(button)
-
+    def _build_log(self):
+        log_frame = tk.Frame(
+            self.split,
+            bg=PANEL,
+            highlightthickness=1,
+            highlightbackground=EDGE,
+            highlightcolor=EDGE,
+        )
+        self.log_frame = log_frame
+        tk.Label(log_frame, text="Activity", bg=PANEL, fg=MUTED, font=FONT_BOLD).pack(
+            anchor="w", padx=10, pady=(8, 0)
+        )
         self.log_output = scrolledtext.ScrolledText(
-            self.chrome,
-            height=8,
+            log_frame,
+            height=4,
             bg=PANEL,
             fg=TEXT,
             insertbackground=TEXT,
@@ -501,13 +552,14 @@ class BitaxeAutotuningApp:
             padx=8,
             pady=8,
         )
-        self.log_output.pack(fill=tk.X)
+        self.log_output.pack(fill=tk.BOTH, expand=True)
         self.log_output.tag_configure("success", foreground="#8fd19a")
         self.log_output.tag_configure("warning", foreground="#e0b15a")
         self.log_output.tag_configure("error", foreground="#f0a0a0")
         self.log_output.tag_configure("info", foreground=TEXT)
         self.log_output.bind("<Key>", self._log_key)
         self.log_output.bind("<<Paste>>", lambda _event: "break")
+        self.split.add(log_frame, minsize=140, stretch="always")
 
     def _build_menu(self):
         self.tree_menu = tk.Menu(
@@ -521,12 +573,33 @@ class BitaxeAutotuningApp:
         self.tree_menu.add_command(label="Edit Miner Settings", command=self.edit_miner_settings)
         self.tree_menu.add_command(label="Refresh", command=self.refresh_selected_miner)
         self.tree_menu.add_command(label="Restart Miner", command=self.restart_selected_miner)
-        self.tree_menu.add_separator()
         self.tree_menu.add_command(label="Open Miner Web UI", command=self.open_miner_webpage)
+        self.tree_menu.add_separator()
+        self.tree_menu.add_command(label="Remove Miner", command=self.delete_miner)
 
     def _reflow_toolbars(self):
-        for row in (self.miners_row, self.tuner_row, self.selected_row):
+        for row in (self.miners_row, self.tuner_row):
             row.reflow()
+
+    def _place_split(self, tries=0):
+        """Size the table to the current rows and give the rest of the window to the log."""
+        if self._split_placed or not self.root.winfo_exists():
+            return
+        self.root.update_idletasks()
+        height = self.split.winfo_height()
+        if height <= 1:
+            if tries < 10:
+                self.root.after(50, lambda: self._place_split(tries + 1))
+            return
+        rows = max(1, len(self.tree.get_children()))
+        table_height = min(max(56 + rows * 34, 140), int(height * 0.55))
+        if height - table_height < 160:
+            table_height = max(120, height - 160)
+        try:
+            self.split.sash_place(0, 0, int(table_height))
+        except tk.TclError:
+            return
+        self._split_placed = True
 
     def _set_status(self, text, kind):
         colors = {
@@ -740,7 +813,17 @@ class BitaxeAutotuningApp:
     def add_miner(self):
         """Opens a window to manually add a miner."""
         window = self._dialog("Add Miner")
-        tk.Label(window, text="Add Miner", bg=BG, fg=TEXT, font=FONT_SECTION).pack(anchor="w", padx=16, pady=(16, 8))
+        tk.Label(window, text="Add Miner", bg=BG, fg=TEXT, font=FONT_SECTION).pack(anchor="w", padx=16, pady=(16, 4))
+        hint = tk.Label(
+            window,
+            text="Leave the nickname blank to use the miner's hostname.",
+            bg=BG,
+            fg=MUTED,
+            font=FONT_SMALL,
+            wraplength=380,
+            justify=tk.LEFT,
+        )
+        hint.pack(anchor="w", padx=16, pady=(0, 8))
         body = tk.Frame(window, bg=BG)
         body.pack(fill=tk.X, padx=16)
         nickname_entry = self._labeled_entry(body, "Nickname")
@@ -777,19 +860,20 @@ class BitaxeAutotuningApp:
                         finish_error(f"{ip} is not a Bitaxe Gamma 601 (BM1370, board 601).")
                         return
                     miner_type = miner_type_from_info(info)
-                    add_miner(miner_type, ip, nickname)
+                    name = miner_name_from_info(info, ip, nickname)
+                    add_miner(miner_type, ip, name)
                     if not any(miner["ip"] == ip for miner in get_miners()):
                         finish_error(f"Could not add miner at {ip}.")
                         return
                     self.miner_type_by_ip[ip] = miner_type
                     item_id = self.tree.insert(
-                        "", "end", values=blank_miner_row(nickname, ip), tags=("idle",)
+                        "", "end", values=blank_miner_row(name, ip), tags=("idle",)
                     )
                     self.tree_items_by_ip[ip] = item_id
                     self._show_empty(False)
                     self._kick_miner_display()
-                    self.log_message(f"Miner {nickname or ip} added.", "success")
-                    messagebox.showinfo("Success", f"Miner {nickname or ip} added successfully.", parent=window)
+                    self.log_message(f"Miner {name} added.", "success")
+                    messagebox.showinfo("Success", f"Miner {name} added successfully.", parent=window)
                     window.destroy()
 
                 try:
@@ -900,7 +984,7 @@ class BitaxeAutotuningApp:
             self.log_message(f"Error fetching miner data from {ip}: {miner_data}", "error")
             self._touch_updated()
             return
-        values = self.tree.item(item, "values")
+        values = self._maybe_adopt_hostname(ip, miner_data, self.tree.item(item, "values"))
         updated = self._live_row_values(ip, values, miner_data)
         self.tree.item(item, values=updated)
         self._set_row_tag(item, self._tag_for_values(ip, updated))
@@ -1284,7 +1368,7 @@ class BitaxeAutotuningApp:
         self._fit_dialog(window, 760, 560)
 
     def toggle_fullscreen(self, event=None):
-        """Toggle full-screen mode. The header stays so the tablet can leave it."""
+        """Toggle full-screen mode. The header, table, and log stay visible."""
         self._set_fullscreen(not bool(self.root.attributes("-fullscreen")))
         return "break"
 
@@ -1298,10 +1382,11 @@ class BitaxeAutotuningApp:
         self.root.attributes("-fullscreen", enabled)
         self.fullscreen_button.configure(text="Exit fullscreen" if enabled else "Fullscreen")
         if enabled:
-            if self.chrome.winfo_ismapped():
-                self.chrome.pack_forget()
-        elif not self.chrome.winfo_ismapped():
-            self.chrome.pack(fill=tk.X, padx=16, pady=(0, 12))
+            if self.toolbar.winfo_ismapped():
+                self.toolbar.pack_forget()
+        elif not self.toolbar.winfo_ismapped():
+            self.toolbar.pack(fill=tk.X, padx=16, pady=(0, 8), before=self.split)
+            self.root.after_idle(self._reflow_toolbars)
 
     def reset_to_baseline(self):
         """Write factory clocks to every saved miner and forget the learned setpoint."""
@@ -1328,7 +1413,7 @@ class BitaxeAutotuningApp:
             return
 
         confirmed = messagebox.askyesno(
-            "Reset to Baseline",
+            "Reset All to Baseline",
             f"Set every miner to the Gamma 601 stock clocks ({STOCK_FREQ} MHz / {STOCK_VOLT} mV) "
             "and forget the saved setpoint?\n\n"
             "The next Start Autotuner will climb or step down from there.",
@@ -1353,7 +1438,7 @@ class BitaxeAutotuningApp:
 
         def work():
             try:
-                reset_miners_to_baseline(miners, self.log_message)
+                reset_miners_to_baseline(miners, self.log_message, parallel=True)
             finally:
                 try:
                     self.root.after(0, finish)
@@ -1542,7 +1627,7 @@ class BitaxeAutotuningApp:
                 if isinstance(miner_data, str) or not isinstance(miner_data, dict):
                     self._mark_offline(item)
                     continue
-                values = self.tree.item(item, "values")
+                values = self._maybe_adopt_hostname(ip, miner_data, self.tree.item(item, "values"))
                 updated = self._live_row_values(ip, values, miner_data)
                 self.tree.item(item, values=updated)
                 self._set_row_tag(item, self._tag_for_values(ip, updated))
@@ -1580,8 +1665,34 @@ class BitaxeAutotuningApp:
             self._display_after_id = None
         self.update_miner_display()
 
+    def _miner_names(self):
+        names = {}
+        for miner in get_miners():
+            ip = str(miner.get("ip") or "").strip()
+            name = str(miner.get("nickname") or "").strip()
+            if ip and name:
+                names[ip] = name
+        return names
+
+    def _maybe_adopt_hostname(self, ip, miner_data, values):
+        """Save the AxeOS hostname when this miner still has a placeholder name."""
+        current = ""
+        if values and len(values) > COL_NAME:
+            current = values[COL_NAME]
+        stored = str(get_miner_defaults(ip).get("nickname") or current)
+        hostname = adopted_hostname(stored, ip, miner_data)
+        if not hostname:
+            return values
+        update_miner(ip, {"nickname": hostname})
+        updated = list(values)
+        while len(updated) < len(TREE_COLUMNS):
+            updated.append("-")
+        updated[COL_NAME] = hostname
+        return updated
+
     def log_message(self, message, level="info"):
         """Logs messages to the UI, ensuring updates run on the main thread."""
+        message = replace_ips_with_names(message, self._miner_names())
         timestamp = datetime.now().strftime("%H:%M:%S")
         message = f"[{timestamp}] {message}"
         if level not in ("success", "warning", "error", "info"):
