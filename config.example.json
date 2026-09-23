@@ -7,5 +7,7 @@
     "vr_temp_tolerance": 3,
     "refresh_interval": 180,
     "ceiling_soak_seconds": 1800,
+    "flatline_detection_enabled": false,
+    "flatline_hashrate_repeat_count": 5,
     "miners": []
 }

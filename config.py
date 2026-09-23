@@ -7,6 +7,8 @@ import threading
 
 import requests
 
+SYSTEM_INFO_TIMEOUT = 10
+
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 CONFIG_CORRUPT_MESSAGE = (
     "config.json is damaged and was not loaded. "
@@ -136,7 +138,9 @@ def detect_miners(start_ip, end_ip, on_progress=None, should_cancel=None):
         if on_progress is not None:
             on_progress(index, total, ip_str)
         try:
-            response = requests.get(f"http://{ip_str}/api/system/info", timeout=1)
+            response = requests.get(
+                f"http://{ip_str}/api/system/info", timeout=SYSTEM_INFO_TIMEOUT
+            )
             if response.status_code == 200:
                 miner_info = response.json()
                 if not is_gamma_601(miner_info):
@@ -318,6 +322,8 @@ def get_default_config():
         "vr_temp_tolerance": 3,
         "refresh_interval": 180,
         "ceiling_soak_seconds": DEFAULT_CEILING_SOAK_SECONDS,
+        "flatline_detection_enabled": False,
+        "flatline_hashrate_repeat_count": 5,
         "miners": [],
     }
 

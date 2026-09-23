@@ -841,6 +841,9 @@ class SnapshotTests(unittest.TestCase):
             fields["max_freq"] = "5000"
             fields["min_input_voltage"] = "4.9"
             fields["max_error_percentage"] = "2"
+            fields["max_temp"] = "68.5"
+            fields["max_watts"] = "50.25"
+            fields["max_vr_temp"] = "88.5"
             saved = app.save_autotuner_settings(
                 [
                     {"ip": "10.0.0.8", "enabled": True, "fields": fields},
@@ -850,6 +853,9 @@ class SnapshotTests(unittest.TestCase):
             stored = config.get_miners()[0]
             self.assertEqual(stored["max_freq"], dashboard.HARD_MAX_FREQ)
             self.assertEqual(stored["max_droop_mv"], 10)
+            self.assertEqual(stored["max_temp"], 68.5)
+            self.assertEqual(stored["max_watts"], 50.25)
+            self.assertEqual(stored["max_vr_temp"], 88.5)
             self.assertTrue(stored["enabled"])
 
             fields["max_temp"] = ""
@@ -985,6 +991,34 @@ class SnapshotTests(unittest.TestCase):
             app.threads[0].join(timeout=2)
             self.assertEqual(started, ["10.0.0.8"])
             self.assertEqual(app.threads[0].miner_ip, "10.0.0.8")
+
+    def test_editing_the_ip_while_running_starts_the_new_address(self):
+        miner = config.new_miner_record(
+            "BM1370 601", "10.0.0.8", "Alpha", config.get_default_config()
+        )
+        with temp_config([miner]):
+            app = TunerDashboard()
+            app.running = True
+            old_stop = threading.Event()
+            app._miner_stops["10.0.0.8"] = old_stop
+            started = []
+
+            def fake_monitor(*args, **kwargs):
+                started.append(args[0])
+
+            info = {"ASICModel": "BM1370", "boardVersion": "601", "hostname": "alpha"}
+            with (
+                mock.patch("dashboard.get_system_info", return_value=info),
+                mock.patch("dashboard.monitor_and_adjust", fake_monitor),
+            ):
+                result = app.edit_miner("10.0.0.8", "Alpha", "10.0.0.9")
+            self.assertTrue(result["ok"])
+            self.assertTrue(old_stop.is_set())
+            self.assertEqual(config.get_miners()[0]["ip"], "10.0.0.9")
+            self.assertEqual(len(app.threads), 1)
+            app.threads[0].join(timeout=2)
+            self.assertEqual(started, ["10.0.0.9"])
+            self.assertEqual(app.threads[0].miner_ip, "10.0.0.9")
 
     def test_reversed_limits_are_rejected_and_not_saved(self):
         miner = config.new_miner_record(
