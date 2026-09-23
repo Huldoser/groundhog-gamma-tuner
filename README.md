@@ -1,5 +1,9 @@
 # Groundhog Gamma Tuner
 
+<p align="center">
+  <img src="web/logo.png" alt="Groundhog Gamma Tuner" width="360">
+</p>
+
 A personal desktop tuner for one setup: custom-cooled Bitaxe Gamma 601 boards (ASIC BM1370, board version 601) on a Windows ARM tablet. The clocks, voltage, temperatures, and power guard in this repository are highly optimized for that cooling and that power supply. The app checks the live board and saves a miner only when AxeOS reports a BM1370 on board 601. It refuses every other board. It is not a tuner for a stock Gamma, and it is not a multi-model Bitaxe app.
 
 It runs as a local dashboard window, watches the miner's AxeOS API, and adjusts frequency and voltage to hold a higher hash rate without crossing that board's limits. The page is a file inside that window. It is not a site, and it does not listen on the network.
@@ -19,6 +23,14 @@ This is an unofficial tool. It is not affiliated with Hurllz or the Bitaxe proje
 3. Lowers frequency if ASIC temperature, regulator temperature, power, input voltage, or core-voltage droop crosses the limit.
 4. Raises voltage only when the ASIC error percentage is above the budget, then raises frequency while errors stay inside that budget.
 5. Trims voltage down at the ceiling, then holds. The last good setpoint is saved so the next start does not begin from stock. The fan stays at full speed for the whole session, so a warmer room is what moves the clocks.
+
+![Dashboard while the tuner is running](docs/dashboard.png)
+
+Alpha is holding a high clock, beta is still climbing, gamma is trimming with the regulator in the warning band, and delta is offline.
+
+![AutoTuner settings for alpha](docs/autotuner.png)
+
+Each saved miner has its own frequency, voltage, and temperature limits.
 
 ## This setup
 

@@ -66,7 +66,7 @@
                   <th aria-sort="none" title="Accepted and rejected shares, then error"><button type="button" class="sort" data-sort="shares">Shares</button></th>
                   <th aria-sort="none" title="Uptime"><button type="button" class="sort" data-sort="up">Up</button></th>
                   <th aria-sort="none"><button type="button" class="sort" data-sort="phase">Phase</button></th>
-                  <th class="left" aria-sort="none"><button type="button" class="sort" data-sort="setpoint">Setpoint</button></th>
+                  <th class="left" aria-sort="none" title="Last saved frequency and voltage, and the limit that stopped the climb"><button type="button" class="sort" data-sort="setpoint">Setpoint</button></th>
                 </tr>
               </thead>
               <tbody id="miner-body"></tbody>
@@ -148,7 +148,7 @@
       <h2>Global Settings</h2>
       <fieldset>
         <legend>Steps</legend>
-        <p class="hint">How far each step moves, how often the tuner checks, and how long it holds at the ceiling before saving the setpoint.</p>
+        <p class="hint">How far each step moves, how often the tuner checks, and how long it holds at the ceiling before saving the setpoint. Monitor interval is at least 1 second. Tune interval is at least 60 seconds.</p>
         <label>Voltage step (mV) <input id="voltage_step" inputmode="numeric"></label>
         <label>Frequency step (MHz) <input id="frequency_step" inputmode="numeric"></label>
         <label>Monitor interval (sec) <input id="monitor_interval" inputmode="numeric"></label>
@@ -194,7 +194,7 @@
             <label>Max <input id="tune-max_freq" inputmode="numeric"></label>
           </div>
           <h4>Voltage</h4>
-          <p class="hint">Min stays 1000–1400 mV. 1000 is the lowest BM1370 voltage preset. Voltage is lowered only after frequency is already at its minimum.</p>
+          <p class="hint">Min stays 1000–1400 mV. 1000 is the lowest BM1370 voltage preset. At the frequency ceiling the tuner trims voltage down, then restores it if hashrate or errors get worse. Voltage is lowered again only after frequency is already at its minimum.</p>
           <div class="trio">
             <label>Min <input id="tune-min_volt" inputmode="numeric"></label>
             <label>Start <input id="tune-start_volt" inputmode="numeric"></label>

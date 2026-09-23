@@ -18,6 +18,7 @@ from xml.sax.saxutils import escape as xml_escape
 import requests
 
 from autotune import (
+    HASHRATE_1M_SETTLE_SECONDS,
     STARTUP_STAGGER_SECONDS,
     STOCK_FREQ,
     STOCK_VOLT,
@@ -33,6 +34,7 @@ from autotune import (
     restart_miners,
 )
 from config import (
+    CONFIG_CORRUPT_MESSAGE,
     DEFAULT_MAX_DROOP_MV,
     GAMMA601_LIMITS,
     HARD_MAX_FREQ,
@@ -40,6 +42,7 @@ from config import (
     HARD_MIN_FREQ,
     HARD_MIN_VOLT,
     adopted_hostname,
+    config_problem,
     detect_miners,
     get_miner_defaults,
     get_miners,
@@ -151,19 +154,37 @@ def parse_autotuner_value(field, raw):
     return number
 
 
-def format_learned_wall(status, stored):
-    wall = (status or {}).get("wall_type") or (stored or {}).get("wall_type") or ""
-    freq = (status or {}).get("last_good_freq")
-    volt = (status or {}).get("last_good_volt")
+_SETPOINT_LIMITS = {
+    "silicon": "chip errors",
+    "hash": "low hashrate",
+    "thermal": "temperature",
+    "power": "power",
+    "reject": "rejected shares",
+    "input": "input sag",
+}
+
+
+def learned_setpoint(status, stored):
+    """Saved frequency, voltage, and the plain limit that stopped the climb.
+
+    Frequency and voltage are display strings. The limit is empty when none
+    was saved. All three are empty when nothing is saved.
+    """
+    status = status or {}
+    stored = stored or {}
+    wall = status.get("wall_type") or stored.get("wall_type") or ""
+    freq = status.get("last_good_freq")
+    volt = status.get("last_good_volt")
     if freq in ("", None):
-        freq = (stored or {}).get("last_good_freq") or ""
+        freq = stored.get("last_good_freq") or ""
     if volt in ("", None):
-        volt = (stored or {}).get("last_good_volt") or ""
-    if wall and freq not in ("", None) and volt not in ("", None):
-        return f"{wall} {freq}/{volt}"
-    if freq not in ("", None) and volt not in ("", None):
-        return f"{freq}/{volt}"
-    return wall or "-"
+        volt = stored.get("last_good_volt") or ""
+    freq_text = format_number(freq, 0)
+    volt_text = format_number(volt, 0)
+    if freq_text == "-" or volt_text == "-":
+        return "", "", ""
+    label = _SETPOINT_LIMITS.get(str(wall).strip().lower(), "")
+    return freq_text, volt_text, label
 
 
 def parse_display_number(value):
@@ -288,36 +309,50 @@ def format_efficiency(power, hashrate, power_fault):
 
 
 def format_uptime(seconds):
-    """Short age and the whole seconds used to sort it. Largest unit only."""
+    """Short age and the whole seconds used to sort it. Two largest units."""
     number = _plain_number(seconds)
     if number is None or number < 0:
         return "-", None
     total = int(number)
-    if total >= 86400:
-        text = f"{total // 86400}d"
-    elif total >= 3600:
-        text = f"{total // 3600}h"
-    elif total >= 60:
-        text = f"{total // 60}m"
-    else:
-        text = f"{total}s"
-    return text, total
+    days, rem = divmod(total, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes and len(parts) < 2:
+        parts.append(f"{minutes}m")
+    if not parts:
+        parts.append(f"{secs}s")
+    return " ".join(parts), total
+
+
+def format_hashrate(value):
+    """AxeOS reports GH/s. Below 1 TH/s stays in GH/s; 1 TH/s and above is TH/s."""
+    number = _plain_number(value)
+    if number is None:
+        return "-"
+    if number >= 1000:
+        return f"{format_number(number / 1000.0, 2)} TH/s"
+    return f"{format_number(number, 2)} GH/s"
 
 
 def format_hash_title(info):
-    """Live, 10-minute, and expected hashrate for the GH/s tooltip."""
+    """Live, 10-minute, and expected hashrate for the tooltip."""
     if not isinstance(info, dict):
         return ""
     lines = []
-    live = format_number(info.get("hashRate"), 2)
-    ten = format_number(info.get("hashRate_10m"), 2)
-    expected = format_number(info.get("expectedHashrate"), 2)
+    live = format_hashrate(info.get("hashRate"))
+    ten = format_hashrate(info.get("hashRate_10m"))
+    expected = format_hashrate(info.get("expectedHashrate"))
     if live != "-":
-        lines.append(f"Live {live} GH/s")
+        lines.append(f"Live {live}")
     if ten != "-":
-        lines.append(f"10m {ten} GH/s")
+        lines.append(f"10m {ten}")
     if expected != "-":
-        lines.append(f"Expected {expected} GH/s")
+        lines.append(f"Expected {expected}")
     return "\n".join(lines)
 
 
@@ -753,7 +788,9 @@ def blank_miner_row(nickname, ip):
         "up": "-",
         "phase": "-",
         "error": "-",
-        "setpoint": "-",
+        "setpoint_freq": "-",
+        "setpoint_volt": "-",
+        "setpoint_limit": "",
         "tag": "idle",
         "up_seconds": None,
         "mv_alert": False,
@@ -857,6 +894,201 @@ def _windows_short_time(moment):
     if written <= 0:
         return ""
     return buffer.value
+
+
+def rect_covering_monitor(monitor, inset):
+    """(x, y, width, height) whose visible frame covers the monitor.
+
+    ``monitor`` is (left, top, right, bottom). ``inset`` is the invisible
+    frame on (left, top, right, bottom).
+    """
+    left, top, right, bottom = monitor
+    inset_left, inset_top, inset_right, inset_bottom = inset
+    return (
+        left - inset_left,
+        top - inset_top,
+        (right - left) + inset_left + inset_right,
+        (bottom - top) + inset_top + inset_bottom,
+    )
+
+
+def frame_inset(window_rect, visible_rect):
+    """Invisible frame on each edge, as (left, top, right, bottom)."""
+    left, top, right, bottom = window_rect
+    visible_left, visible_top, visible_right, visible_bottom = visible_rect
+    return (
+        visible_left - left,
+        visible_top - top,
+        right - visible_right,
+        bottom - visible_bottom,
+    )
+
+
+def _snap_fullscreen_window(window):
+    """Size the borderless window to the monitor. A failure leaves fullscreen on."""
+    try:
+        native = window.native
+
+        def place():
+            _place_on_monitor(native)
+
+        _run_on_window_thread(native, place)
+    except Exception:
+        return
+
+
+def _run_on_window_thread(native, action):
+    if getattr(native, "InvokeRequired", False):
+        from System import Func, Type
+
+        native.Invoke(Func[Type](action))
+        return
+    action()
+
+
+def _window_handle(native):
+    handle = native.Handle
+    to_int64 = getattr(handle, "ToInt64", None)
+    if callable(to_int64):
+        return to_int64()
+    return int(handle)
+
+
+def _place_on_monitor(native):
+    """Drop the maximized inset, then cover the monitor with square corners."""
+    from System.Windows.Forms import FormWindowState
+
+    native.WindowState = FormWindowState.Normal
+    hwnd = _window_handle(native)
+    user32, dwmapi, rect_type, monitor_info = _win32()
+    monitor = _monitor_rect(user32, hwnd, monitor_info)
+    _move_window(user32, hwnd, rect_covering_monitor(monitor, (0, 0, 0, 0)))
+    _set_square_frame(dwmapi, hwnd)
+    visible = _extended_frame(dwmapi, hwnd, rect_type)
+    if visible is None:
+        return
+    window_rect = _window_rect(user32, hwnd, rect_type)
+    inset = tuple(max(0, edge) for edge in frame_inset(window_rect, visible))
+    if any(inset):
+        _move_window(user32, hwnd, rect_covering_monitor(monitor, inset))
+        _set_square_frame(dwmapi, hwnd)
+
+
+def _win32():
+    import ctypes
+    from ctypes import wintypes
+
+    class Rect(ctypes.Structure):
+        _fields_ = [
+            ("left", ctypes.c_long),
+            ("top", ctypes.c_long),
+            ("right", ctypes.c_long),
+            ("bottom", ctypes.c_long),
+        ]
+
+    class MonitorInfo(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", wintypes.DWORD),
+            ("rcMonitor", Rect),
+            ("rcWork", Rect),
+            ("dwFlags", wintypes.DWORD),
+        ]
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
+    user32.MonitorFromWindow.restype = wintypes.HMONITOR
+    user32.GetMonitorInfoW.argtypes = [wintypes.HMONITOR, ctypes.POINTER(MonitorInfo)]
+    user32.GetMonitorInfoW.restype = wintypes.BOOL
+    user32.SetWindowPos.argtypes = [
+        wintypes.HWND,
+        wintypes.HWND,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        wintypes.UINT,
+    ]
+    user32.SetWindowPos.restype = wintypes.BOOL
+    user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(Rect)]
+    user32.GetWindowRect.restype = wintypes.BOOL
+
+    dwmapi = ctypes.WinDLL("dwmapi", use_last_error=True)
+    attribute_args = [
+        wintypes.HWND,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    ]
+    dwmapi.DwmSetWindowAttribute.argtypes = attribute_args
+    dwmapi.DwmSetWindowAttribute.restype = ctypes.c_long
+    dwmapi.DwmGetWindowAttribute.argtypes = attribute_args
+    dwmapi.DwmGetWindowAttribute.restype = ctypes.c_long
+    return user32, dwmapi, Rect, MonitorInfo
+
+
+def _monitor_rect(user32, hwnd, monitor_info):
+    import ctypes
+
+    monitor = user32.MonitorFromWindow(hwnd, 2)
+    if not monitor:
+        raise OSError("The fullscreen window has no monitor.")
+    info = monitor_info()
+    info.cbSize = ctypes.sizeof(info)
+    if not user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+        raise OSError("GetMonitorInfoW failed.")
+    rect = info.rcMonitor
+    return (rect.left, rect.top, rect.right, rect.bottom)
+
+
+def _move_window(user32, hwnd, placed):
+    import ctypes
+
+    x, y, width, height = placed
+    # SWP_FRAMECHANGED | SWP_SHOWWINDOW. HWND_TOP is 0.
+    moved = user32.SetWindowPos(
+        hwnd, 0, int(x), int(y), int(width), int(height), 0x0060
+    )
+    if not moved:
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _set_square_frame(dwmapi, hwnd):
+    # 33 is DWMWA_WINDOW_CORNER_PREFERENCE, 1 is DWMWCP_DONOTROUND.
+    # 34 is DWMWA_BORDER_COLOR, 0xFFFFFFFE is DWMWA_COLOR_NONE.
+    _set_dwm_dword(dwmapi, hwnd, 33, 1)
+    _set_dwm_dword(dwmapi, hwnd, 34, 0xFFFFFFFE)
+
+
+def _set_dwm_dword(dwmapi, hwnd, attribute, value):
+    import ctypes
+
+    packed = ctypes.c_uint(value)
+    dwmapi.DwmSetWindowAttribute(
+        hwnd, attribute, ctypes.byref(packed), ctypes.sizeof(packed)
+    )
+
+
+def _window_rect(user32, hwnd, rect_type):
+    import ctypes
+
+    rect = rect_type()
+    if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        raise OSError("GetWindowRect failed.")
+    return (rect.left, rect.top, rect.right, rect.bottom)
+
+
+def _extended_frame(dwmapi, hwnd, rect_type):
+    """Visible frame from DWM, or None when the attribute is unavailable."""
+    import ctypes
+
+    rect = rect_type()
+    # DWMWA_EXTENDED_FRAME_BOUNDS
+    code = dwmapi.DwmGetWindowAttribute(
+        hwnd, 9, ctypes.byref(rect), ctypes.sizeof(rect)
+    )
+    if code != 0:
+        return None
+    return (rect.left, rect.top, rect.right, rect.bottom)
 
 
 class TunerDashboard:
@@ -966,7 +1198,13 @@ class TunerDashboard:
             for ip in list(self._alerts):
                 if ip not in kept:
                     self._drop_miner_runtime_locked(ip)
-        self.log_message(f"Loaded {len(rows)} miners.", "success")
+        problem = config_problem()
+        if problem:
+            self.log_message(problem, "error")
+        self.log_message(
+            f"Loaded {len(rows)} miners.",
+            "error" if problem else "success",
+        )
         self._wake.set()
 
     def log_message(self, message, level="info"):
@@ -999,6 +1237,7 @@ class TunerDashboard:
             miners = []
             for row in self._rows:
                 item = dict(row)
+                item["hash_label"] = format_hashrate(item.get("hash"))
                 item["firmware_update"] = firmware_update_version(
                     item.get("name_title"), latest
                 )
@@ -1016,11 +1255,12 @@ class TunerDashboard:
                     "offline": summary["offline"],
                     "hold": summary["hold"],
                     "trim": summary["trim"],
-                    "hash": summary["hash"],
+                    "hash": format_hashrate(summary["hash"]),
                     "watts": summary["watts"],
                     "jth": summary["jth"],
                 },
                 "scan_range": dict(self._scan_range),
+                "config_error": config_problem(),
             }
 
     def _network_locked(self):
@@ -1304,10 +1544,13 @@ class TunerDashboard:
     def restart_all_miners(self):
         """Restart every saved miner. The page confirms before it calls this."""
         with self._lock:
+            self._reap_threads_locked()
             if self._restart_all_running:
                 blocked = "restart"
             elif self._baseline_reset_running:
                 blocked = "baseline"
+            elif self._autotuner_active_locked():
+                blocked = "tuning"
             else:
                 blocked = None
                 self._restart_all_running = True
@@ -1328,6 +1571,13 @@ class TunerDashboard:
             return _fail(
                 "Wait for the baseline reset to finish before restarting miners.",
                 "Reset in Progress",
+                "warning",
+            )
+        if blocked == "tuning":
+            self.log_message("Stop the autotuner before restarting miners.", "warning")
+            return _fail(
+                "Stop the autotuner before restarting miners.",
+                "Autotuner Running",
                 "warning",
             )
 
@@ -1476,7 +1726,8 @@ class TunerDashboard:
             miner_type = miner_type_from_info(info)
             self._signal_miner_stop(current_ip)
 
-        self._apply_miner_edit(current_ip, nickname, new_ip, miner_type)
+        if self._apply_miner_edit(current_ip, nickname, new_ip, miner_type) is False:
+            return _fail(CONFIG_CORRUPT_MESSAGE, "Config file damaged", "error")
         self.log_message(
             f"Updated miner settings: {nickname} ({miner_type}) at {new_ip}", "success"
         )
@@ -1490,6 +1741,19 @@ class TunerDashboard:
         ip = str(ip or "").strip()
         if not ip:
             return _fail("Please select a miner first.", "No Selection", "warning")
+        with self._lock:
+            self._reap_threads_locked()
+            tuning = any(
+                getattr(thread, "miner_ip", None) == ip and thread.is_alive()
+                for thread in self.threads
+            )
+        if tuning:
+            self.log_message(f"Stop the autotuner before restarting {ip}.", "warning")
+            return _fail(
+                "Stop the autotuner before restarting this miner.",
+                "Autotuner Running",
+                "warning",
+            )
         self.log_message(f"Restarting miner at {ip}...", "warning")
         message = restart_bitaxe(ip)
         self.log_message(message, "warning")
@@ -1525,12 +1789,19 @@ class TunerDashboard:
             )
         except (KeyError, TypeError, ValueError):
             return _fail("Please enter valid integer values.")
+        if new_settings["monitor_interval"] < 1:
+            return _fail("Monitor interval must be at least 1 second.")
+        if new_settings["refresh_interval"] < HASHRATE_1M_SETTLE_SECONDS:
+            return _fail(
+                f"Tune interval must be at least {HASHRATE_1M_SETTLE_SECONDS} seconds."
+            )
 
         def mutate(config):
             config.update(new_settings)
             config.pop("enforce_safe_pairing", None)
 
-        modify_config(mutate)
+        if modify_config(mutate) is False:
+            return _fail(CONFIG_CORRUPT_MESSAGE, "Config file damaged", "error")
         self.log_message("Global settings updated.", "success")
         return {"ok": True}
 
@@ -1584,6 +1855,8 @@ class TunerDashboard:
                     )
             parsed.append((row, fields))
 
+        stopped = []
+
         def mutate(config):
             by_ip = {miner["ip"]: miner for miner in config.get("miners", [])}
             for row, fields in parsed:
@@ -1595,13 +1868,22 @@ class TunerDashboard:
                     miner["enabled"] = False
                 else:
                     miner["enabled"] = _as_bool(row.get("enabled"))
+                if not miner["enabled"]:
+                    stopped.append(miner["ip"])
 
-        modify_config(mutate)
+        if modify_config(mutate) is False:
+            return _fail(CONFIG_CORRUPT_MESSAGE, "Config file damaged", "error")
+        for ip in stopped:
+            self._signal_miner_stop(ip)
         self.log_message("Updated AutoTuner settings for all miners.", "success")
         return {"ok": True}
 
     def set_fullscreen(self, enabled):
-        """Fill the work area. The header, table, and log stay; the toolbar does not."""
+        """Fill the work area. The header, table, and log stay; the toolbar does not.
+
+        On Windows the window then covers the monitor, so the desktop does not
+        show through the resize border or the rounded corners.
+        """
         enabled = bool(enabled)
         window = self._window
         if window is not None and enabled != self._fullscreen:
@@ -1609,6 +1891,8 @@ class TunerDashboard:
                 window.toggle_fullscreen()
             except Exception as exc:
                 return _fail(str(exc))
+            if enabled and platform.system() == "Windows":
+                _snap_fullscreen_window(window)
         self._fullscreen = enabled
         return {"ok": True, "fullscreen": enabled}
 
@@ -1700,7 +1984,10 @@ class TunerDashboard:
         row["phase"] = status.get("phase") or "-"
         error = miner_data.get("errorPercentage", status.get("error_percentage"))
         row["error"] = "-" if error in (None, "") else f"{format_number(error, 2)}%"
-        row["setpoint"] = format_learned_wall(status, stored)
+        freq, volt, limit = learned_setpoint(status, stored)
+        row["setpoint_freq"] = freq or "-"
+        row["setpoint_volt"] = volt or "-"
+        row["setpoint_limit"] = limit
         row["reason"] = str(status.get("reason") or "").strip()
         row["power_fault"] = _power_fault_set(miner_data.get("power_fault"))
         row["overheat"] = _overheat_mode_set(miner_data.get("overheat_mode"))
@@ -1781,8 +2068,10 @@ class TunerDashboard:
                     miner["ip"] = new_ip
                     break
 
-        modify_config(mutate)
+        if modify_config(mutate) is False:
+            return False
         self.load_rows()
+        return True
 
     def _miner_type(self, ip, fallback="Unknown"):
         stored = get_miner_defaults(ip)
@@ -1796,6 +2085,15 @@ class TunerDashboard:
             if ip and name:
                 names[ip] = name
         return names
+
+    def _autotuner_active_locked(self):
+        """True while a tuner thread is starting, running, or still leaving."""
+        return (
+            self.running
+            or self._start_pending
+            or self._stop_in_progress
+            or any(thread.is_alive() for thread in self.threads)
+        )
 
     def _signal_miner_stop(self, ip):
         """Ask the tuner thread for one address to leave. Other miners keep running."""
@@ -1856,7 +2154,9 @@ class TunerDashboard:
             "status_label": label,
             "reset_enabled": not reset_locked,
             "restart_all_enabled": not (
-                self._restart_all_running or self._baseline_reset_running
+                self._restart_all_running
+                or self._baseline_reset_running
+                or self._autotuner_active_locked()
             ),
             "scan_enabled": not self._scan_running,
         }

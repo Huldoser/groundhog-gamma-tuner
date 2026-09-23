@@ -8,8 +8,13 @@ import threading
 import requests
 
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+CONFIG_CORRUPT_MESSAGE = (
+    "config.json is damaged and was not loaded. "
+    "Fix that file before saving. The empty defaults were not written over it."
+)
 _config_lock = threading.RLock()
 _last_good_config = None
+_config_corrupt = False
 
 # Gamma 601 hard range. The UI and the tuner both stay inside this.
 # 350 MHz is the lowest BM1370 clock in the AxeOS v2.15.1 preset list (Gamma Duo).
@@ -164,21 +169,33 @@ def detect_miners(start_ip, end_ip, on_progress=None, should_cancel=None):
         if not added:
             return []
         fresh.setdefault("miners", []).extend(added)
-        save_config(fresh)
+        if save_config(fresh) is False:
+            print(CONFIG_CORRUPT_MESSAGE)
+            return []
     return added
+
+
+def config_problem():
+    """Error text when this process could not parse config.json. Empty when it is fine."""
+    with _config_lock:
+        if _config_corrupt and _last_good_config is None:
+            return CONFIG_CORRUPT_MESSAGE
+        return ""
 
 
 def load_config():
     """Load configuration settings from config.json.
 
     A partial or corrupt file does not replace the last config that parsed.
+    A fresh process keeps the damaged file on disk and reports config_problem().
     """
-    global _last_good_config
+    global _last_good_config, _config_corrupt
     with _config_lock:
         if not os.path.exists(CONFIG_FILE):
             default = get_default_config()
             _write_config(default)
             _last_good_config = copy.deepcopy(default)
+            _config_corrupt = False
             return default
 
         try:
@@ -187,25 +204,36 @@ def load_config():
         except json.JSONDecodeError:
             if _last_good_config is not None:
                 return copy.deepcopy(_last_good_config)
+            _config_corrupt = True
             return get_default_config()
         except FileNotFoundError:
             default = get_default_config()
             _write_config(default)
             _last_good_config = copy.deepcopy(default)
+            _config_corrupt = False
             return default
 
         _drop_daily_reset(loaded)
         _last_good_config = copy.deepcopy(loaded)
+        _config_corrupt = False
         return loaded
 
 
 def save_config(config):
-    """Save configuration settings to config.json atomically."""
-    global _last_good_config
+    """Save configuration settings to config.json atomically.
+
+    Returns False when the file on disk is damaged and this process has no
+    parsed copy to replace it with.
+    """
+    global _last_good_config, _config_corrupt
     with _config_lock:
+        if _config_corrupt and _last_good_config is None:
+            return False
         _drop_daily_reset(config)
         _write_config(config)
         _last_good_config = copy.deepcopy(config)
+        _config_corrupt = False
+        return True
 
 
 def modify_config(mutator):
@@ -217,9 +245,12 @@ def modify_config(mutator):
     """
     with _config_lock:
         config = load_config()
+        if _config_corrupt and _last_good_config is None:
+            return False
         if mutator(config) is False:
             return None
-        save_config(config)
+        if save_config(config) is False:
+            return False
         return config
 
 
@@ -332,9 +363,12 @@ def remove_miner(ip):
 
 def update_miner(ip, new_settings):
     """Updates an existing miner's settings in config.json under one lock."""
-    global _last_good_config
+    global _last_good_config, _config_corrupt
     with _config_lock:
         config = load_config()
+        if _config_corrupt and _last_good_config is None:
+            print(CONFIG_CORRUPT_MESSAGE)
+            return
         updated = False
         for miner in config.get("miners", []):
             if miner.get("ip") == ip:
@@ -348,6 +382,7 @@ def update_miner(ip, new_settings):
 
         _write_config(config)
         _last_good_config = copy.deepcopy(config)
+        _config_corrupt = False
         print(f"Updated miner {ip} settings successfully.")
 
 

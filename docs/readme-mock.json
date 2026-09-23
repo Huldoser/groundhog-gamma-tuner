@@ -1,0 +1,395 @@
+{
+  "snapshot": {
+    "updated": "7:41 PM",
+    "miners": [
+      {
+        "name": "alpha",
+        "ip": "192.168.1.41",
+        "freq": "990",
+        "mv": "1260",
+        "vin": "5.14",
+        "asic": "63.8",
+        "vr": "79.6",
+        "hash": "1864.20",
+        "watts": "27.42",
+        "jth": "14.71",
+        "best": "86.42G",
+        "session": "1.84M",
+        "shares": "2146/9",
+        "up": "2d",
+        "phase": "hold",
+        "error": "0.42%",
+        "setpoint": "silicon 990/1260",
+        "tag": "hold",
+        "up_seconds": 198420,
+        "mv_alert": false,
+        "asic_level": "",
+        "vr_level": "",
+        "error_alert": false,
+        "watts_alert": false,
+        "vin_alert": false,
+        "name_title": "v2.15.2",
+        "firmware_update": "",
+        "mv_title": "Measured 1244 mV, droop 16 mV",
+        "hash_title": "Live 1891.40 GH/s\n10m 1855.10 GH/s\nExpected 1890.90 GH/s",
+        "shares_title": "Pool difficulty 16384",
+        "reason": "",
+        "pool": "stratum.ckpool.org",
+        "fallback": false,
+        "wifi": "-58",
+        "wifi_weak": false,
+        "power_fault": false,
+        "overheat": false,
+        "best_exact": 86420000000,
+        "best_title": "86420000000",
+        "session_title": "1840000"
+      },
+      {
+        "name": "beta",
+        "ip": "192.168.1.42",
+        "freq": "875",
+        "mv": "1200",
+        "vin": "5.11",
+        "asic": "58.4",
+        "vr": "73.8",
+        "hash": "1612.40",
+        "watts": "21.98",
+        "jth": "13.63",
+        "best": "4.82M",
+        "session": "890.40k",
+        "shares": "640/2",
+        "up": "2d",
+        "phase": "climb",
+        "error": "0.18%",
+        "setpoint": "hash 850/1180",
+        "tag": "climb",
+        "up_seconds": 197880,
+        "mv_alert": false,
+        "asic_level": "",
+        "vr_level": "",
+        "error_alert": false,
+        "watts_alert": false,
+        "vin_alert": false,
+        "name_title": "v2.15.1",
+        "firmware_update": "v2.15.2",
+        "mv_title": "Measured 1188 mV, droop 12 mV",
+        "hash_title": "Live 1638.70 GH/s\n10m 1594.20 GH/s\nExpected 1671.25 GH/s",
+        "shares_title": "Pool difficulty 8192",
+        "reason": "increase frequency",
+        "pool": "stratum.ckpool.org",
+        "fallback": false,
+        "wifi": "-61",
+        "wifi_weak": false,
+        "power_fault": false,
+        "overheat": false,
+        "best_exact": 4820000,
+        "best_title": "4820000",
+        "session_title": "890400"
+      },
+      {
+        "name": "gamma",
+        "ip": "192.168.1.43",
+        "freq": "1040",
+        "mv": "1280",
+        "vin": "5.08",
+        "asic": "64.6",
+        "vr": "86.2",
+        "hash": "1986.50",
+        "watts": "29.73",
+        "jth": "14.97",
+        "best": "22.40M",
+        "session": "3.16M",
+        "shares": "1804/14",
+        "up": "6h",
+        "phase": "trim",
+        "error": "1.12%",
+        "setpoint": "1040/1290",
+        "tag": "trim",
+        "up_seconds": 24840,
+        "mv_alert": false,
+        "asic_level": "",
+        "vr_level": "warn",
+        "error_alert": false,
+        "watts_alert": false,
+        "vin_alert": false,
+        "name_title": "v2.15.2",
+        "firmware_update": "",
+        "mv_title": "Measured 1252 mV, droop 28 mV",
+        "hash_title": "Live 1972.80 GH/s\n10m 1991.40 GH/s\nExpected 1986.40 GH/s",
+        "shares_title": "Job not found 6\nPool difficulty 16384",
+        "reason": "trim voltage",
+        "pool": "stratum.ckpool.org",
+        "fallback": false,
+        "wifi": "-55",
+        "wifi_weak": false,
+        "power_fault": false,
+        "overheat": false,
+        "best_exact": 22400000,
+        "best_title": "22400000",
+        "session_title": "3160000"
+      },
+      {
+        "name": "delta",
+        "ip": "192.168.1.44",
+        "freq": "-",
+        "mv": "-",
+        "vin": "-",
+        "asic": "-",
+        "vr": "-",
+        "hash": "-",
+        "watts": "-",
+        "jth": "-",
+        "best": "-",
+        "session": "-",
+        "shares": "-",
+        "up": "-",
+        "phase": "offline",
+        "error": "-",
+        "setpoint": "-",
+        "tag": "alert",
+        "up_seconds": null,
+        "mv_alert": false,
+        "asic_level": "",
+        "vr_level": "",
+        "error_alert": false,
+        "watts_alert": false,
+        "vin_alert": false,
+        "name_title": "",
+        "firmware_update": "",
+        "mv_title": "",
+        "hash_title": "",
+        "shares_title": "",
+        "reason": "",
+        "pool": "",
+        "fallback": false,
+        "wifi": "",
+        "wifi_weak": false,
+        "power_fault": false,
+        "overheat": false,
+        "best_exact": null,
+        "best_title": "",
+        "session_title": ""
+      }
+    ],
+    "log": [
+      {
+        "id": 1,
+        "text": "[2026-09-22 07:14:02] Loaded 4 miners.",
+        "level": "success"
+      },
+      {
+        "id": 2,
+        "text": "[2026-09-22 07:14:06] [alpha] Resuming at 990 MHz / 1260 mV.",
+        "level": "info"
+      },
+      {
+        "id": 3,
+        "text": "[2026-09-22 07:14:06] [alpha] Fan updated.",
+        "level": "info"
+      },
+      {
+        "id": 4,
+        "text": "[2026-09-22 07:14:06] [alpha] Applied settings: Voltage = 1260mV, Frequency = 990MHz",
+        "level": "info"
+      },
+      {
+        "id": 5,
+        "text": "[2026-09-22 07:14:09] [beta] Resuming at 850 MHz / 1180 mV.",
+        "level": "info"
+      },
+      {
+        "id": 6,
+        "text": "[2026-09-22 07:14:09] [beta] Fan updated.",
+        "level": "info"
+      },
+      {
+        "id": 7,
+        "text": "[2026-09-22 07:14:09] [beta] Applied settings: Voltage = 1180mV, Frequency = 850MHz",
+        "level": "info"
+      },
+      {
+        "id": 8,
+        "text": "[2026-09-22 07:14:12] [gamma] Resuming at 1040 MHz / 1290 mV.",
+        "level": "info"
+      },
+      {
+        "id": 9,
+        "text": "[2026-09-22 07:14:12] [gamma] Fan updated.",
+        "level": "info"
+      },
+      {
+        "id": 10,
+        "text": "[2026-09-22 07:14:12] [gamma] Applied settings: Voltage = 1290mV, Frequency = 1040MHz",
+        "level": "info"
+      },
+      {
+        "id": 11,
+        "text": "[2026-09-22 07:17:08] [alpha] Confirmed 990 MHz / 1260 mV.",
+        "level": "success"
+      },
+      {
+        "id": 12,
+        "text": "[2026-09-22 07:17:11] [beta] Confirmed 850 MHz / 1180 mV.",
+        "level": "success"
+      },
+      {
+        "id": 13,
+        "text": "[2026-09-22 07:17:14] [gamma] Confirmed 1040 MHz / 1290 mV.",
+        "level": "success"
+      },
+      {
+        "id": 14,
+        "text": "[2026-09-22 11:02:44] [gamma] Frequency ceiling. Trimming voltage.",
+        "level": "info"
+      },
+      {
+        "id": 15,
+        "text": "[2026-09-22 11:02:44] [gamma] trim voltage.",
+        "level": "info"
+      },
+      {
+        "id": 16,
+        "text": "[2026-09-22 11:02:44] [gamma] Applied settings: Voltage = 1280mV, Frequency = 1040MHz",
+        "level": "info"
+      },
+      {
+        "id": 17,
+        "text": "[2026-09-22 11:05:48] [gamma] Confirmed 1040 MHz / 1280 mV.",
+        "level": "success"
+      },
+      {
+        "id": 18,
+        "text": "[2026-09-22 19:22:11] [beta] increase frequency.",
+        "level": "info"
+      },
+      {
+        "id": 19,
+        "text": "[2026-09-22 19:22:11] [beta] Applied settings: Voltage = 1200mV, Frequency = 875MHz",
+        "level": "info"
+      },
+      {
+        "id": 20,
+        "text": "[2026-09-22 19:25:14] [beta] Confirmed 875 MHz / 1200 mV. PLL is 873 MHz.",
+        "level": "success"
+      },
+      {
+        "id": 21,
+        "text": "[2026-09-22 19:38:02] Error fetching system info from delta: HTTPConnectionPool(host='delta', port=80): Read timed out. (read timeout=10)",
+        "level": "error"
+      }
+    ],
+    "scan": null,
+    "controls": {
+      "status": "running",
+      "status_label": "Running",
+      "reset_enabled": false,
+      "restart_all_enabled": true,
+      "scan_enabled": true
+    },
+    "prompts": {
+      "baseline": "Set every miner to the Gamma 601 stock clocks (525 MHz / 1150 mV) and forget the saved setpoint?\n\nThe next Start Autotuner will climb or step down from there."
+    },
+    "network": {
+      "difficulty": "142.37T",
+      "difficulty_title": "142370000000000",
+      "pools": [
+        { "name": "stratum.ckpool.org", "online": true },
+        { "name": "public-pool.io", "online": true }
+      ]
+    },
+    "fleet": {
+      "online": 3,
+      "offline": 1,
+      "hold": 1,
+      "trim": 1,
+      "hash": "5463.10",
+      "watts": "79.13",
+      "jth": "14.48"
+    }
+  },
+  "tuner": {
+    "ok": true,
+    "miners": [
+      {
+        "ip": "192.168.1.41",
+        "name": "alpha",
+        "label": "alpha (192.168.1.41)",
+        "enabled": true,
+        "fields": {
+          "min_freq": "350",
+          "start_freq": "525",
+          "max_freq": "1100",
+          "min_volt": "1000",
+          "start_volt": "1150",
+          "max_volt": "1300",
+          "max_temp": "68",
+          "max_watts": "50",
+          "max_vr_temp": "88",
+          "min_input_voltage": "4.9",
+          "max_error_percentage": "2.0",
+          "max_droop_mv": "40"
+        }
+      },
+      {
+        "ip": "192.168.1.42",
+        "name": "beta",
+        "label": "beta (192.168.1.42)",
+        "enabled": true,
+        "fields": {
+          "min_freq": "350",
+          "start_freq": "525",
+          "max_freq": "1100",
+          "min_volt": "1000",
+          "start_volt": "1150",
+          "max_volt": "1300",
+          "max_temp": "68",
+          "max_watts": "50",
+          "max_vr_temp": "88",
+          "min_input_voltage": "4.9",
+          "max_error_percentage": "2.0",
+          "max_droop_mv": "40"
+        }
+      },
+      {
+        "ip": "192.168.1.43",
+        "name": "gamma",
+        "label": "gamma (192.168.1.43)",
+        "enabled": true,
+        "fields": {
+          "min_freq": "350",
+          "start_freq": "525",
+          "max_freq": "1100",
+          "min_volt": "1000",
+          "start_volt": "1150",
+          "max_volt": "1300",
+          "max_temp": "68",
+          "max_watts": "50",
+          "max_vr_temp": "88",
+          "min_input_voltage": "4.9",
+          "max_error_percentage": "2.0",
+          "max_droop_mv": "40"
+        }
+      },
+      {
+        "ip": "192.168.1.44",
+        "name": "delta",
+        "label": "delta (192.168.1.44)",
+        "enabled": true,
+        "fields": {
+          "min_freq": "350",
+          "start_freq": "525",
+          "max_freq": "1100",
+          "min_volt": "1000",
+          "start_volt": "1150",
+          "max_volt": "1300",
+          "max_temp": "68",
+          "max_watts": "50",
+          "max_vr_temp": "88",
+          "min_input_voltage": "4.9",
+          "max_error_percentage": "2.0",
+          "max_droop_mv": "40"
+        }
+      }
+    ]
+  }
+}
