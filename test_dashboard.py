@@ -21,8 +21,8 @@ from dashboard import (
     format_difficulty,
     format_efficiency,
     format_hash_title,
+    format_hashrate,
     format_input_voltage,
-    format_learned_wall,
     format_log_line,
     format_minute_hashrate,
     format_number,
@@ -30,6 +30,7 @@ from dashboard import (
     format_shares,
     format_uptime,
     format_version_title,
+    learned_setpoint,
     limit_level,
     replace_ips_with_names,
     under_limit,
@@ -42,8 +43,10 @@ def temp_config(miners=None):
         path = os.path.join(directory, "config.json")
         old_path = config.CONFIG_FILE
         old_last = config._last_good_config
+        old_corrupt = config._config_corrupt
         config.CONFIG_FILE = path
         config._last_good_config = None
+        config._config_corrupt = False
         try:
             saved = config.get_default_config()
             if miners is not None:
@@ -53,6 +56,7 @@ def temp_config(miners=None):
         finally:
             config.CONFIG_FILE = old_path
             config._last_good_config = old_last
+            config._config_corrupt = old_corrupt
 
 
 class DisplayHelperTests(unittest.TestCase):
@@ -61,13 +65,55 @@ class DisplayHelperTests(unittest.TestCase):
         self.assertEqual(format_number("12.3%", 1), "12.3")
         self.assertEqual(format_number(12.3, 2), "12.30")
         self.assertEqual(
-            format_learned_wall(
+            learned_setpoint(
                 {"wall_type": "silicon", "last_good_freq": 640, "last_good_volt": 1200},
                 {},
             ),
-            "silicon 640/1200",
+            ("640", "1200", "chip errors"),
         )
-        self.assertEqual(format_learned_wall({}, {}), "-")
+        self.assertEqual(
+            learned_setpoint(
+                {"wall_type": "hash", "last_good_freq": 850, "last_good_volt": 1180},
+                {},
+            ),
+            ("850", "1180", "low hashrate"),
+        )
+        self.assertEqual(
+            learned_setpoint(
+                {"wall_type": "thermal", "last_good_freq": 700, "last_good_volt": 1150},
+                {},
+            ),
+            ("700", "1150", "temperature"),
+        )
+        self.assertEqual(
+            learned_setpoint(
+                {"wall_type": "power", "last_good_freq": 600, "last_good_volt": 1100},
+                {},
+            ),
+            ("600", "1100", "power"),
+        )
+        self.assertEqual(
+            learned_setpoint(
+                {"wall_type": "reject", "last_good_freq": 550, "last_good_volt": 1120},
+                {},
+            ),
+            ("550", "1120", "rejected shares"),
+        )
+        self.assertEqual(
+            learned_setpoint(
+                {"wall_type": "input", "last_good_freq": 500, "last_good_volt": 1100},
+                {},
+            ),
+            ("500", "1100", "input sag"),
+        )
+        self.assertEqual(
+            learned_setpoint(
+                {},
+                {"last_good_freq": 1040, "last_good_volt": 1290},
+            ),
+            ("1040", "1290", ""),
+        )
+        self.assertEqual(learned_setpoint({}, {}), ("", "", ""))
         self.assertEqual(format_difficulty(49224525), "49.22M")
         self.assertEqual(format_difficulty(2038368), "2.04M")
         self.assertEqual(format_difficulty(999), "999")
@@ -203,14 +249,32 @@ class DisplayHelperTests(unittest.TestCase):
         self.assertEqual(format_efficiency(18.5, 1000, "UV"), "-")
         self.assertEqual(format_efficiency(18.5, 1000, "none"), "18.50")
         self.assertEqual(format_uptime(18000), ("5h", 18000))
+        self.assertEqual(format_uptime(18720), ("5h 12m", 18720))
+        self.assertEqual(format_uptime(3661), ("1h 1m", 3661))
         self.assertEqual(format_uptime(172800), ("2d", 172800))
+        self.assertEqual(format_uptime(183600), ("2d 3h", 183600))
+        self.assertEqual(format_uptime(174600), ("2d 30m", 174600))
+        self.assertEqual(format_uptime(90), ("1m", 90))
         self.assertEqual(format_uptime(45), ("45s", 45))
         self.assertEqual(format_uptime(None), ("-", None))
+        self.assertEqual(format_hashrate(0.4), "0.40 GH/s")
+        self.assertEqual(format_hashrate(12.5), "12.50 GH/s")
+        self.assertEqual(format_hashrate(999.4), "999.40 GH/s")
+        self.assertEqual(format_hashrate(1000), "1.00 TH/s")
+        self.assertEqual(format_hashrate(1000.5), "1.00 TH/s")
+        self.assertEqual(format_hashrate(1072.24), "1.07 TH/s")
+        self.assertEqual(format_hashrate(None), "-")
         self.assertEqual(
             format_hash_title(
                 {"hashRate": 1072.24, "hashRate_10m": 1070, "expectedHashrate": 1071}
             ),
-            "Live 1072.24 GH/s\n10m 1070.00 GH/s\nExpected 1071.00 GH/s",
+            "Live 1.07 TH/s\n10m 1.07 TH/s\nExpected 1.07 TH/s",
+        )
+        self.assertEqual(
+            format_hash_title(
+                {"hashRate": 0.5, "hashRate_10m": 1200, "expectedHashrate": 1}
+            ),
+            "Live 0.50 GH/s\n10m 1.20 TH/s\nExpected 1.00 GH/s",
         )
         self.assertEqual(
             format_core_voltage_title(1150, 1144), "Measured 1144 mV, droop 6 mV"
@@ -448,6 +512,7 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(row["vin"], "5.09")
         self.assertEqual(row["asic"], "61.2")
         self.assertEqual(row["hash"], "12.50")
+        self.assertEqual(row["hash_label"], "12.50 GH/s")
         self.assertEqual(
             row["hash_title"], "Live 12.50 GH/s\n10m 12.20 GH/s\nExpected 13.00 GH/s"
         )
@@ -459,7 +524,9 @@ class SnapshotTests(unittest.TestCase):
             row["shares_title"], "Stale 13\nPool difficulty 1000\nFallback pool"
         )
         self.assertEqual(row["error"], "0.50%")
-        self.assertEqual(row["setpoint"], "silicon 640/1200")
+        self.assertEqual(row["setpoint_freq"], "640")
+        self.assertEqual(row["setpoint_volt"], "1200")
+        self.assertEqual(row["setpoint_limit"], "chip errors")
         self.assertEqual(row["reason"], "holding")
         self.assertEqual(row["pool"], "solo.ckpool.org")
         self.assertTrue(row["fallback"])
@@ -809,6 +876,69 @@ class SnapshotTests(unittest.TestCase):
             stored = config.load_config()
             self.assertEqual(stored["vr_temp_tolerance"], 4)
             self.assertEqual(stored["ceiling_soak_seconds"], 900)
+            settings["monitor_interval"] = 0
+            rejected = app.save_global_settings(settings)
+            self.assertFalse(rejected["ok"])
+            self.assertIn("1 second", rejected["message"])
+            settings["monitor_interval"] = 5
+            settings["refresh_interval"] = 30
+            rejected = app.save_global_settings(settings)
+            self.assertFalse(rejected["ok"])
+            self.assertIn("60", rejected["message"])
+
+    def test_restart_is_blocked_while_that_miner_is_tuning(self):
+        miner = config.new_miner_record(
+            "BM1370 601", "10.0.0.8", "Alpha", config.get_default_config()
+        )
+        with temp_config([miner]):
+            app = TunerDashboard()
+
+            class _Alive:
+                def is_alive(self):
+                    return True
+
+            thread = _Alive()
+            thread.miner_ip = "10.0.0.8"
+            app.threads = [thread]
+            app.running = True
+            blocked = app.restart_miner("10.0.0.8")
+            self.assertFalse(blocked["ok"])
+            self.assertFalse(app._controls_locked()["restart_all_enabled"])
+            refused = app.restart_all_miners()
+            self.assertFalse(refused["ok"])
+            self.assertFalse(app._restart_all_running)
+
+    def test_clearing_tune_stops_that_miner(self):
+        miner = config.new_miner_record(
+            "BM1370 601", "10.0.0.8", "Alpha", config.get_default_config()
+        )
+        with temp_config([miner]):
+            app = TunerDashboard()
+            event = threading.Event()
+            app._miner_stops["10.0.0.8"] = event
+            fields = {field: str(miner[field]) for field in ALL_AUTOTUNE_FIELDS}
+            saved = app.save_autotuner_settings(
+                [{"ip": "10.0.0.8", "enabled": False, "fields": fields}]
+            )
+            self.assertTrue(saved["ok"])
+            self.assertTrue(event.is_set())
+            self.assertFalse(config.get_miners()[0]["enabled"])
+
+    def test_corrupt_config_is_reported_and_not_overwritten(self):
+        with temp_config():
+            path = config.CONFIG_FILE
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("{broken")
+            config._last_good_config = None
+            config._config_corrupt = False
+            app = TunerDashboard()
+            app.load_rows()
+            self.assertTrue(any("damaged" in line["text"] for line in app._log))
+            self.assertIn("damaged", app.get_snapshot(0)["config_error"])
+            rejected = app.save_global_settings(app.get_global_settings()["settings"])
+            self.assertFalse(rejected["ok"])
+            with open(path, encoding="utf-8") as handle:
+                self.assertTrue(handle.read().startswith("{broken"))
 
     def test_settings_save_keeps_a_setpoint_learned_while_it_waits(self):
         miner = config.new_miner_record(
@@ -1020,7 +1150,7 @@ class SnapshotTests(unittest.TestCase):
         self.assertNotIn("history", snapshot)
         self.assertNotIn("odds", snapshot)
         self.assertEqual(snapshot["fleet"]["online"], 1)
-        self.assertEqual(snapshot["fleet"]["hash"], "1000.00")
+        self.assertEqual(snapshot["fleet"]["hash"], "1.00 TH/s")
         self.assertEqual(snapshot["fleet"]["hold"], 1)
         self.assertIn("start", snapshot["scan_range"])
 
@@ -1092,6 +1222,75 @@ class SnapshotTests(unittest.TestCase):
         self.assertFalse(app._focused)
         DashboardApi(app).get_snapshot(0, True)
         self.assertTrue(app._focused)
+
+
+class FullscreenTests(unittest.TestCase):
+    def test_monitor_rect_covers_the_frame_inset(self):
+        monitor = (0, 0, 1920, 1080)
+        self.assertEqual(
+            dashboard.rect_covering_monitor(monitor, (0, 0, 0, 0)),
+            (0, 0, 1920, 1080),
+        )
+        self.assertEqual(
+            dashboard.rect_covering_monitor(monitor, (8, 8, 8, 8)),
+            (-8, -8, 1936, 1096),
+        )
+        self.assertEqual(
+            dashboard.frame_inset((0, 0, 1920, 1080), (8, 8, 1912, 1072)),
+            (8, 8, 8, 8),
+        )
+
+    def test_fullscreen_snaps_only_when_entering_on_windows(self):
+        app = TunerDashboard()
+        window = mock.Mock()
+        app._window = window
+        with (
+            mock.patch("dashboard.platform.system", return_value="Windows"),
+            mock.patch("dashboard._snap_fullscreen_window") as snap,
+        ):
+            entered = app.set_fullscreen(True)
+            self.assertEqual(entered, {"ok": True, "fullscreen": True})
+            window.toggle_fullscreen.assert_called_once_with()
+            snap.assert_called_once_with(window)
+
+            window.toggle_fullscreen.reset_mock()
+            snap.reset_mock()
+            repeated = app.set_fullscreen(True)
+            self.assertEqual(repeated, {"ok": True, "fullscreen": True})
+            window.toggle_fullscreen.assert_not_called()
+            snap.assert_not_called()
+
+            left = app.set_fullscreen(False)
+            self.assertEqual(left, {"ok": True, "fullscreen": False})
+            window.toggle_fullscreen.assert_called_once_with()
+            snap.assert_not_called()
+
+        window.toggle_fullscreen.reset_mock()
+        with (
+            mock.patch("dashboard.platform.system", return_value="Linux"),
+            mock.patch("dashboard._snap_fullscreen_window") as snap,
+        ):
+            entered = app.set_fullscreen(True)
+        self.assertEqual(entered, {"ok": True, "fullscreen": True})
+        window.toggle_fullscreen.assert_called_once_with()
+        snap.assert_not_called()
+
+    def test_fullscreen_stays_on_when_the_snap_fails(self):
+        app = TunerDashboard()
+
+        class BrokenWindow:
+            def toggle_fullscreen(self):
+                return None
+
+            @property
+            def native(self):
+                raise OSError("snap failed")
+
+        app._window = BrokenWindow()
+        with mock.patch("dashboard.platform.system", return_value="Windows"):
+            result = app.set_fullscreen(True)
+        self.assertEqual(result, {"ok": True, "fullscreen": True})
+        self.assertTrue(app._fullscreen)
 
 
 if __name__ == "__main__":

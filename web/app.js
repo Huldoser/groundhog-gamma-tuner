@@ -175,7 +175,7 @@ let tableKey = "";
 let sortColumn = "best";
 let sortDirection = "desc";
 
-const NUMERIC_COLUMNS = new Set(["freq", "asic", "hash", "watts", "best", "shares", "up"]);
+const NUMERIC_COLUMNS = new Set(["freq", "asic", "hash", "watts", "best", "shares", "up", "setpoint"]);
 const DIFFICULTY_SUFFIX = { k: 1e3, M: 1e6, G: 1e9, T: 1e12, P: 1e15 };
 
 function plainNumber(text) {
@@ -204,6 +204,7 @@ function sortValue(miner, column) {
   if (column === "best" || column === "session") return difficultyNumber(miner, column);
   if (column === "shares") return shareNumber(miner.shares);
   if (column === "up") return plainNumber(miner.up_seconds);
+  if (column === "setpoint") return plainNumber(miner.setpoint_freq);
   if (NUMERIC_COLUMNS.has(column)) return plainNumber(miner[column]);
   const text = String(miner[column] ?? "").trim();
   if (!text || text === "-") return null;
@@ -314,7 +315,7 @@ function renderCell(miner, column) {
   if (column === "hash") {
     if (!shown(miner.hash) && !shown(miner.jth)) cell.textContent = "-";
     else {
-      if (shown(miner.hash)) addLine(cell, `${miner.hash} GH/s`);
+      if (shown(miner.hash)) addLine(cell, miner.hash_label || `${miner.hash} GH/s`);
       if (shown(miner.jth)) addLine(cell, `${miner.jth} J/TH`, "muted");
     }
     setTitle(cell, miner.hash_title);
@@ -364,7 +365,19 @@ function renderCell(miner, column) {
     if (shown(miner.reason)) addLine(cell, miner.reason, "muted reason");
     return cell;
   }
-  if (column === "setpoint") cell.className = "left quiet";
+  if (column === "setpoint") {
+    cell.className = "left";
+    if (!shown(miner.setpoint_freq) && !shown(miner.setpoint_volt)) {
+      cell.textContent = "-";
+      return cell;
+    }
+    if (shown(miner.setpoint_freq)) addLine(cell, `${miner.setpoint_freq} MHz`);
+    if (shown(miner.setpoint_volt)) {
+      const limit = shown(miner.setpoint_limit) ? ` \u00b7 ${miner.setpoint_limit}` : "";
+      addLine(cell, `${miner.setpoint_volt} mV${limit}`, "muted");
+    }
+    return cell;
+  }
   if (column === "up") cell.className = "quiet";
   const value = miner[column];
   cell.textContent = value == null || value === "" ? "-" : value;
@@ -485,7 +498,7 @@ function renderFleet(fleet, miners) {
   fleetEl.replaceChildren();
   addStat(fleetEl, "Online", String(fleet.online));
   if (fleet.offline) addStat(fleetEl, "Offline", String(fleet.offline), "offline");
-  if (shown(fleet.hash)) addStat(fleetEl, "Hash", `${fleet.hash} GH/s`);
+  if (shown(fleet.hash)) addStat(fleetEl, "Hash", fleet.hash);
   if (shown(fleet.watts)) addStat(fleetEl, "Power", `${fleet.watts} W`);
   if (shown(fleet.jth)) addStat(fleetEl, "", fleet.jth, "", "", "J/TH");
   if (fleet.hold) addStat(fleetEl, "Holding", String(fleet.hold), "hold");
@@ -494,8 +507,18 @@ function renderFleet(fleet, miners) {
   if (strip) strip.hidden = false;
 }
 
+let configErrorShown = false;
+
 function applySnapshot(snapshot) {
   lastSnapshot = snapshot;
+  if (snapshot.config_error && !configErrorShown) {
+    configErrorShown = true;
+    showNotice({
+      title: "Config file damaged",
+      message: snapshot.config_error,
+      level: "error",
+    });
+  }
   applyControls(snapshot.controls || lastSnapshot.controls);
   if (selectedIp && !(snapshot.miners || []).some((miner) => miner.ip === selectedIp)) {
     selectedIp = "";

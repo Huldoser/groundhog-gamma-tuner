@@ -292,17 +292,15 @@ def wall_type_from_reason(reason):
 def _thermal_frequency_steps(overshoot, tolerance):
     """How many frequency steps to shed for this many degrees over a cap.
 
-    One step inside a single tolerance band, two inside two bands, and three
-    past that. A zero tolerance still sheds one step.
+    One step per tolerance band, with no cap, so a large overshoot sheds more
+    than three steps. A zero tolerance still sheds one step.
     """
     if overshoot <= 0:
         return 1
     band = tolerance if tolerance and tolerance > 0 else 0
-    if band <= 0 or overshoot <= band:
+    if band <= 0:
         return 1
-    if overshoot <= (2 * band):
-        return 2
-    return 3
+    return max(1, int((overshoot + band - 1) // band))
 
 
 def _step_down(
@@ -346,6 +344,22 @@ def _power_fault_set(value):
     return bool(value)
 
 
+def _usable_temp(value):
+    """ASIC temperature in °C, or None when the sensor is missing or not positive."""
+    number = _as_float(value)
+    if number is None or number <= 0:
+        return None
+    return number
+
+
+def _usable_core_voltage(value):
+    """Measured core voltage in mV, or None when it is missing or not positive."""
+    number = _as_float(value)
+    if number is None or number <= 0:
+        return None
+    return number
+
+
 def _needs_immediate_retreat(
     temp,
     vr_temp,
@@ -364,19 +378,22 @@ def _needs_immediate_retreat(
     """True when a confirmed setpoint should step down without waiting out a climb interval.
 
     A watt-cap breach steps down on the next poll, by one frequency step. Error retreats
-    still wait, so a noisy error sample cannot walk the clocks down.
+    still wait, so a noisy error sample cannot walk the clocks down. A missing ASIC
+    temperature or power reading does not hide a breach on the sensors that did report.
     """
-    if temp is None or power is None:
-        return False
-    if _overheat_mode_set(overheat_mode) or power <= 0.5:
-        return False
-    if float(temp) > max_temp:
-        return True
+    temp_value = _usable_temp(temp)
+    power_value = _as_float(power)
     vr_value = _as_float(vr_temp)
+    if temp_value is not None and temp_value > max_temp:
+        return True
     if vr_value is not None and vr_value > max_vr_temp:
         return True
-    if float(power) > max_watts:
+    if power_value is not None and power_value > max_watts:
         return True
+    if _overheat_mode_set(overheat_mode) or (
+        power_value is not None and power_value <= 0.5
+    ):
+        return False
     if (
         min_input_voltage is not None
         and input_voltage is not None
@@ -385,7 +402,7 @@ def _needs_immediate_retreat(
         return True
     if _power_fault_set(power_fault):
         return True
-    actual_voltage = _as_float(core_voltage_actual)
+    actual_voltage = _usable_core_voltage(core_voltage_actual)
     droop_limit = _as_float(max_droop_mv)
     if (
         actual_voltage is not None
@@ -463,9 +480,11 @@ def measured_hashrate(info):
 
 
 # BM1370 self-test treats delivered hashrate under 85% of expected as a miss.
-# hashRate_10m covers ten minutes, so it is only compared after the clocks have
-# been sitting still for that long.
+# hashRate_1m is the last minute of samples. A climb compares it once this
+# setpoint has been confirmed for that long. hashRate_10m replaces it after
+# the clocks have been still for ten minutes.
 HASHRATE_SHORTFALL_RATIO = 0.85
+HASHRATE_1M_SETTLE_SECONDS = 60
 HASHRATE_10M_SETTLE_SECONDS = 10 * 60
 
 # Pool reject share that steps frequency down. Stale and non-silicon results are left out.
@@ -897,7 +916,8 @@ def decide_adjustment(
     a thermal retreat and blocks the next climb until the caller clears it.
     `blocked_frequency` is a clock that just failed for errors or rejects. The climb
     stops short of it until the caller clears the block.
-    A missing regulator temperature blocks climbs and voltage increases.
+    A missing ASIC or regulator temperature blocks climbs and voltage increases.
+    A breach on any sensor that did report still steps down.
     `tier_list`, `expected_hashrate`, and `shares_rejected_delta` stay in the
     signature so older callers keep working.
     """
@@ -908,21 +928,11 @@ def decide_adjustment(
     vr_tolerance = vr_temp_tolerance if vr_temp_tolerance is not None else 0
     phase = phase or "climb"
 
-    if temp is None or power is None:
-        return current_frequency, current_voltage, "holding for telemetry"
-
-    if _overheat_mode_set(overheat_mode) or power <= 0.5:
-        return (
-            current_frequency,
-            current_voltage,
-            "holding while the miner is offline or in overheat mode",
-        )
-
-    temp_value = float(temp)
+    temp_value = _usable_temp(temp)
     vr_value = _as_float(vr_temp)
-    power_value = float(power)
-    over_temp = temp_value > max_temp
-    over_power = power_value > max_watts
+    power_value = _as_float(power)
+    over_temp = temp_value is not None and temp_value > max_temp
+    over_power = power_value is not None and power_value > max_watts
     over_vr = vr_value is not None and vr_value > max_vr_temp
     if over_temp or over_power or over_vr:
         tag = None if (over_temp or over_vr) else "power limit"
@@ -949,6 +959,15 @@ def decide_adjustment(
             voltage_step,
             tag,
             frequency_steps,
+        )
+
+    if _overheat_mode_set(overheat_mode) or (
+        power_value is not None and power_value <= 0.5
+    ):
+        return (
+            current_frequency,
+            current_voltage,
+            "holding while the miner is offline or in overheat mode",
         )
 
     if (
@@ -981,7 +1000,7 @@ def decide_adjustment(
             "power fault",
         )
 
-    actual_voltage = _as_float(core_voltage_actual)
+    actual_voltage = _usable_core_voltage(core_voltage_actual)
     droop_limit = _as_float(max_droop_mv)
     if (
         actual_voltage is not None
@@ -999,6 +1018,9 @@ def decide_adjustment(
             voltage_step,
             "core voltage droop",
         )
+
+    if temp_value is None or power_value is None:
+        return current_frequency, current_voltage, "holding for telemetry"
 
     rate = _as_float(hash_rate)
     if rate is not None and rate <= 0:
@@ -1233,12 +1255,90 @@ def _apply_fan(bitaxe_ip, payload, log_callback):
         log_callback(f"{bitaxe_ip} -> Fan update failed: {error}", "warning")
 
 
+MANUAL_FULL_FAN = {"autofanspeed": 0, "fanspeed": 100}
+
+
+def _fan_is_manual_full(info):
+    """True when AxeOS reports manual fan control at 100%."""
+    if not isinstance(info, dict):
+        return False
+    if "autofanspeed" not in info or "fanspeed" not in info:
+        return False
+    if _overheat_mode_set(info.get("autofanspeed")):
+        return False
+    speed = _as_float(info.get("fanspeed"))
+    return speed is not None and speed >= 100
+
+
 def _reports_error_percentage(info):
     return (
         isinstance(info, dict)
         and "errorPercentage" in info
         and info.get("errorPercentage") is not None
     )
+
+
+def _is_safety_retreat(reason):
+    """True for heat, power, sag, fault, or droop. Quality retreats stay in the session."""
+    text = (reason or "").lower()
+    if not (text.startswith("step frequency") or text.startswith("step voltage")):
+        return False
+    return not any(
+        tag in text for tag in ("silicon", "hashrate", "above target", "rejected")
+    )
+
+
+def opening_setpoint(
+    frequency,
+    voltage,
+    info,
+    limits,
+    frequency_step,
+    voltage_step,
+    temp_tolerance,
+    vr_temp_tolerance,
+    min_input_voltage,
+    max_error_percentage,
+    max_droop_mv,
+):
+    """Clocks for the first write. A live breach lowers them. A cool chip does not climb."""
+    if not isinstance(info, dict):
+        return frequency, voltage, ""
+    new_frequency, new_voltage, reason = decide_adjustment(
+        current_frequency=frequency,
+        current_voltage=voltage,
+        min_freq=limits["min_freq"],
+        max_freq=limits["max_freq"],
+        min_volt=limits["min_volt"],
+        max_volt=limits["max_volt"],
+        max_temp=limits["max_temp"],
+        max_watts=limits["max_watts"],
+        max_vr_temp=limits["max_vr_temp"],
+        temp=info.get("temp") if "temp" in info else None,
+        vr_temp=info.get("vrTemp") if "vrTemp" in info else None,
+        power=info.get("power") if "power" in info else None,
+        hash_rate=measured_hashrate(info),
+        expected_hashrate=expected_hashrate_from_info(info, frequency),
+        shares_rejected_delta=0,
+        overheat_mode=info.get("overheat_mode"),
+        frequency_step=frequency_step,
+        voltage_step=voltage_step,
+        temp_tolerance=temp_tolerance,
+        error_percentage=_as_float(info.get("errorPercentage")),
+        input_voltage=normalize_input_voltage(info.get("voltage")),
+        min_input_voltage=min_input_voltage,
+        core_voltage_actual=info.get("coreVoltageActual"),
+        max_droop_mv=max_droop_mv,
+        power_fault=info.get("power_fault"),
+        phase="climb",
+        max_error_percentage=max_error_percentage,
+        vr_temp_tolerance=vr_temp_tolerance,
+    )
+    if (new_frequency < frequency or new_voltage < voltage) and _is_safety_retreat(
+        reason
+    ):
+        return new_frequency, new_voltage, reason
+    return frequency, voltage, ""
 
 
 def monitor_and_adjust(
@@ -1356,10 +1456,70 @@ def monitor_and_adjust(
             "info",
         )
 
-    _apply_fan(bitaxe_ip, {"autofanspeed": 0, "fanspeed": 100}, log_callback)
-
     runtime = load_config()
-    refresh_interval = runtime.get("refresh_interval", 180)
+    interval = _non_negative_float(runtime.get("monitor_interval", interval), 5)
+    frequency_step = _positive_int(runtime.get("frequency_step"), 5)
+    voltage_step = _positive_int(runtime.get("voltage_step"), 10)
+    temp_tolerance = _non_negative_float(runtime.get("temp_tolerance"), 3)
+    vr_temp_tolerance = _non_negative_float(runtime.get("vr_temp_tolerance"), 3)
+    refresh_interval = _non_negative_float(runtime.get("refresh_interval"), 180)
+    resume_frequency = start_frequency
+    resume_voltage = start_voltage
+
+    def _opening_from(sample):
+        return opening_setpoint(
+            resume_frequency,
+            resume_voltage,
+            sample,
+            limits,
+            frequency_step,
+            voltage_step,
+            temp_tolerance,
+            vr_temp_tolerance,
+            min_input_voltage,
+            max_error_percentage,
+            max_droop_mv,
+        )
+
+    _apply_fan(bitaxe_ip, dict(MANUAL_FULL_FAN), log_callback)
+    start_frequency, start_voltage, opening_reason = _opening_from(info)
+    # A downward opening is applied even if the fan has not read back yet.
+    # An overclock waits until AxeOS reports manual 100%.
+    if not opening_reason and not _fan_is_manual_full(info):
+        while not event.is_set():
+            if _wait(event, interval):
+                break
+            try:
+                polled = get_system_info(bitaxe_ip)
+            except Exception as exc:
+                log_callback(f"{bitaxe_ip} -> UNCAUGHT ERROR: {exc}", "error")
+                continue
+            if isinstance(polled, str) or not isinstance(polled, dict):
+                log_callback(
+                    polled
+                    if isinstance(polled, str)
+                    else f"{bitaxe_ip} -> Unexpected system info format: {polled}",
+                    "error",
+                )
+                continue
+            info = polled
+            start_frequency, start_voltage, opening_reason = _opening_from(info)
+            if opening_reason or _fan_is_manual_full(info):
+                break
+            _apply_fan(bitaxe_ip, dict(MANUAL_FULL_FAN), log_callback)
+            log_callback(
+                f"{bitaxe_ip} -> Waiting for the fan to hold manual 100%.",
+                "info",
+            )
+    if event.is_set() or (not opening_reason and not _fan_is_manual_full(info)):
+        log_callback(f"{bitaxe_ip} -> Autotuning stopped.", "warning")
+        return
+    if opening_reason:
+        log_callback(
+            f"{bitaxe_ip} -> Live sample is over a limit. "
+            f"Opening at {start_frequency} MHz / {start_voltage} mV.",
+            "warning",
+        )
     applied_settings = set_system_settings(bitaxe_ip, start_voltage, start_frequency)
     log_callback(applied_settings, "info")
 
@@ -1387,10 +1547,12 @@ def monitor_and_adjust(
     ceiling_saved = False
     limit_wall = record.get("wall_type") or ""
     # Frequency step or voltage trim waiting on a settled good-hashrate reading.
-    # hash_ceiling is the last clock that still paid, and only after the higher
-    # clock failed at max voltage or while a thermal retreat is latched.
+    # hash_ceiling is the last clock that still paid, after a higher clock
+    # failed for hashrate. A request whose PLL did not move is not a ceiling:
+    # pll_retry_frequency is the next request to try.
     probe = None
     hash_ceiling = None
+    pll_retry_frequency = None
     blocked_frequency = None
     blocked_voltage = None
     blocked_needs_cool = False
@@ -1403,6 +1565,7 @@ def monitor_and_adjust(
     zero_restarted = False
     flatline_restarted = False
     thermal_hold = False
+    fan_retry_at = 0.0
     setpoint_since = None
     last_accepted = None
     last_rejected = None
@@ -1452,6 +1615,10 @@ def monitor_and_adjust(
                 if _wait(event, interval):
                     break
                 continue
+
+            if not _fan_is_manual_full(info) and time.time() >= fan_retry_at:
+                _apply_fan(bitaxe_ip, dict(MANUAL_FULL_FAN), log_callback)
+                fan_retry_at = time.time() + max(float(interval or 0), 0)
 
             reported_frequency = info.get("frequency")
             reported_voltage = info.get("coreVoltage")
@@ -1674,13 +1841,16 @@ def monitor_and_adjust(
             window_positive_hash = False
 
             hashrate_short = False
-            if (
-                setpoint_since is not None
-                and (time.time() - setpoint_since) >= HASHRATE_10M_SETTLE_SECONDS
-            ):
-                hashrate_short = hashrate_well_below_expected(
-                    info.get("hashRate_10m"), expected_hashrate
-                )
+            if setpoint_since is not None:
+                settled_for = time.time() - setpoint_since
+                if settled_for >= HASHRATE_10M_SETTLE_SECONDS:
+                    hashrate_short = hashrate_well_below_expected(
+                        info.get("hashRate_10m"), expected_hashrate
+                    )
+                elif settled_for >= HASHRATE_1M_SETTLE_SECONDS:
+                    hashrate_short = hashrate_well_below_expected(
+                        info.get("hashRate_1m"), expected_hashrate
+                    )
 
             error_budget = max_error_percentage
             error_ok = (
@@ -1738,6 +1908,12 @@ def monitor_and_adjust(
                         info.get("actualFrequency"),
                         band,
                     )
+                # A step that held its hashrate can still be under the self-test
+                # fraction. That is not a keep. The 1-minute check is what makes
+                # this true during a climb; the 10-minute rate is not settled yet.
+                under_expected = paid is True and kind != "trim" and hashrate_short
+                if under_expected:
+                    paid = False
                 if paid is None:
                     log_callback(f"{bitaxe_ip} -> holding for good hashrate.", "info")
                     last_tune_time = time.time()
@@ -1770,12 +1946,20 @@ def monitor_and_adjust(
                         and _as_float(vr_temp) is not None
                         and confirmed[1] < limits["max_volt"]
                     )
+                    retry_frequency = failed_frequency + frequency_step
+                    pll_can_retry = (
+                        clock_stuck and retry_frequency <= limits["max_freq"]
+                    )
+                    short_text = (
+                        f"under {int(HASHRATE_SHORTFALL_RATIO * 100)}% of expected"
+                    )
                     if can_raise_voltage:
                         raised_voltage = min(
                             limits["max_volt"], confirmed[1] + voltage_step
                         )
+                        miss = short_text if under_expected else "lost good hashrate"
                         log_callback(
-                            f"{bitaxe_ip} -> {failed_frequency} MHz lost good hashrate. "
+                            f"{bitaxe_ip} -> {failed_frequency} MHz {miss}. "
                             f"Raising voltage to {raised_voltage} mV and retrying.",
                             "info",
                         )
@@ -1814,12 +1998,23 @@ def monitor_and_adjust(
                             f"Restoring {back_voltage} mV.",
                             "info",
                         )
+                    elif pll_can_retry:
+                        log_callback(
+                            f"{bitaxe_ip} -> {failed_frequency} MHz did not move the PLL "
+                            f"({actual_now:g} MHz). Next request is {retry_frequency} MHz.",
+                            "info",
+                        )
                     else:
                         clock_note = (
                             f" PLL stayed at {actual_now:g} MHz." if clock_stuck else ""
                         )
+                        miss = (
+                            short_text
+                            if under_expected
+                            else "did not hold good hashrate"
+                        )
                         log_callback(
-                            f"{bitaxe_ip} -> {failed_frequency} MHz did not hold good hashrate. "
+                            f"{bitaxe_ip} -> {failed_frequency} MHz {miss}. "
                             f"Stepping back to {back_frequency} MHz.{clock_note}",
                             "info",
                         )
@@ -1854,16 +2049,18 @@ def monitor_and_adjust(
                                 f"{bitaxe_ip} -> Holding {back_frequency} MHz / {back_voltage} mV.",
                                 "success",
                             )
+                        elif pll_can_retry:
+                            pll_retry_frequency = retry_frequency
+                            retreat_reason = "retry frequency"
                         else:
                             hash_ceiling = back_frequency
+                            pll_retry_frequency = None
                             limit_wall = wall_type_from_reason(
                                 "step frequency down after good hashrate"
                             )
-                        retreat_reason = (
-                            "restore voltage"
-                            if kind == "trim"
-                            else "step frequency down after good hashrate"
-                        )
+                            retreat_reason = "step frequency down after good hashrate"
+                        if kind == "trim":
+                            retreat_reason = "restore voltage"
                         _publish_status(
                             bitaxe_ip,
                             phase=phase,
@@ -1886,6 +2083,7 @@ def monitor_and_adjust(
                         "success",
                     )
                 probe = None
+                pll_retry_frequency = None
 
             climb_cap = limits["max_freq"]
             if hash_ceiling is not None:
@@ -1925,37 +2123,40 @@ def monitor_and_adjust(
                 "above_target_high": above_target_high,
             }
 
-            pll_frequency = rounded_pll_frequency(info.get("actualFrequency"))
-            decision_frequency = (
-                pll_frequency if pll_frequency is not None else confirmed[0]
-            )
-            new_frequency, new_voltage, reason = decide_adjustment(
-                decision_frequency, confirmed[1], **decision
-            )
             reported_frequency_number = _as_float(reported_frequency)
             reported_voltage_number = _as_float(reported_voltage)
-            jump_frequency = (
-                pll_frequency
-                if pll_frequency is not None
-                else (
-                    int(reported_frequency_number)
-                    if reported_frequency_number is not None
-                    else None
+            new_frequency, new_voltage, reason = decide_adjustment(
+                confirmed[0], confirmed[1], **decision
+            )
+            report_frequency = (
+                int(reported_frequency_number)
+                if reported_frequency_number is not None
+                else None
+            )
+            # The PLL judges whether the last step moved. The next request stays
+            # within one frequency step of the last confirmed setpoint, or follows
+            # the miner's own frequency field when that setpoint is stale.
+            follow_report = (
+                report_frequency is not None
+                and reported_voltage_number is not None
+                and (
+                    _proposal_jumps_above_report(
+                        new_frequency,
+                        new_voltage,
+                        report_frequency,
+                        int(reported_voltage_number),
+                        frequency_step,
+                        voltage_step,
+                    )
+                    or (
+                        new_frequency < confirmed[0]
+                        and report_frequency < confirmed[0]
+                        and new_frequency >= report_frequency
+                    )
                 )
             )
-            if (
-                jump_frequency is not None
-                and reported_voltage_number is not None
-                and _proposal_jumps_above_report(
-                    new_frequency,
-                    new_voltage,
-                    jump_frequency,
-                    int(reported_voltage_number),
-                    frequency_step,
-                    voltage_step,
-                )
-            ):
-                confirmed = (jump_frequency, int(reported_voltage_number))
+            if follow_report:
+                confirmed = (report_frequency, int(reported_voltage_number))
                 log_callback(
                     f"{bitaxe_ip} -> Reported {confirmed[0]} MHz / {confirmed[1]} mV. "
                     "Following the miner instead of jumping.",
@@ -1968,13 +2169,25 @@ def monitor_and_adjust(
                     new_frequency = confirmed[0] + frequency_step
                 if new_voltage > confirmed[1] + voltage_step:
                     new_voltage = confirmed[1] + voltage_step
-                decision_frequency = confirmed[0]
 
-            if _same_setpoint(
-                (new_frequency, new_voltage), (decision_frequency, confirmed[1])
+            if reason in ("increase voltage", "trim voltage", "restore voltage"):
+                new_frequency = confirmed[0]
+            if (
+                pll_retry_frequency is not None
+                and reason == "increase frequency"
+                and confirmed[0] < pll_retry_frequency <= climb_cap
+                and new_frequency < pll_retry_frequency
             ):
+                new_frequency = pll_retry_frequency
+            elif (
+                reason == "increase frequency"
+                and new_frequency > confirmed[0] + frequency_step
+            ):
+                new_frequency = confirmed[0] + frequency_step
+            if reason == "increase frequency" and new_frequency < confirmed[0]:
                 new_frequency = confirmed[0]
                 new_voltage = confirmed[1]
+                reason = "holding"
 
             if (
                 reason == "increase frequency"
@@ -1983,6 +2196,13 @@ def monitor_and_adjust(
                 new_frequency = confirmed[0]
                 new_voltage = confirmed[1]
                 reason = "holding for good hashrate"
+
+            if reason in ("increase frequency", "increase voltage") and not (
+                _fan_is_manual_full(info)
+            ):
+                new_frequency = confirmed[0]
+                new_voltage = confirmed[1]
+                reason = "holding for fan"
 
             if reason == "holding at zero hashrate":
                 _publish_status(
@@ -2084,6 +2304,11 @@ def monitor_and_adjust(
                 log_callback(applied_settings, "info")
                 last_tune_time = time.time()
                 if settings_were_applied(applied_settings):
+                    if new_frequency < confirmed[0] or (
+                        pll_retry_frequency is not None
+                        and new_frequency >= pll_retry_frequency
+                    ):
+                        pll_retry_frequency = None
                     if reason == "increase frequency":
                         probe = {
                             "kind": "frequency",
