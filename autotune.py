@@ -67,12 +67,17 @@ def _clear_miner_status(ip):
 
 
 def _reset_one_miner_to_baseline(miner, log_callback):
-    """Write factory clocks for one miner and forget its learned setpoint."""
+    """Write factory clocks for one miner and forget its learned setpoint.
+
+    Returns False when the miner did not accept the write. An empty address
+    is not a failure.
+    """
     ip = (miner or {}).get("ip")
     if not ip:
-        return
+        return True
     message = set_system_settings(ip, STOCK_VOLT, STOCK_FREQ)
-    log_callback(message, "success" if settings_were_applied(message) else "error")
+    applied = settings_were_applied(message)
+    log_callback(message, "success" if applied else "error")
     update_miner(
         ip,
         {
@@ -86,6 +91,7 @@ def _reset_one_miner_to_baseline(miner, log_callback):
         },
     )
     _clear_miner_status(ip)
+    return applied
 
 
 def reset_miners_to_baseline(
@@ -96,33 +102,48 @@ def reset_miners_to_baseline(
     A failed write is logged and does not skip clearing that miner or the ones after it.
     Min, max, temperature, and power limits are left as the user set them.
     parallel=True starts every write together and ignores the stagger.
+    Returns how many miners rejected the write.
     """
     miners = list(miners or [])
+    failed = 0
+    failed_lock = threading.Lock()
+
+    def run(miner):
+        nonlocal failed
+        if _reset_one_miner_to_baseline(miner, log_callback):
+            return
+        with failed_lock:
+            failed += 1
+
     if parallel:
         threads = []
         for miner in miners:
-            thread = threading.Thread(
-                target=_reset_one_miner_to_baseline,
-                args=(miner, log_callback),
-                daemon=True,
-            )
+            thread = threading.Thread(target=run, args=(miner,), daemon=True)
             thread.start()
             threads.append(thread)
         for thread in threads:
             thread.join()
-        return
+        return failed
     for index, miner in enumerate(miners):
         if index > 0 and stagger_seconds:
             time.sleep(stagger_seconds)
-        _reset_one_miner_to_baseline(miner, log_callback)
+        run(miner)
+    return failed
+
+
+def restart_was_accepted(message):
+    """True when restart_bitaxe did not return an error string."""
+    return isinstance(message, str) and "Error restarting system" not in message
 
 
 def restart_miners(miners, log_callback, stagger_seconds=STARTUP_STAGGER_SECONDS):
     """POST a restart for each saved miner.
 
     A failed restart is logged and does not skip the miners after it.
+    Returns how many restarts were rejected.
     """
     started = 0
+    failed = 0
     for miner in list(miners or []):
         ip = str((miner or {}).get("ip") or "").strip()
         if not ip:
@@ -131,7 +152,11 @@ def restart_miners(miners, log_callback, stagger_seconds=STARTUP_STAGGER_SECONDS
             time.sleep(stagger_seconds)
         started += 1
         log_callback(f"Restarting miner at {ip}...", "warning")
-        log_callback(restart_bitaxe(ip), "warning")
+        message = restart_bitaxe(ip)
+        log_callback(message, "warning")
+        if not restart_was_accepted(message):
+            failed += 1
+    return failed
 
 
 def _wait(stop_event, seconds):
@@ -280,6 +305,8 @@ def wall_type_from_reason(reason):
         return "silicon"
     if "power limit" in text or "power fault" in text or "droop" in text:
         return "power"
+    if "frequency cap" in text:
+        return ""
     if (
         text.startswith("step frequency")
         or text.startswith("step voltage")
@@ -336,6 +363,34 @@ def _overheat_mode_set(value):
         return bool(value)
 
 
+def overheat_ready_to_clear(info, max_temp, max_vr_temp):
+    """True when a sticky overheat flag can be cleared.
+
+    Both sensors have a positive reading at or under their caps, and the
+    board is drawing more than the idle floor. A powered-down Gamma 601
+    reports no ASIC temperature, so that latch stays.
+    """
+    if not isinstance(info, dict) or not _overheat_mode_set(info.get("overheat_mode")):
+        return False
+    temp = _usable_temp(info.get("temp"))
+    vr_temp = _usable_temp(info.get("vrTemp"))
+    power = _as_float(info.get("power"))
+    temp_cap = _as_float(max_temp)
+    vr_cap = _as_float(max_vr_temp)
+    if (
+        temp is None
+        or vr_temp is None
+        or power is None
+        or temp_cap is None
+        or vr_cap is None
+        or power <= 0.5
+        or temp > temp_cap
+        or vr_temp > vr_cap
+    ):
+        return False
+    return True
+
+
 def _power_fault_set(value):
     if value is None or value is False:
         return False
@@ -345,7 +400,7 @@ def _power_fault_set(value):
 
 
 def _usable_temp(value):
-    """ASIC temperature in °C, or None when the sensor is missing or not positive."""
+    """Temperature in °C, or None when the sensor is missing or not positive."""
     number = _as_float(value)
     if number is None or number <= 0:
         return None
@@ -375,7 +430,7 @@ def _needs_immediate_retreat(
     power_fault,
     overheat_mode,
 ):
-    """True when a confirmed setpoint should step down without waiting out a climb interval.
+    """True when the clocks the miner is running should step down without waiting.
 
     A watt-cap breach steps down on the next poll, by one frequency step. Error retreats
     still wait, so a noisy error sample cannot walk the clocks down. A missing ASIC
@@ -383,7 +438,7 @@ def _needs_immediate_retreat(
     """
     temp_value = _usable_temp(temp)
     power_value = _as_float(power)
-    vr_value = _as_float(vr_temp)
+    vr_value = _usable_temp(vr_temp)
     if temp_value is not None and temp_value > max_temp:
         return True
     if vr_value is not None and vr_value > max_vr_temp:
@@ -477,6 +532,46 @@ def measured_hashrate(info):
     if live is not None and live > 0:
         return live
     return None
+
+
+def _reported_rate(info, key):
+    """(present, value). Present is false when the miner omitted the field."""
+    if not isinstance(info, dict) or key not in info or info.get(key) is None:
+        return False, None
+    return True, _as_float(info.get(key))
+
+
+def board_hashrate_is_dead(info):
+    """True when the latest reported rates are not positive.
+
+    A 1-minute rate of 0 with a positive live rate is not dead: the live
+    rate is still hashing. A missing field is not a zero. The session uses
+    this so an earlier positive sample cannot hide a board that has stopped.
+    """
+    minute_present, minute = _reported_rate(info, "hashRate_1m")
+    live_present, live = _reported_rate(info, "hashRate")
+    live_positive = live is not None and live > 0
+    minute_positive = minute is not None and minute > 0
+    if minute_present:
+        if minute_positive or live_positive:
+            return False
+        return True
+    if live_present:
+        return not live_positive
+    return False
+
+
+def minute_rate_failed(info):
+    """True when the 1-minute rate is present and not positive, but live hashrate is.
+
+    That is a failed sample for an open probe, not a missing one and not a
+    dead board.
+    """
+    minute_present, minute = _reported_rate(info, "hashRate_1m")
+    if not minute_present or (minute is not None and minute > 0):
+        return False
+    _live_present, live = _reported_rate(info, "hashRate")
+    return live is not None and live > 0
 
 
 # BM1370 self-test treats delivered hashrate under 85% of expected as a miss.
@@ -769,6 +864,72 @@ def reject_share(accepted_delta, rejected_delta, stale_delta=0):
     return bad / total
 
 
+# Heat uses temp_tolerance as the gap under the cap. Power and droop have no
+# tolerance field, so a retreat does not climb again until the reading is
+# back inside the cap by this margin. Input releases at its floor.
+POWER_HOLD_MARGIN_WATTS = 1
+DROOP_HOLD_MARGIN_MV = 5
+
+
+def _at_or_under(value, cap, margin):
+    """True when `value` is at or under `cap` minus a non-negative margin."""
+    reading = _as_float(value)
+    limit = _as_float(cap)
+    if reading is None or limit is None:
+        return False
+    gap = _as_float(margin)
+    if gap is None or gap < 0:
+        gap = 0
+    if gap > limit:
+        gap = 0
+    return reading <= (limit - gap)
+
+
+def safety_hold_cleared(
+    power,
+    max_watts,
+    input_voltage,
+    min_input_voltage,
+    core_voltage_actual,
+    current_voltage,
+    max_droop_mv,
+    power_fault,
+):
+    """True when a power, sag, droop, or fault hold may release.
+
+    Power and droop have to be back inside their caps. Input has to be back
+    at its floor. A power fault or a missing power reading keeps the hold.
+    A missing input or core-voltage reading does not, once the readings that
+    did arrive are inside their limits.
+    """
+    if _power_fault_set(power_fault):
+        return False
+    if not _at_or_under(power, max_watts, POWER_HOLD_MARGIN_WATTS):
+        return False
+    if (
+        min_input_voltage is not None
+        and input_voltage is not None
+        and input_voltage < min_input_voltage
+    ):
+        return False
+    actual = _usable_core_voltage(core_voltage_actual)
+    droop_limit = _as_float(max_droop_mv)
+    if actual is not None and droop_limit is not None and current_voltage is not None:
+        if not _at_or_under(
+            current_voltage - actual, droop_limit, DROOP_HOLD_MARGIN_MV
+        ):
+            return False
+    return True
+
+
+def _safety_hold_kind(reason):
+    """'power' or 'input' when this retreat should block the next climb."""
+    wall = wall_type_from_reason(reason)
+    if wall in ("power", "input"):
+        return wall
+    return ""
+
+
 def cooled_after_retreat(
     temp, vr_temp, max_temp, max_vr_temp, temp_tolerance, vr_temp_tolerance
 ):
@@ -777,13 +938,13 @@ def cooled_after_retreat(
     A missing regulator reading does not keep the latch. The climb still waits
     for that sensor on its own.
     """
-    temp_value = _as_float(temp)
+    temp_value = _usable_temp(temp)
     if temp_value is None:
         return False
     asic_band = temp_tolerance if temp_tolerance and temp_tolerance > 0 else 0
     if temp_value > (max_temp - asic_band):
         return False
-    vr_value = _as_float(vr_temp)
+    vr_value = _usable_temp(vr_temp)
     if vr_value is None:
         return True
     vr_band = vr_temp_tolerance if vr_temp_tolerance and vr_temp_tolerance > 0 else 0
@@ -826,11 +987,59 @@ def _guard_bounds(
     max_volt,
     reason,
 ):
-    new_frequency = _clamp(int(new_frequency), min_freq, max_freq)
+    requested = int(new_frequency)
+    new_frequency = _clamp(requested, min_freq, max_freq)
+    # A min above the live clock must not turn a retreat into a higher frequency.
+    # A climb proposal is already above the live clock and is left alone.
+    if new_frequency > current_frequency and requested <= current_frequency:
+        new_frequency = current_frequency
     new_voltage = _clamp(int(new_voltage), min_volt, max_volt)
     if new_frequency < current_frequency and new_voltage > current_voltage:
         new_voltage = current_voltage
     return new_frequency, new_voltage, reason
+
+
+def _apply_frequency_cap(
+    current_frequency,
+    current_voltage,
+    min_freq,
+    max_freq,
+    min_volt,
+    max_volt,
+    frequency_step,
+    voltage_step,
+):
+    """Step a live clock down onto a max frequency it is already above.
+
+    The floor for this drop is the cap, so one decision lands on the cap
+    instead of walking under it. Voltage stays put.
+    """
+    gap = int(current_frequency) - int(max_freq)
+    steps = max(1, (gap + frequency_step - 1) // frequency_step)
+    new_frequency, new_voltage, step_reason = _step_down(
+        current_frequency,
+        current_voltage,
+        max_freq,
+        min_volt,
+        frequency_step,
+        voltage_step,
+        steps,
+    )
+    if step_reason == "holding at minimum":
+        chosen = "frequency ceiling"
+    else:
+        chosen = "step frequency down after frequency cap"
+    return _guard_bounds(
+        current_frequency,
+        current_voltage,
+        new_frequency,
+        new_voltage,
+        min_freq,
+        max_freq,
+        min_volt,
+        max_volt,
+        chosen,
+    )
 
 
 def _apply_step_down(
@@ -903,21 +1112,26 @@ def decide_adjustment(
     max_error_percentage=DEFAULT_MAX_ERROR_PERCENTAGE,
     vr_temp_tolerance=3,
     thermal_hold=False,
+    safety_hold=False,
     reject_share=None,
     max_reject_share=DEFAULT_MAX_REJECT_SHARE,
     hashrate_short=False,
     blocked_frequency=None,
     above_target_high=False,
+    droop_voltage=None,
 ):
     """Choose the next frequency and voltage.
 
     Returns (frequency, voltage, reason). Voltage is never raised while stepping down.
     Climb while both sensors are at or under their caps. `thermal_hold` is set after
     a thermal retreat and blocks the next climb until the caller clears it.
+    `safety_hold` does the same after a power, sag, droop, or fault retreat.
     `blocked_frequency` is a clock that just failed for errors or rejects. The climb
     stops short of it until the caller clears the block.
     A missing ASIC or regulator temperature blocks climbs and voltage increases.
     A breach on any sensor that did report still steps down.
+    `droop_voltage` scores sag against an earlier setpoint. The step still uses
+    the live voltage. Pass it for one settle after a voltage raise.
     `tier_list`, `expected_hashrate`, and `shares_rejected_delta` stay in the
     signature so older callers keep working.
     """
@@ -929,7 +1143,7 @@ def decide_adjustment(
     phase = phase or "climb"
 
     temp_value = _usable_temp(temp)
-    vr_value = _as_float(vr_temp)
+    vr_value = _usable_temp(vr_temp)
     power_value = _as_float(power)
     over_temp = temp_value is not None and temp_value > max_temp
     over_power = power_value is not None and power_value > max_watts
@@ -1002,10 +1216,12 @@ def decide_adjustment(
 
     actual_voltage = _usable_core_voltage(core_voltage_actual)
     droop_limit = _as_float(max_droop_mv)
+    droop_from = current_voltage if droop_voltage is None else droop_voltage
     if (
         actual_voltage is not None
         and droop_limit is not None
-        and (current_voltage - actual_voltage) > droop_limit
+        and droop_from is not None
+        and (droop_from - actual_voltage) > droop_limit
     ):
         return _apply_step_down(
             current_frequency,
@@ -1017,6 +1233,18 @@ def decide_adjustment(
             frequency_step,
             voltage_step,
             "core voltage droop",
+        )
+
+    if current_frequency > max_freq:
+        return _apply_frequency_cap(
+            current_frequency,
+            current_voltage,
+            min_freq,
+            max_freq,
+            min_volt,
+            max_volt,
+            frequency_step,
+            voltage_step,
         )
 
     if temp_value is None or power_value is None:
@@ -1080,7 +1308,12 @@ def decide_adjustment(
                 max_volt,
                 "restore voltage",
             )
-        if phase == "hold" or thermal_hold or current_voltage >= max_volt:
+        if (
+            phase == "hold"
+            or thermal_hold
+            or safety_hold
+            or current_voltage >= max_volt
+        ):
             return _apply_step_down(
                 current_frequency,
                 current_voltage,
@@ -1121,6 +1354,10 @@ def decide_adjustment(
 
     if thermal_hold and phase == "climb":
         return current_frequency, current_voltage, "holding after thermal retreat"
+
+    if safety_hold and phase == "climb":
+        kind = "input" if safety_hold == "input" else "power"
+        return current_frequency, current_voltage, f"holding after {kind} retreat"
 
     if error is None:
         return current_frequency, current_voltage, "holding for error percentage"
@@ -1192,7 +1429,7 @@ def get_system_info(bitaxe_ip):
         response = requests.get(f"http://{bitaxe_ip}/api/system/info", timeout=10)
         response.raise_for_status()
         return response.json()
-    except requests.exceptions.RequestException as e:
+    except (requests.exceptions.RequestException, ValueError) as e:
         return f"Error fetching system info from {bitaxe_ip}: {e}"
 
 
@@ -1465,6 +1702,19 @@ def monitor_and_adjust(
     refresh_interval = _non_negative_float(runtime.get("refresh_interval"), 180)
     resume_frequency = start_frequency
     resume_voltage = start_voltage
+    # After a voltage raise, score droop against the previous setpoint until
+    # this settle ends. The measured rail lags the new setpoint.
+    droop_reference = None
+    droop_grace_until = 0.0
+
+    def _arm_droop_grace(previous_voltage, new_voltage):
+        nonlocal droop_reference, droop_grace_until
+        previous = _as_float(previous_voltage)
+        updated = _as_float(new_voltage)
+        if previous is None or updated is None or updated <= previous:
+            return
+        droop_reference = int(previous)
+        droop_grace_until = last_tune_time + refresh_interval
 
     def _opening_from(sample):
         return opening_setpoint(
@@ -1537,12 +1787,17 @@ def monitor_and_adjust(
     now = time.time()
     settle_until = now + refresh_interval if pending is not None else now
     last_tune_time = now if pending is not None else 0
+    if pending is not None:
+        _arm_droop_grace(info.get("coreVoltage"), start_voltage)
 
     hashrate_history = []
     rolling_hashrate = []
     last_config_refresh = 0
     phase = "climb"
     trim_good_voltage = None
+    # A silicon frequency retreat below max voltage stays in hold until the
+    # chip looks healthy. Entering trim immediately would raise voltage.
+    trim_after_retreat = False
     hold_since = None
     ceiling_saved = False
     limit_wall = record.get("wall_type") or ""
@@ -1553,6 +1808,9 @@ def monitor_and_adjust(
     probe = None
     hash_ceiling = None
     pll_retry_frequency = None
+    # Frequency that already failed one probe because the 1-minute rate was
+    # zero while live hashrate was still up. A second miss locks the ceiling.
+    minute_retry_frequency = None
     blocked_frequency = None
     blocked_voltage = None
     blocked_needs_cool = False
@@ -1565,6 +1823,7 @@ def monitor_and_adjust(
     zero_restarted = False
     flatline_restarted = False
     thermal_hold = False
+    safety_hold = _safety_hold_kind(opening_reason)
     fan_retry_at = 0.0
     setpoint_since = None
     last_accepted = None
@@ -1767,8 +2026,35 @@ def monitor_and_adjust(
                 last_good_volt=confirmed[1] if confirmed else "",
             )
 
+            reported_frequency_number = _as_float(reported_frequency)
+            reported_voltage_number = _as_float(reported_voltage)
+            reported_clocks = None
+            if (
+                reported_frequency_number is not None
+                and reported_voltage_number is not None
+            ):
+                reported_clocks = (
+                    int(reported_frequency_number),
+                    int(reported_voltage_number),
+                )
             clocks_confirmed = pending is None and confirmed is not None
-            immediate_retreat = clocks_confirmed and _needs_immediate_retreat(
+            # An unconfirmed write still steps down from the clocks the miner
+            # is reporting. A climb keeps waiting until that write echoes.
+            retreat_clocks = (
+                reported_clocks
+                if pending is not None and reported_clocks is not None
+                else confirmed
+            )
+            if droop_reference is not None and now >= droop_grace_until:
+                droop_reference = None
+            retreat_voltage = None
+            if retreat_clocks is not None:
+                retreat_voltage = (
+                    droop_reference
+                    if droop_reference is not None
+                    else retreat_clocks[1]
+                )
+            immediate_retreat = retreat_clocks is not None and _needs_immediate_retreat(
                 _as_float(temp),
                 _as_float(vr_temp),
                 _as_float(power),
@@ -1778,12 +2064,18 @@ def monitor_and_adjust(
                 normalize_input_voltage(info.get("voltage")),
                 min_input_voltage,
                 _as_float(info.get("coreVoltageActual")),
-                confirmed[1],
+                retreat_voltage,
                 max_droop_mv,
                 info.get("power_fault"),
                 info.get("overheat_mode"),
             )
-            if not clocks_confirmed or (settling and not immediate_retreat):
+            if (
+                immediate_retreat
+                and pending is not None
+                and reported_clocks is not None
+            ):
+                confirmed = reported_clocks
+            if not immediate_retreat and (not clocks_confirmed or settling):
                 if _wait(event, interval):
                     break
                 continue
@@ -1829,7 +2121,11 @@ def monitor_and_adjust(
             if window_error is not None:
                 error_percentage = window_error
             error_samples.clear()
-            if window_zero_hash and not window_positive_hash:
+            # The latest sample wins. An earlier positive rate in this window
+            # must not keep a dead board looking healthy.
+            if board_hashrate_is_dead(info):
+                average_hashrate = 0
+            elif window_zero_hash and not window_positive_hash:
                 average_hashrate = 0
             else:
                 average_hashrate = (
@@ -1858,6 +2154,19 @@ def monitor_and_adjust(
                 and error_percentage <= error_budget
                 and not hashrate_short
             )
+            if (
+                trim_after_retreat
+                and error_ok
+                and probe is None
+                and confirmed is not None
+            ):
+                # The retreated clock is healthy. Trim can lower voltage now.
+                # Doing this while errors are still high would raise voltage.
+                if phase == "hold":
+                    phase = "trim"
+                    hold_since = None
+                    ceiling_saved = False
+                trim_after_retreat = False
             if phase == "trim" and error_ok and probe is None:
                 trim_good_voltage = confirmed[1]
 
@@ -1871,6 +2180,17 @@ def monitor_and_adjust(
             )
             if thermal_hold and cooled:
                 thermal_hold = False
+            if safety_hold and safety_hold_cleared(
+                _as_float(power),
+                limits["max_watts"],
+                normalize_input_voltage(info.get("voltage")),
+                min_input_voltage,
+                _as_float(info.get("coreVoltageActual")),
+                droop_reference if droop_reference is not None else confirmed[1],
+                max_droop_mv,
+                info.get("power_fault"),
+            ):
+                safety_hold = ""
             if frequency_block_cleared(
                 blocked_frequency,
                 confirmed[1],
@@ -1894,6 +2214,11 @@ def monitor_and_adjust(
                 and confirmed[1] == probe["to_volt"]
                 and now >= settle_until
             )
+            # A dead board restarts below, even if this step is still on trial.
+            # A 1-minute rate of 0 with live hashrate still up fails the trial.
+            if probe_ready and board_hashrate_is_dead(info):
+                probe = None
+                probe_ready = False
             if probe_ready:
                 current_good = good_hashrate(measured_hashrate(info), error_percentage)
                 kind = probe.get("kind") or "frequency"
@@ -1913,6 +2238,10 @@ def monitor_and_adjust(
                 # this true during a climb; the 10-minute rate is not settled yet.
                 under_expected = paid is True and kind != "trim" and hashrate_short
                 if under_expected:
+                    paid = False
+                paid_before_minute = paid
+                minute_failed = minute_rate_failed(info)
+                if minute_failed:
                     paid = False
                 if paid is None:
                     log_callback(f"{bitaxe_ip} -> holding for good hashrate.", "info")
@@ -1943,12 +2272,25 @@ def monitor_and_adjust(
                         kind != "trim"
                         and not clock_stuck
                         and not thermal_hold
-                        and _as_float(vr_temp) is not None
+                        and not safety_hold
+                        and _usable_temp(vr_temp) is not None
                         and confirmed[1] < limits["max_volt"]
                     )
                     retry_frequency = failed_frequency + frequency_step
                     pll_can_retry = (
                         clock_stuck and retry_frequency <= limits["max_freq"]
+                    )
+                    # A zero 1-minute rate with live hashrate still up is a bad
+                    # sample, not a wall. The first one steps back and may be
+                    # tried again. A real miss, or a second one, locks the ceiling.
+                    glitch_only = (
+                        minute_failed
+                        and paid_before_minute is not False
+                        and not under_expected
+                        and not clock_stuck
+                    )
+                    first_minute_retry = (
+                        glitch_only and minute_retry_frequency != failed_frequency
                     )
                     short_text = (
                         f"under {int(HASHRATE_SHORTFALL_RATIO * 100)}% of expected"
@@ -1957,7 +2299,12 @@ def monitor_and_adjust(
                         raised_voltage = min(
                             limits["max_volt"], confirmed[1] + voltage_step
                         )
-                        miss = short_text if under_expected else "lost good hashrate"
+                        if glitch_only:
+                            miss = "had no 1-minute rate"
+                        elif under_expected:
+                            miss = short_text
+                        else:
+                            miss = "lost good hashrate"
                         log_callback(
                             f"{bitaxe_ip} -> {failed_frequency} MHz {miss}. "
                             f"Raising voltage to {raised_voltage} mV and retrying.",
@@ -1969,6 +2316,7 @@ def monitor_and_adjust(
                         log_callback(applied_settings, "info")
                         last_tune_time = time.time()
                         if settings_were_applied(applied_settings):
+                            _arm_droop_grace(confirmed[1], raised_voltage)
                             probe = dict(probe)
                             probe["to_volt"] = raised_voltage
                             pending = (failed_frequency, raised_voltage)
@@ -2002,6 +2350,12 @@ def monitor_and_adjust(
                         log_callback(
                             f"{bitaxe_ip} -> {failed_frequency} MHz did not move the PLL "
                             f"({actual_now:g} MHz). Next request is {retry_frequency} MHz.",
+                            "info",
+                        )
+                    elif first_minute_retry:
+                        log_callback(
+                            f"{bitaxe_ip} -> {failed_frequency} MHz had no 1-minute rate. "
+                            f"Stepping back to {back_frequency} MHz.",
                             "info",
                         )
                     else:
@@ -2052,8 +2406,13 @@ def monitor_and_adjust(
                         elif pll_can_retry:
                             pll_retry_frequency = retry_frequency
                             retreat_reason = "retry frequency"
+                        elif first_minute_retry:
+                            minute_retry_frequency = failed_frequency
+                            pll_retry_frequency = None
+                            retreat_reason = "retry minute rate"
                         else:
                             hash_ceiling = back_frequency
+                            minute_retry_frequency = None
                             pll_retry_frequency = None
                             limit_wall = wall_type_from_reason(
                                 "step frequency down after good hashrate"
@@ -2084,6 +2443,7 @@ def monitor_and_adjust(
                     )
                 probe = None
                 pll_retry_frequency = None
+                minute_retry_frequency = None
 
             climb_cap = limits["max_freq"]
             if hash_ceiling is not None:
@@ -2111,12 +2471,14 @@ def monitor_and_adjust(
                 "min_input_voltage": min_input_voltage,
                 "core_voltage_actual": _as_float(info.get("coreVoltageActual")),
                 "max_droop_mv": max_droop_mv,
+                "droop_voltage": droop_reference,
                 "power_fault": info.get("power_fault"),
                 "phase": phase,
                 "trim_good_voltage": trim_good_voltage,
                 "max_error_percentage": max_error_percentage,
                 "vr_temp_tolerance": vr_temp_tolerance,
                 "thermal_hold": thermal_hold,
+                "safety_hold": safety_hold,
                 "reject_share": share,
                 "hashrate_short": hashrate_short,
                 "blocked_frequency": blocked_frequency,
@@ -2262,13 +2624,27 @@ def monitor_and_adjust(
                     break
                 continue
 
+            if pending is not None and _same_setpoint(
+                (new_frequency, new_voltage), pending
+            ):
+                # This retreat is already in flight. Wait until it echoes
+                # instead of sending the same clocks on every poll.
+                if _wait(event, interval):
+                    break
+                continue
+
             leaving_hold = phase in ("hold", "trim") and (
                 reason.startswith("step frequency")
                 or reason.startswith("step voltage")
                 or "silicon wall" in reason
                 or "above target" in reason
             )
-            if reason in ("trim complete", "restore voltage"):
+            was_trimming = phase == "trim"
+            was_holding_retreat = trim_after_retreat and phase == "hold"
+            clocks_unchanged = _same_setpoint((new_frequency, new_voltage), confirmed)
+            if reason == "trim complete" or (
+                reason == "restore voltage" and clocks_unchanged
+            ):
                 if phase != "hold":
                     phase = "hold"
                     hold_since = time.time()
@@ -2282,12 +2658,17 @@ def monitor_and_adjust(
                 hold_since = None
                 ceiling_saved = False
                 trim_good_voltage = None
+                if not _quality_frequency_retreat(reason):
+                    trim_after_retreat = False
 
             wall = wall_type_from_reason(reason)
             if wall:
                 limit_wall = wall
             if wall == "thermal":
                 thermal_hold = True
+            hold_kind = _safety_hold_kind(reason)
+            if hold_kind:
+                safety_hold = hold_kind
             log_callback(f"{bitaxe_ip} -> {reason}.", "info")
             _publish_status(
                 bitaxe_ip,
@@ -2297,13 +2678,23 @@ def monitor_and_adjust(
                 reason=reason,
             )
 
-            if not _same_setpoint((new_frequency, new_voltage), confirmed):
+            if not clocks_unchanged:
                 applied_settings = set_system_settings(
                     bitaxe_ip, new_voltage, new_frequency
                 )
                 log_callback(applied_settings, "info")
                 last_tune_time = time.time()
                 if settings_were_applied(applied_settings):
+                    _arm_droop_grace(confirmed[1], new_voltage)
+                    if reason == "restore voltage":
+                        phase = "hold"
+                        hold_since = time.time()
+                        ceiling_saved = False
+                        trim_after_retreat = False
+                        log_callback(
+                            f"{bitaxe_ip} -> Holding {new_frequency} MHz / {new_voltage} mV.",
+                            "success",
+                        )
                     if new_frequency < confirmed[0] or (
                         pll_retry_frequency is not None
                         and new_frequency >= pll_retry_frequency
@@ -2355,21 +2746,41 @@ def monitor_and_adjust(
                             )
                             saved_signature = signature
                         trim_good_voltage = new_voltage
-                        if phase != "trim":
+                        trim_after_retreat = True
+                        if int(new_voltage) >= int(limits["max_volt"]):
                             phase = "trim"
                             hold_since = None
                             ceiling_saved = False
-                            log_callback(
-                                f"{bitaxe_ip} -> Frequency retreat. Trimming voltage.",
-                                "info",
-                            )
-                            _publish_status(
-                                bitaxe_ip,
-                                phase=phase,
-                                wall_type=limit_wall,
-                                error_percentage=error_percentage,
-                                reason="frequency retreat",
-                            )
+                            if not was_trimming:
+                                log_callback(
+                                    f"{bitaxe_ip} -> Frequency retreat. Trimming voltage.",
+                                    "info",
+                                )
+                                _publish_status(
+                                    bitaxe_ip,
+                                    phase=phase,
+                                    wall_type=limit_wall,
+                                    error_percentage=error_percentage,
+                                    reason="frequency retreat",
+                                )
+                        else:
+                            # Stay in hold so the next bad sample steps frequency
+                            # again. Trim starts after this clock looks healthy.
+                            phase = "hold"
+                            hold_since = None
+                            ceiling_saved = False
+                            if not was_holding_retreat:
+                                log_callback(
+                                    f"{bitaxe_ip} -> Frequency retreat. Holding voltage.",
+                                    "info",
+                                )
+                                _publish_status(
+                                    bitaxe_ip,
+                                    phase=phase,
+                                    wall_type=limit_wall,
+                                    error_percentage=error_percentage,
+                                    reason="frequency retreat",
+                                )
                     if error_ok and reason in (
                         "increase frequency",
                         "increase voltage",

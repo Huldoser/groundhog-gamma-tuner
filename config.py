@@ -154,7 +154,7 @@ def detect_miners(start_ip, end_ip, on_progress=None, should_cancel=None):
                         f"Detected miner: {model} at {ip_str}, added as {detected_miners[-1]['nickname']}"
                     )
 
-        except requests.exceptions.RequestException:
+        except (requests.exceptions.RequestException, ValueError):
             continue
 
     if not detected_miners:

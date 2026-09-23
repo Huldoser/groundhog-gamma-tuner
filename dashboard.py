@@ -25,13 +25,17 @@ from autotune import (
     _overheat_mode_set,
     _power_fault_set,
     _publish_status,
+    coerce_limit,
     get_miner_status,
     get_system_info,
     monitor_and_adjust,
     normalize_input_voltage,
+    overheat_ready_to_clear,
+    patch_system,
     reset_miners_to_baseline,
     restart_bitaxe,
     restart_miners,
+    restart_was_accepted,
 )
 from config import (
     CONFIG_CORRUPT_MESSAGE,
@@ -152,6 +156,33 @@ def parse_autotuner_value(field, raw):
     if field in ("min_volt", "max_volt", "start_volt"):
         return max(HARD_MIN_VOLT, min(HARD_MAX_VOLT, number))
     return number
+
+
+def limit_order_error(fields, label):
+    """Error text when min, start, and max are out of order. Empty when they are fine.
+
+    A blank cell turns that miner off, so a missing number is not an order error.
+    """
+
+    def number(key):
+        value = fields.get(key)
+        if value == "" or value is None:
+            return None
+        return value
+
+    def check(low_key, mid_key, high_key, name):
+        low, mid, high = number(low_key), number(mid_key), number(high_key)
+        if low is not None and high is not None and low > high:
+            return f"{label}: {name} min must be at or below max."
+        if low is not None and mid is not None and mid < low:
+            return f"{label}: {name} start must be at or above min."
+        if high is not None and mid is not None and mid > high:
+            return f"{label}: {name} start must be at or below max."
+        return ""
+
+    return check("min_freq", "start_freq", "max_freq", "Frequency") or check(
+        "min_volt", "start_volt", "max_volt", "Voltage"
+    )
 
 
 _SETPOINT_LIMITS = {
@@ -739,6 +770,14 @@ def limit_level(value, limit, tolerance=0):
     return ""
 
 
+def _cap_or_default(stored, key):
+    """A saved miner cap, or the Gamma 601 default when the cell is empty."""
+    value = coerce_limit((stored or {}).get(key))
+    if value is None:
+        return GAMMA601_LIMITS[key]
+    return value
+
+
 def _configured_tolerance(settings, key):
     """A global tolerance. Missing or negative values use the tuner default of 3."""
     if not isinstance(settings, dict):
@@ -1117,6 +1156,7 @@ class TunerDashboard:
         self._latest_firmware = ""
         self._firmware_checked = None
         self._alerts = {}
+        self._overheat_clear_failed = set()
         self._focused = True
         start_ip, end_ip = subnet_range_for(local_ipv4())
         self._scan_range = {"start": start_ip, "end": end_ip}
@@ -1396,32 +1436,10 @@ class TunerDashboard:
             threads = []
             self.log_message("Starting autotuning for selected miners...", "success")
             for index, miner in enumerate(ready_miners):
-                miner_event = threading.Event()
-                miner_stops[miner["ip"]] = miner_event
-                thread = threading.Thread(
-                    target=monitor_and_adjust,
-                    args=(
-                        miner["ip"],
-                        miner.get("type", "Unknown"),
-                        interval,
-                        self.log_message,
-                        miner.get("min_freq"),
-                        miner.get("max_freq"),
-                        miner.get("min_volt"),
-                        miner.get("max_volt"),
-                        miner.get("max_temp"),
-                        miner.get("max_watts"),
-                        miner.get("start_freq", ""),
-                        miner.get("start_volt", ""),
-                        miner.get("max_vr_temp"),
-                    ),
-                    kwargs={
-                        "stop_event": miner_event,
-                        "startup_delay": index * STARTUP_STAGGER_SECONDS,
-                    },
-                    daemon=True,
+                miner_event, thread = self._miner_thread(
+                    miner, interval, index * STARTUP_STAGGER_SECONDS
                 )
-                thread.miner_ip = miner["ip"]
+                miner_stops[miner["ip"]] = miner_event
                 threads.append(thread)
 
             with self._lock:
@@ -1528,15 +1546,25 @@ class TunerDashboard:
         )
 
         def work():
+            failed = 0
             try:
-                reset_miners_to_baseline(miners, self.log_message)
+                failed = reset_miners_to_baseline(miners, self.log_message)
             finally:
                 with self._lock:
                     self._baseline_reset_running = False
-                self.log_message(
-                    f"Baseline reset finished. Start Autotuner to tune from {STOCK_FREQ} MHz / {STOCK_VOLT} mV.",
-                    "success",
-                )
+                if failed:
+                    self.log_message(
+                        "Baseline reset finished with "
+                        f"{failed} miner(s) that did not accept "
+                        f"{STOCK_FREQ} MHz / {STOCK_VOLT} mV. "
+                        "Learned setpoints were cleared.",
+                        "error",
+                    )
+                else:
+                    self.log_message(
+                        f"Baseline reset finished. Start Autotuner to tune from {STOCK_FREQ} MHz / {STOCK_VOLT} mV.",
+                        "success",
+                    )
 
         threading.Thread(target=work, daemon=True).start()
         return {"ok": True}
@@ -1594,12 +1622,19 @@ class TunerDashboard:
         self.log_message("Restarting all miners.", "warning")
 
         def work():
+            failed = 0
             try:
-                restart_miners(miners, self.log_message)
+                failed = restart_miners(miners, self.log_message)
             finally:
                 with self._lock:
                     self._restart_all_running = False
-                self.log_message("Restart of all miners finished.", "success")
+                if failed:
+                    self.log_message(
+                        f"Restart of all miners finished with {failed} failure(s).",
+                        "error",
+                    )
+                else:
+                    self.log_message("Restart of all miners finished.", "success")
 
         threading.Thread(target=work, daemon=True).start()
         return {
@@ -1743,11 +1778,38 @@ class TunerDashboard:
             return _fail("Please select a miner first.", "No Selection", "warning")
         with self._lock:
             self._reap_threads_locked()
-            tuning = any(
+            if self._baseline_reset_running:
+                blocked = "baseline"
+            elif self._restart_all_running:
+                blocked = "restart"
+            elif any(
                 getattr(thread, "miner_ip", None) == ip and thread.is_alive()
                 for thread in self.threads
+            ):
+                blocked = "tuning"
+            else:
+                blocked = None
+        if blocked == "baseline":
+            self.log_message(
+                "Wait for the baseline reset to finish before restarting this miner.",
+                "warning",
             )
-        if tuning:
+            return _fail(
+                "Wait for the baseline reset to finish before restarting this miner.",
+                "Reset in Progress",
+                "warning",
+            )
+        if blocked == "restart":
+            self.log_message(
+                "Wait for the miner restart to finish before restarting this miner.",
+                "warning",
+            )
+            return _fail(
+                "Wait for the miner restart to finish before restarting this miner.",
+                "Restart in Progress",
+                "warning",
+            )
+        if blocked == "tuning":
             self.log_message(f"Stop the autotuner before restarting {ip}.", "warning")
             return _fail(
                 "Stop the autotuner before restarting this miner.",
@@ -1756,6 +1818,9 @@ class TunerDashboard:
             )
         self.log_message(f"Restarting miner at {ip}...", "warning")
         message = restart_bitaxe(ip)
+        if not restart_was_accepted(message):
+            self.log_message(message, "error")
+            return _fail(message, "Restart Failed")
         self.log_message(message, "warning")
         return {
             "ok": True,
@@ -1806,7 +1871,7 @@ class TunerDashboard:
         return {"ok": True}
 
     def get_autotuner_settings(self):
-        """Per-miner limits. Empty cells fall back to the Gamma 601 defaults for display."""
+        """Per-miner limits. A blank cell stays blank so Save can turn that miner off."""
         miners = get_miners()
         if not miners:
             return _fail(
@@ -1819,8 +1884,6 @@ class TunerDashboard:
             fields = {}
             for field in ALL_AUTOTUNE_FIELDS:
                 display = miner.get(field, "")
-                if display in ("", None) and field in GAMMA601_LIMITS:
-                    display = GAMMA601_LIMITS[field]
                 fields[field] = "" if display is None else str(display)
             nickname = miner.get("nickname") or miner["ip"]
             rows.append(
@@ -1855,7 +1918,13 @@ class TunerDashboard:
                     )
             parsed.append((row, fields))
 
+        for row, fields in parsed:
+            problem = limit_order_error(fields, row.get("ip") or "miner")
+            if problem:
+                return _fail(problem)
+
         stopped = []
+        enabled = []
 
         def mutate(config):
             by_ip = {miner["ip"]: miner for miner in config.get("miners", [])}
@@ -1870,11 +1939,14 @@ class TunerDashboard:
                     miner["enabled"] = _as_bool(row.get("enabled"))
                 if not miner["enabled"]:
                     stopped.append(miner["ip"])
+                else:
+                    enabled.append(miner["ip"])
 
         if modify_config(mutate) is False:
             return _fail(CONFIG_CORRUPT_MESSAGE, "Config file damaged", "error")
         for ip in stopped:
             self._signal_miner_stop(ip)
+        self._start_miners_if_running(enabled)
         self.log_message("Updated AutoTuner settings for all miners.", "success")
         return {"ok": True}
 
@@ -1939,6 +2011,7 @@ class TunerDashboard:
                     messages.append(message)
             self._updated = format_local_time()
         self._deliver_alerts(messages)
+        self._clear_cooled_overheat(results)
 
     def _apply_one_locked(self, row, ip, miner_data):
         if isinstance(miner_data, str) or not isinstance(miner_data, dict):
@@ -2033,6 +2106,49 @@ class TunerDashboard:
 
     def _drop_miner_runtime_locked(self, ip):
         self._alerts.pop(ip, None)
+        self._overheat_clear_failed.discard(ip)
+
+    def _clear_cooled_overheat(self, results):
+        """PATCH overheat_mode 0 when a cool sample still carries the flag.
+
+        A failed write is logged once. Later polls retry quietly until the
+        miner reports the flag clear.
+        """
+        for ip, miner_data in results:
+            if not isinstance(miner_data, dict):
+                continue
+            with self._lock:
+                if not any(row["ip"] == ip for row in self._rows):
+                    continue
+            if not _overheat_mode_set(miner_data.get("overheat_mode")):
+                with self._lock:
+                    self._overheat_clear_failed.discard(ip)
+                continue
+            stored = get_miner_defaults(ip)
+            if not overheat_ready_to_clear(
+                miner_data,
+                _cap_or_default(stored, "max_temp"),
+                _cap_or_default(stored, "max_vr_temp"),
+            ):
+                continue
+            with self._lock:
+                if not any(row["ip"] == ip for row in self._rows):
+                    continue
+                quiet = ip in self._overheat_clear_failed
+            ok, error = patch_system(ip, {"overheat_mode": 0})
+            with self._lock:
+                if ok:
+                    self._overheat_clear_failed.discard(ip)
+                else:
+                    self._overheat_clear_failed.add(ip)
+            if quiet:
+                continue
+            if ok:
+                self.log_message(f"{ip} -> Cleared overheat mode.")
+            else:
+                self.log_message(
+                    f"{ip} -> Could not clear overheat mode: {error}", "warning"
+                )
 
     def _note_alert_locked(self, row):
         kind = alert_kind(row)
@@ -2094,6 +2210,96 @@ class TunerDashboard:
             or self._stop_in_progress
             or any(thread.is_alive() for thread in self.threads)
         )
+
+    def _miner_thread(self, miner, interval, startup_delay):
+        """One tuner thread and the event that asks it to leave."""
+        miner_event = threading.Event()
+        thread = threading.Thread(
+            target=monitor_and_adjust,
+            args=(
+                miner["ip"],
+                miner.get("type", "Unknown"),
+                interval,
+                self.log_message,
+                miner.get("min_freq"),
+                miner.get("max_freq"),
+                miner.get("min_volt"),
+                miner.get("max_volt"),
+                miner.get("max_temp"),
+                miner.get("max_watts"),
+                miner.get("start_freq", ""),
+                miner.get("start_volt", ""),
+                miner.get("max_vr_temp"),
+            ),
+            kwargs={
+                "stop_event": miner_event,
+                "startup_delay": startup_delay,
+            },
+            daemon=True,
+        )
+        thread.miner_ip = miner["ip"]
+        return miner_event, thread
+
+    def _start_miners_if_running(self, ips):
+        """Start threads for miners enabled while a session is already running."""
+        ips = {ip for ip in ips if ip}
+        if not ips:
+            return
+        with self._lock:
+            if (
+                not self.running
+                or self._stop_in_progress
+                or self._baseline_reset_running
+                or self._restart_all_running
+            ):
+                return
+            self._reap_threads_locked()
+            alive = {
+                getattr(thread, "miner_ip", None)
+                for thread in self.threads
+                if thread.is_alive()
+            }
+        runtime = load_config()
+        interval = runtime.get("monitor_interval", 5)
+        ready = []
+        for miner in runtime.get("miners", []):
+            ip = miner.get("ip")
+            if ip not in ips or not miner.get("enabled") or ip in alive:
+                continue
+            if any(
+                field not in miner or miner[field] == "" or miner[field] is None
+                for field in START_REQUIRED_FIELDS
+            ):
+                continue
+            ready.append(miner)
+        if not ready:
+            return
+        events = {}
+        threads = []
+        for miner in ready:
+            event, thread = self._miner_thread(miner, interval, 0)
+            events[miner["ip"]] = event
+            threads.append(thread)
+        with self._lock:
+            if (
+                not self.running
+                or self._stop_in_progress
+                or (self.stop_event is not None and self.stop_event.is_set())
+            ):
+                return
+            for ip, event in events.items():
+                self._miner_stops[ip] = event
+            self.threads.extend(threads)
+        for thread in threads:
+            thread.start()
+        with self._lock:
+            if self._stop_in_progress or (
+                self.stop_event is not None and self.stop_event.is_set()
+            ):
+                for event in events.values():
+                    event.set()
+        names = ", ".join(miner["ip"] for miner in ready)
+        self.log_message(f"Starting autotuning for {names}.", "success")
 
     def _signal_miner_stop(self, ip):
         """Ask the tuner thread for one address to leave. Other miners keep running."""
