@@ -863,6 +863,38 @@ class SnapshotTests(unittest.TestCase):
             self.assertEqual(stored["max_temp"], "")
             self.assertFalse(stored["enabled"])
 
+    def test_blank_autotuner_cells_stay_blank(self):
+        miner = {
+            "ip": "10.0.0.8",
+            "nickname": "Alpha",
+            "enabled": False,
+            "type": "BM1370 601",
+            "max_temp": "",
+        }
+        with temp_config([miner]):
+            app = TunerDashboard()
+            result = app.get_autotuner_settings()
+            self.assertTrue(result["ok"])
+            fields = result["miners"][0]["fields"]
+            self.assertEqual(fields["max_temp"], "")
+            self.assertEqual(fields["min_freq"], "")
+            self.assertFalse(result["miners"][0]["enabled"])
+
+    def test_failed_restart_is_not_reported_as_triggered(self):
+        miner = config.new_miner_record(
+            "BM1370 601", "10.0.0.8", "Alpha", config.get_default_config()
+        )
+        with temp_config([miner]):
+            app = TunerDashboard()
+            with mock.patch(
+                "dashboard.restart_bitaxe",
+                return_value="10.0.0.8 -> Error restarting system: down",
+            ):
+                result = app.restart_miner("10.0.0.8")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["notice"]["title"], "Restart Failed")
+        self.assertNotEqual(result["notice"]["title"], "Restart Triggered")
+
     def test_global_settings_save_vr_tolerance_and_ceiling_soak(self):
         with temp_config():
             app = TunerDashboard()
@@ -907,6 +939,78 @@ class SnapshotTests(unittest.TestCase):
             refused = app.restart_all_miners()
             self.assertFalse(refused["ok"])
             self.assertFalse(app._restart_all_running)
+
+    def test_restart_miner_waits_for_baseline_and_restart_all(self):
+        miner = config.new_miner_record(
+            "BM1370 601", "10.0.0.8", "Alpha", config.get_default_config()
+        )
+        with temp_config([miner]):
+            app = TunerDashboard()
+            app._baseline_reset_running = True
+            blocked = app.restart_miner("10.0.0.8")
+            self.assertFalse(blocked["ok"])
+            self.assertIn("baseline", blocked["message"])
+            app._baseline_reset_running = False
+            app._restart_all_running = True
+            blocked = app.restart_miner("10.0.0.8")
+            self.assertFalse(blocked["ok"])
+            self.assertIn("restart", blocked["message"].lower())
+
+    def test_enabling_a_miner_while_running_starts_its_thread(self):
+        miner = config.new_miner_record(
+            "BM1370 601", "10.0.0.8", "Alpha", config.get_default_config()
+        )
+        miner["enabled"] = False
+        with temp_config([miner]):
+            app = TunerDashboard()
+            fields = {field: str(miner[field]) for field in ALL_AUTOTUNE_FIELDS}
+            idle = app.save_autotuner_settings(
+                [{"ip": "10.0.0.8", "enabled": True, "fields": fields}]
+            )
+            self.assertTrue(idle["ok"])
+            self.assertEqual(app.threads, [])
+
+            app.running = True
+            started = []
+
+            def fake_monitor(*args, **kwargs):
+                started.append(args[0])
+
+            with mock.patch("dashboard.monitor_and_adjust", fake_monitor):
+                saved = app.save_autotuner_settings(
+                    [{"ip": "10.0.0.8", "enabled": True, "fields": fields}]
+                )
+            self.assertTrue(saved["ok"])
+            self.assertEqual(len(app.threads), 1)
+            app.threads[0].join(timeout=2)
+            self.assertEqual(started, ["10.0.0.8"])
+            self.assertEqual(app.threads[0].miner_ip, "10.0.0.8")
+
+    def test_reversed_limits_are_rejected_and_not_saved(self):
+        miner = config.new_miner_record(
+            "BM1370 601", "10.0.0.8", "Alpha", config.get_default_config()
+        )
+        with temp_config([miner]):
+            app = TunerDashboard()
+            fields = {field: str(miner[field]) for field in ALL_AUTOTUNE_FIELDS}
+            fields["min_freq"] = "900"
+            fields["max_freq"] = "400"
+            rejected = app.save_autotuner_settings(
+                [{"ip": "10.0.0.8", "enabled": True, "fields": fields}]
+            )
+            self.assertFalse(rejected["ok"])
+            self.assertIn("min", rejected["message"])
+            self.assertEqual(config.get_miners()[0]["min_freq"], miner["min_freq"])
+
+            fields = {field: str(miner[field]) for field in ALL_AUTOTUNE_FIELDS}
+            fields["start_volt"] = "1400"
+            fields["max_volt"] = "1200"
+            rejected = app.save_autotuner_settings(
+                [{"ip": "10.0.0.8", "enabled": True, "fields": fields}]
+            )
+            self.assertFalse(rejected["ok"])
+            self.assertIn("start", rejected["message"])
+            self.assertEqual(config.get_miners()[0]["start_volt"], miner["start_volt"])
 
     def test_clearing_tune_stops_that_miner(self):
         miner = config.new_miner_record(
@@ -1222,6 +1326,189 @@ class SnapshotTests(unittest.TestCase):
         self.assertFalse(app._focused)
         DashboardApi(app).get_snapshot(0, True)
         self.assertTrue(app._focused)
+
+    def test_cooled_overheat_is_cleared_and_a_healthy_sample_drops_both_warnings(self):
+        app = TunerDashboard()
+        app._rows = [blank_miner_row("Alpha", "10.0.0.8")]
+        stored = {"nickname": "Alpha", "max_temp": 68, "max_vr_temp": 88}
+        status = {"phase": "hold"}
+        cool = {
+            "overheat_mode": 1,
+            "power_fault": "UV",
+            "temp": 45,
+            "vrTemp": 40,
+            "power": 12,
+            "hashRate_1m": 10,
+            "frequency": 500,
+        }
+        with (
+            mock.patch("dashboard.patch_system", return_value=(True, "")) as patch,
+            mock.patch("dashboard.get_system_info", return_value=cool),
+            mock.patch("dashboard.get_miner_status", return_value=status),
+            mock.patch("dashboard.get_miner_defaults", return_value=stored),
+            mock.patch("dashboard.load_config", return_value={}),
+        ):
+            app.refresh_once()
+        patch.assert_called_once_with("10.0.0.8", {"overheat_mode": 0})
+        latched = app.get_snapshot(0)["miners"][0]
+        self.assertTrue(latched["overheat"])
+        self.assertTrue(latched["power_fault"])
+        self.assertEqual(latched["tag"], "alert")
+        self.assertEqual(latched["reason"], "overheat mode")
+
+        healthy = {
+            "overheat_mode": 0,
+            "temp": 45,
+            "vrTemp": 40,
+            "power": 12,
+            "hashRate_1m": 10,
+            "frequency": 500,
+        }
+        with (
+            mock.patch("dashboard.patch_system", return_value=(True, "")) as patch,
+            mock.patch("dashboard.get_system_info", return_value=healthy),
+            mock.patch("dashboard.get_miner_status", return_value=status),
+            mock.patch("dashboard.get_miner_defaults", return_value=stored),
+            mock.patch("dashboard.load_config", return_value={}),
+        ):
+            app.refresh_once()
+        patch.assert_not_called()
+        row = app.get_snapshot(0)["miners"][0]
+        self.assertFalse(row["overheat"])
+        self.assertFalse(row["power_fault"])
+        self.assertEqual(row["tag"], "hold")
+        self.assertEqual(row["reason"], "")
+
+    def test_failed_overheat_clear_is_logged_once_until_the_flag_reads_clear(self):
+        app = TunerDashboard()
+        app._rows = [blank_miner_row("Alpha", "10.0.0.8")]
+        stored = {"nickname": "Alpha", "max_temp": 68, "max_vr_temp": 88}
+        cool = {
+            "overheat_mode": 1,
+            "temp": 45,
+            "vrTemp": 40,
+            "power": 12,
+            "hashRate_1m": 10,
+            "frequency": 500,
+        }
+        healthy = {
+            "overheat_mode": 0,
+            "temp": 45,
+            "vrTemp": 40,
+            "power": 12,
+            "hashRate_1m": 10,
+            "frequency": 500,
+        }
+
+        def warnings():
+            return [
+                line
+                for line in app.get_snapshot(0)["log"]
+                if line["level"] == "warning" and "overheat" in line["text"]
+            ]
+
+        with (
+            mock.patch("dashboard.patch_system", return_value=(False, "down")) as patch,
+            mock.patch("dashboard.get_system_info", return_value=cool),
+            mock.patch("dashboard.get_miner_status", return_value={"phase": "hold"}),
+            mock.patch("dashboard.get_miner_defaults", return_value=stored),
+            mock.patch("dashboard.load_config", return_value={}),
+        ):
+            app.refresh_once()
+            app.refresh_once()
+        self.assertEqual(patch.call_count, 2)
+        self.assertEqual(len(warnings()), 1)
+        self.assertIn("Could not clear overheat mode", warnings()[0]["text"])
+
+        with (
+            mock.patch("dashboard.patch_system", return_value=(True, "")) as patch,
+            mock.patch("dashboard.get_system_info", return_value=healthy),
+            mock.patch("dashboard.get_miner_status", return_value={"phase": "hold"}),
+            mock.patch("dashboard.get_miner_defaults", return_value=stored),
+            mock.patch("dashboard.load_config", return_value={}),
+        ):
+            app.refresh_once()
+        patch.assert_not_called()
+
+        with (
+            mock.patch("dashboard.patch_system", return_value=(False, "down")) as patch,
+            mock.patch("dashboard.get_system_info", return_value=cool),
+            mock.patch("dashboard.get_miner_status", return_value={"phase": "hold"}),
+            mock.patch("dashboard.get_miner_defaults", return_value=stored),
+            mock.patch("dashboard.load_config", return_value={}),
+        ):
+            app.refresh_once()
+        patch.assert_called_once_with("10.0.0.8", {"overheat_mode": 0})
+        self.assertEqual(len(warnings()), 2)
+
+    def test_overheat_clear_skips_an_ip_removed_during_the_poll(self):
+        app = TunerDashboard()
+        app._rows = [blank_miner_row("Alpha", "10.0.0.8")]
+        cool = {
+            "overheat_mode": 1,
+            "temp": 45,
+            "vrTemp": 40,
+            "power": 12,
+            "hashRate_1m": 10,
+            "frequency": 500,
+        }
+
+        def fetch(_ip):
+            app._rows = []
+            return cool
+
+        with (
+            mock.patch("dashboard.patch_system", return_value=(True, "")) as patch,
+            mock.patch("dashboard.get_system_info", side_effect=fetch),
+            mock.patch("dashboard.get_miner_status", return_value={"phase": "hold"}),
+            mock.patch("dashboard.get_miner_defaults", return_value={}),
+            mock.patch("dashboard.load_config", return_value={}),
+        ):
+            app.refresh_once()
+        patch.assert_not_called()
+
+    def test_failed_baseline_and_restart_all_do_not_log_success(self):
+        miner = config.new_miner_record(
+            "BM1370 601", "10.0.0.8", "Alpha", config.get_default_config()
+        )
+
+        def finished(app, phrase):
+            for _ in range(40):
+                lines = [
+                    line
+                    for line in app.get_snapshot(0)["log"]
+                    if phrase in line["text"]
+                ]
+                if lines:
+                    return lines[-1]
+                time.sleep(0.05)
+            return None
+
+        with temp_config([miner]):
+            app = TunerDashboard()
+            with mock.patch(
+                "autotune.set_system_settings",
+                return_value="10.0.0.8 -> Error setting system settings: down",
+            ):
+                started = app.reset_baseline()
+                self.assertTrue(started["ok"])
+                line = finished(app, "Baseline reset finished")
+            self.assertIsNotNone(line)
+            self.assertEqual(line["level"], "error")
+            self.assertIn("did not accept", line["text"])
+
+        with temp_config([miner]):
+            app = TunerDashboard()
+            with mock.patch(
+                "autotune.restart_bitaxe",
+                return_value="10.0.0.8 -> Error restarting system: down",
+            ):
+                started = app.restart_all_miners()
+                self.assertTrue(started["ok"])
+                line = finished(app, "Restart of all miners finished")
+            self.assertIsNotNone(line)
+            self.assertEqual(line["level"], "error")
+            self.assertIn("failure", line["text"])
 
 
 class FullscreenTests(unittest.TestCase):
