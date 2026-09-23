@@ -26,6 +26,7 @@ from autotune import (
     _power_fault_set,
     _publish_status,
     coerce_limit,
+    coerce_real_limit,
     get_miner_status,
     get_system_info,
     monitor_and_adjust,
@@ -148,7 +149,13 @@ def parse_autotuner_value(field, raw):
     text = str(raw).strip()
     if text == "":
         return ""
-    if field in ("min_input_voltage", "max_error_percentage"):
+    if field in (
+        "min_input_voltage",
+        "max_error_percentage",
+        "max_temp",
+        "max_watts",
+        "max_vr_temp",
+    ):
         return float(text)
     number = int(float(text))
     if field in ("min_freq", "max_freq", "start_freq"):
@@ -772,7 +779,11 @@ def limit_level(value, limit, tolerance=0):
 
 def _cap_or_default(stored, key):
     """A saved miner cap, or the Gamma 601 default when the cell is empty."""
-    value = coerce_limit((stored or {}).get(key))
+    raw = (stored or {}).get(key)
+    if key in ("max_temp", "max_watts", "max_vr_temp"):
+        value = coerce_real_limit(raw)
+    else:
+        value = coerce_limit(raw)
     if value is None:
         return GAMMA601_LIMITS[key]
     return value
@@ -1766,6 +1777,8 @@ class TunerDashboard:
         self.log_message(
             f"Updated miner settings: {nickname} ({miner_type}) at {new_ip}", "success"
         )
+        if new_ip != current_ip:
+            self._start_miners_if_running([new_ip])
         return {
             "ok": True,
             "message": f"Updated miner settings: {nickname} ({miner_type}) at {new_ip}",
@@ -1833,7 +1846,7 @@ class TunerDashboard:
         config = load_config()
         settings = {key: config.get(key, "") for key in GLOBAL_INT_FIELDS}
         settings["flatline_detection_enabled"] = bool(
-            config.get("flatline_detection_enabled", True)
+            config.get("flatline_detection_enabled", False)
         )
         settings["flatline_hashrate_repeat_count"] = config.get(
             "flatline_hashrate_repeat_count", 5

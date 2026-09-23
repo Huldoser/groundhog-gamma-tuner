@@ -14,6 +14,7 @@ from config import (
     HARD_MIN_VOLT,
     STOCK_FREQ,
     STOCK_VOLT,
+    SYSTEM_INFO_TIMEOUT,
     is_gamma_601,
     load_config,
     update_miner,
@@ -176,6 +177,20 @@ def coerce_limit(value):
         return None
 
 
+def coerce_real_limit(value):
+    """Return a float limit, or None when the value is missing or not numeric.
+
+    ASIC temperature, power, and regulator temperature keep a decimal. Frequency
+    and voltage stay on coerce_limit.
+    """
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _as_float(value):
     try:
         return float(value)
@@ -224,6 +239,7 @@ _RUNNING_LIMIT_FIELDS = (
     "max_watts",
     "max_vr_temp",
 )
+_REAL_LIMIT_FIELDS = ("max_temp", "max_watts", "max_vr_temp")
 
 
 def refresh_running_limits(limits, record):
@@ -237,7 +253,10 @@ def refresh_running_limits(limits, record):
     updated = dict(limits)
     changed = False
     for key in _RUNNING_LIMIT_FIELDS:
-        value = coerce_limit(record.get(key))
+        if key in _REAL_LIMIT_FIELDS:
+            value = coerce_real_limit(record.get(key))
+        else:
+            value = coerce_limit(record.get(key))
         if value is None or value == updated.get(key):
             continue
         updated[key] = value
@@ -430,9 +449,11 @@ def _needs_immediate_retreat(
     power_fault,
     overheat_mode,
 ):
-    """True when the clocks the miner is running should step down without waiting.
+    """True when the clocks the miner is running are past a safety limit.
 
-    A watt-cap breach steps down on the next poll, by one frequency step. Error retreats
+    The session steps down on the next poll for the first breach. It does not
+    ask again until a drop already written has finished its settle, so a
+    heatsink that has not moved yet cannot walk the clocks down. Error retreats
     still wait, so a noisy error sample cannot walk the clocks down. A missing ASIC
     temperature or power reading does not hide a breach on the sensors that did report.
     """
@@ -561,6 +582,19 @@ def board_hashrate_is_dead(info):
     return False
 
 
+def pool_is_down(info):
+    """True when AxeOS reports a pool difficulty that is not positive.
+
+    A missing difficulty is not a stall, so older samples keep the old rules.
+    A zero difficulty means the pool is not handing out work. A dead or short
+    hashrate then is not the chip.
+    """
+    if not isinstance(info, dict) or "poolDifficulty" not in info:
+        return False
+    difficulty = _as_float(info.get("poolDifficulty"))
+    return difficulty is None or difficulty <= 0
+
+
 def minute_rate_failed(info):
     """True when the 1-minute rate is present and not positive, but live hashrate is.
 
@@ -581,6 +615,9 @@ def minute_rate_failed(info):
 HASHRATE_SHORTFALL_RATIO = 0.85
 HASHRATE_1M_SETTLE_SECONDS = 60
 HASHRATE_10M_SETTLE_SECONDS = 10 * 60
+# hashRate_1m is already a one-minute average. It has to sit still for longer
+# than that minute, with the live rate also still, before it counts as a hang.
+FLATLINE_STILL_SECONDS = HASHRATE_1M_SETTLE_SECONDS
 
 # Pool reject share that steps frequency down. Stale and non-silicon results are left out.
 # One counted reject must not cross the limit, so a sample needs more than 100 judged shares.
@@ -727,12 +764,14 @@ class RejectSample:
         """Return (hardware share or None, above-target is sustained).
 
         None means the sample is still too small. The counters reset once it qualifies.
+        Hardware share uses every judged share, including above-target results.
         """
         judged = self.accepted + self.hardware + self.above
         if judged < minimum:
             return None, False
-        hardware_total = self.accepted + self.hardware
-        hardware_share = (self.hardware / hardware_total) if hardware_total > 0 else 0.0
+        # Above-target shares count toward the sample size, so they stay in
+        # this denominator. One hardware reject in a full sample is then 1%.
+        hardware_share = (self.hardware / judged) if judged > 0 else 0.0
         above_total = self.accepted + self.above
         above_share = (self.above / above_total) if above_total > 0 else 0.0
         if above_share > limit:
@@ -1426,7 +1465,9 @@ def decide_adjustment(
 def get_system_info(bitaxe_ip):
     """Fetch system info from Bitaxe API."""
     try:
-        response = requests.get(f"http://{bitaxe_ip}/api/system/info", timeout=10)
+        response = requests.get(
+            f"http://{bitaxe_ip}/api/system/info", timeout=SYSTEM_INFO_TIMEOUT
+        )
         response.raise_for_status()
         return response.json()
     except (requests.exceptions.RequestException, ValueError) as e:
@@ -1482,6 +1523,21 @@ def _numbers_match(reported, requested):
 
 def _same_setpoint(left, right):
     return int(left[0]) == int(right[0]) and int(left[1]) == int(right[1])
+
+
+def _restore_is_confirmed(probe, confirmed):
+    """True when a voltage restore has been echoed by the miner.
+
+    The probe stays in place until then, so a stop during the settle keeps the
+    clocks that were put back instead of the trim that just failed.
+    """
+    if not isinstance(probe, dict) or not probe.get("restore") or confirmed is None:
+        return False
+    origin_frequency = probe.get("from_freq")
+    origin_voltage = probe.get("from_volt")
+    if origin_frequency is None or origin_voltage is None:
+        return False
+    return _same_setpoint(confirmed, (origin_frequency, origin_voltage))
 
 
 def _apply_fan(bitaxe_ip, payload, log_callback):
@@ -1604,9 +1660,9 @@ def monitor_and_adjust(
         "max_freq": coerce_limit(max_freq),
         "min_volt": coerce_limit(min_volt),
         "max_volt": coerce_limit(max_volt),
-        "max_temp": coerce_limit(max_temp),
-        "max_watts": coerce_limit(max_watts),
-        "max_vr_temp": coerce_limit(max_vr_temp),
+        "max_temp": coerce_real_limit(max_temp),
+        "max_watts": coerce_real_limit(max_watts),
+        "max_vr_temp": coerce_real_limit(max_vr_temp),
     }
     missing = [name for name, value in limits.items() if value is None]
     if missing:
@@ -1817,13 +1873,25 @@ def monitor_and_adjust(
     blocked_for_rejects = False
     reject_sample = RejectSample()
     saved_signature = None
+    if pending is not None and start_frequency < resume_frequency:
+        opening_wall = wall_type_from_reason(opening_reason)
+        if opening_wall:
+            limit_wall = opening_wall
+        remember_setpoint(bitaxe_ip, start_frequency, start_voltage, limit_wall)
+        saved_signature = (int(start_frequency), int(start_voltage), limit_wall)
     error_samples = []
     window_positive_hash = False
     window_zero_hash = False
     zero_restarted = False
     flatline_restarted = False
-    thermal_hold = False
+    flatline_since = None
+    flatline_live = None
+    pool_down_logged = False
+    # An opening heat drop has to latch the cool-down. Otherwise the next
+    # tune interval climbs again while the chip is still inside the band.
+    thermal_hold = wall_type_from_reason(opening_reason) == "thermal"
     safety_hold = _safety_hold_kind(opening_reason)
+    safety_settle_until = settle_until if _is_safety_retreat(opening_reason) else 0.0
     fan_retry_at = 0.0
     setpoint_since = None
     last_accepted = None
@@ -1859,7 +1927,7 @@ def monitor_and_adjust(
                 runtime.get("ceiling_soak_seconds"), DEFAULT_CEILING_SOAK_SECONDS
             )
             flatline_repeat_count = runtime.get("flatline_hashrate_repeat_count", 5)
-            flatline_enabled = runtime.get("flatline_detection_enabled", True)
+            flatline_enabled = runtime.get("flatline_detection_enabled", False)
 
             info = get_system_info(bitaxe_ip)
             if event.is_set():
@@ -1890,6 +1958,8 @@ def monitor_and_adjust(
             ):
                 confirmed = pending
                 pending = None
+                if _restore_is_confirmed(probe, confirmed):
+                    probe = None
                 if setpoint_since is None:
                     setpoint_since = now
                 pll_note = ""
@@ -1937,8 +2007,8 @@ def monitor_and_adjust(
             vr_temp = info.get("vrTemp") if "vrTemp" in info else None
             live_hash = _as_float(info.get("hashRate"))
             minute_hash = _as_float(info.get("hashRate_1m"))
-            # Tune on the 1-minute rate when the miner reports one. Flatline still
-            # watches the live rate, which moves unless the board is actually stuck.
+            # Tune on the 1-minute rate when the miner reports one. Flatline watches
+            # that same rate. A live sample that sits still is not a hang.
             decision_hash = (
                 minute_hash
                 if minute_hash is not None and minute_hash > 0
@@ -1965,10 +2035,35 @@ def monitor_and_adjust(
                     else:
                         window_zero_hash = True
 
-            if not settling and live_hash is not None and live_hash > 0:
-                sample = round(live_hash, 2)
+            flatline_live_moved = False
+            # An open trial owns this window. A steady minute rate must not
+            # reboot the miner while that trial is still waiting to be judged.
+            # hashRate_1m is a one-minute average, so a few identical polls are
+            # a normal reading. A moving live rate is not a hang either. Both
+            # have to sit still for a full minute before a restart.
+            if (
+                not settling
+                and probe is None
+                and minute_hash is not None
+                and minute_hash > 0
+            ):
+                sample = round(minute_hash, 2)
+                live_sample = (
+                    round(live_hash, 2)
+                    if live_hash is not None and live_hash > 0
+                    else None
+                )
                 if hashrate_history and sample != hashrate_history[-1]:
                     flatline_restarted = False
+                    flatline_since = time.time()
+                    flatline_live = live_sample
+                elif not hashrate_history:
+                    flatline_since = time.time()
+                    flatline_live = live_sample
+                elif live_sample is not None and live_sample != flatline_live:
+                    flatline_since = time.time()
+                    flatline_live = live_sample
+                    flatline_live_moved = True
                 hashrate_history.append(sample)
                 if len(hashrate_history) > flatline_repeat_count:
                     hashrate_history.pop(0)
@@ -1984,9 +2079,14 @@ def monitor_and_adjust(
                 and flatline_repeat_count > 0
                 and len(hashrate_history) == flatline_repeat_count
                 and len(set(hashrate_history)) == 1
+                and flatline_since is not None
+                and not flatline_live_moved
+                and (time.time() - flatline_since) >= FLATLINE_STILL_SECONDS
             ):
                 frozen_rate = hashrate_history[-1]
                 hashrate_history.clear()
+                flatline_since = None
+                flatline_live = None
                 rolling_hashrate.clear()
                 error_samples.clear()
                 window_positive_hash = False
@@ -2054,7 +2154,9 @@ def monitor_and_adjust(
                     if droop_reference is not None
                     else retreat_clocks[1]
                 )
-            immediate_retreat = retreat_clocks is not None and _needs_immediate_retreat(
+            # A safety drop already written waits out its settle. The next hot
+            # sample must not shed another step before the heatsink has moved.
+            immediate_retreat = now >= safety_settle_until and _needs_immediate_retreat(
                 _as_float(temp),
                 _as_float(vr_temp),
                 _as_float(power),
@@ -2069,6 +2171,8 @@ def monitor_and_adjust(
                 info.get("power_fault"),
                 info.get("overheat_mode"),
             )
+            if retreat_clocks is None:
+                immediate_retreat = False
             if (
                 immediate_retreat
                 and pending is not None
@@ -2147,6 +2251,8 @@ def monitor_and_adjust(
                     hashrate_short = hashrate_well_below_expected(
                         info.get("hashRate_1m"), expected_hashrate
                     )
+            if pool_is_down(info):
+                hashrate_short = False
 
             error_budget = max_error_percentage
             error_ok = (
@@ -2214,11 +2320,98 @@ def monitor_and_adjust(
                 and confirmed[1] == probe["to_volt"]
                 and now >= settle_until
             )
-            # A dead board restarts below, even if this step is still on trial.
+            # A dead board on an open trial steps back to the clocks it left.
+            # The pool being down is not that failure: the trial stays open
+            # and the zero-hashrate path holds instead of rebooting.
             # A 1-minute rate of 0 with live hashrate still up fails the trial.
-            if probe_ready and board_hashrate_is_dead(info):
-                probe = None
+            if probe_ready and board_hashrate_is_dead(info) and pool_is_down(info):
                 probe_ready = False
+            elif probe_ready and board_hashrate_is_dead(info):
+                back_frequency = probe["from_freq"]
+                back_voltage = probe["from_volt"]
+                failed_frequency = probe["to_freq"]
+                kind = probe.get("kind") or "frequency"
+                if kind == "trim":
+                    log_callback(
+                        f"{bitaxe_ip} -> {confirmed[1]} mV stopped hashing. "
+                        f"Restoring {back_voltage} mV.",
+                        "info",
+                    )
+                else:
+                    log_callback(
+                        f"{bitaxe_ip} -> {failed_frequency} MHz stopped hashing. "
+                        f"Stepping back to {back_frequency} MHz.",
+                        "info",
+                    )
+                reverted = _same_setpoint((back_frequency, back_voltage), confirmed)
+                if not reverted:
+                    applied_settings = set_system_settings(
+                        bitaxe_ip, back_voltage, back_frequency
+                    )
+                    log_callback(applied_settings, "info")
+                    last_tune_time = time.time()
+                    reverted = settings_were_applied(applied_settings)
+                    if reverted:
+                        pending = (back_frequency, back_voltage)
+                        setpoint_since = None
+                        settle_until = time.time() + refresh_interval
+                        hashrate_history.clear()
+                        rolling_hashrate.clear()
+                        error_samples.clear()
+                        window_positive_hash = False
+                        window_zero_hash = False
+                    else:
+                        log_callback(
+                            f"{bitaxe_ip} -> Miner rejected the change. Setpoint left unchanged.",
+                            "warning",
+                        )
+                if reverted:
+                    if kind == "trim":
+                        # Keep the probe until the miner echoes the restore.
+                        # Stopping during that settle must not save the trim.
+                        probe["restore"] = True
+                        phase = "hold"
+                        hold_since = time.time()
+                        ceiling_saved = False
+                        trim_good_voltage = back_voltage
+                        retreat_reason = "restore voltage"
+                        signature = (back_frequency, back_voltage, limit_wall)
+                        if signature != saved_signature:
+                            remember_setpoint(
+                                bitaxe_ip,
+                                back_frequency,
+                                back_voltage,
+                                limit_wall,
+                            )
+                            saved_signature = signature
+                    else:
+                        probe = None
+                        hash_ceiling = back_frequency
+                        minute_retry_frequency = None
+                        pll_retry_frequency = None
+                        limit_wall = wall_type_from_reason(
+                            "step frequency down after good hashrate"
+                        )
+                        signature = (back_frequency, back_voltage, limit_wall)
+                        if signature != saved_signature:
+                            remember_setpoint(
+                                bitaxe_ip,
+                                back_frequency,
+                                back_voltage,
+                                limit_wall,
+                            )
+                            saved_signature = signature
+                        retreat_reason = "step frequency down after good hashrate"
+                    _publish_status(
+                        bitaxe_ip,
+                        phase=phase,
+                        wall_type=limit_wall,
+                        error_percentage=error_percentage,
+                        reason=retreat_reason,
+                    )
+                if _wait(event, interval):
+                    break
+                continue
             if probe_ready:
                 current_good = good_hashrate(measured_hashrate(info), error_percentage)
                 kind = probe.get("kind") or "frequency"
@@ -2393,8 +2586,10 @@ def monitor_and_adjust(
                                 "warning",
                             )
                     if reverted:
-                        probe = None
                         if kind == "trim":
+                            # Keep the probe until the miner echoes the restore.
+                            # Stopping during that settle must not save the trim.
+                            probe["restore"] = True
                             phase = "hold"
                             hold_since = time.time()
                             ceiling_saved = False
@@ -2403,23 +2598,35 @@ def monitor_and_adjust(
                                 f"{bitaxe_ip} -> Holding {back_frequency} MHz / {back_voltage} mV.",
                                 "success",
                             )
-                        elif pll_can_retry:
-                            pll_retry_frequency = retry_frequency
-                            retreat_reason = "retry frequency"
-                        elif first_minute_retry:
-                            minute_retry_frequency = failed_frequency
-                            pll_retry_frequency = None
-                            retreat_reason = "retry minute rate"
-                        else:
-                            hash_ceiling = back_frequency
-                            minute_retry_frequency = None
-                            pll_retry_frequency = None
-                            limit_wall = wall_type_from_reason(
-                                "step frequency down after good hashrate"
-                            )
-                            retreat_reason = "step frequency down after good hashrate"
-                        if kind == "trim":
                             retreat_reason = "restore voltage"
+                        else:
+                            probe = None
+                            if pll_can_retry:
+                                pll_retry_frequency = retry_frequency
+                                retreat_reason = "retry frequency"
+                            elif first_minute_retry:
+                                minute_retry_frequency = failed_frequency
+                                pll_retry_frequency = None
+                                retreat_reason = "retry minute rate"
+                            else:
+                                hash_ceiling = back_frequency
+                                minute_retry_frequency = None
+                                pll_retry_frequency = None
+                                limit_wall = wall_type_from_reason(
+                                    "step frequency down after good hashrate"
+                                )
+                                retreat_reason = (
+                                    "step frequency down after good hashrate"
+                                )
+                        signature = (back_frequency, back_voltage, limit_wall)
+                        if signature != saved_signature:
+                            remember_setpoint(
+                                bitaxe_ip,
+                                back_frequency,
+                                back_voltage,
+                                limit_wall,
+                            )
+                            saved_signature = signature
                         _publish_status(
                             bitaxe_ip,
                             phase=phase,
@@ -2566,6 +2773,27 @@ def monitor_and_adjust(
                 new_voltage = confirmed[1]
                 reason = "holding for fan"
 
+            if reason == "holding at zero hashrate" and pool_is_down(info):
+                if not pool_down_logged:
+                    log_callback(
+                        f"{bitaxe_ip} -> Hashrate is 0 GH/s and the pool is down. Holding.",
+                        "warning",
+                    )
+                    pool_down_logged = True
+                _publish_status(
+                    bitaxe_ip,
+                    phase=phase,
+                    wall_type=limit_wall,
+                    error_percentage=error_percentage,
+                    reason="holding for pool",
+                )
+                last_tune_time = time.time()
+                if _wait(event, interval):
+                    break
+                continue
+            if not (pool_is_down(info) and board_hashrate_is_dead(info)):
+                pool_down_logged = False
+
             if reason == "holding at zero hashrate":
                 _publish_status(
                     bitaxe_ip,
@@ -2686,6 +2914,8 @@ def monitor_and_adjust(
                 last_tune_time = time.time()
                 if settings_were_applied(applied_settings):
                     _arm_droop_grace(confirmed[1], new_voltage)
+                    if _is_safety_retreat(reason):
+                        safety_settle_until = time.time() + refresh_interval
                     if reason == "restore voltage":
                         phase = "hold"
                         hold_since = time.time()
@@ -2736,15 +2966,16 @@ def monitor_and_adjust(
                         blocked_for_rejects = (
                             "rejected shares" in (reason or "").lower()
                         )
-                    if new_frequency < confirmed[0] and _quality_frequency_retreat(
-                        reason
-                    ):
+                    if new_frequency < confirmed[0]:
                         signature = (new_frequency, new_voltage, limit_wall)
                         if signature != saved_signature:
                             remember_setpoint(
                                 bitaxe_ip, new_frequency, new_voltage, limit_wall
                             )
                             saved_signature = signature
+                    if new_frequency < confirmed[0] and _quality_frequency_retreat(
+                        reason
+                    ):
                         trim_good_voltage = new_voltage
                         trim_after_retreat = True
                         if int(new_voltage) >= int(limits["max_volt"]):
