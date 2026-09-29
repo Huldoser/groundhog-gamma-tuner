@@ -5,19 +5,22 @@ repos:
       - id: ruff-check
         name: ruff check
         entry: python -m ruff check
-        language: system
+        language: python
+        additional_dependencies: ["ruff>=0.16.8"]
         types: [python]
         stages: [pre-push]
       - id: ruff-format
         name: ruff format
         entry: python -m ruff format --check
-        language: system
+        language: python
+        additional_dependencies: ["ruff>=0.16.8"]
         types: [python]
         stages: [pre-push]
       - id: unittest
         name: unittest
         entry: python -m unittest
-        language: system
+        language: python
+        additional_dependencies: ["requests>=2.34.2"]
         pass_filenames: false
         always_run: true
         stages: [pre-push]
