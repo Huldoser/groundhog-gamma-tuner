@@ -23,8 +23,11 @@ This is an unofficial tool. It is not affiliated with Hurllz or the Bitaxe proje
 3. Lowers frequency if ASIC temperature, regulator temperature, power, input voltage, or core-voltage droop crosses the limit.
    Temperature caps stay at least 4°C under the AxeOS overheat trip (75°C ASIC, 105°C regulator). Inside that margin the tuner sheds 20 MHz and 10 mV at a time, every 30 seconds, so AxeOS does not cut power and drop the clocks by 100 MHz and 100 mV on its own.
    If AxeOS does trip, the tuner notices the lower clocks, puts them back on the saved minimum once the chip is cool, and climbs again from there. If AxeOS leaves the chip off in overheat mode, the tuner writes the minimum clocks, clears the flag, and restarts the miner once.
+   A heat retreat also drops one voltage step while errors are at most half the budget, so voltage raised for a higher clock does not keep heating a lower one. At the frequency floor, voltage only drops for heat while errors still fit the budget, and never for errors.
 4. Raises voltage only when the ASIC error percentage is above the budget, then raises frequency while errors stay inside that budget.
 5. Trims voltage down at the ceiling, then holds. The last good setpoint is saved so the next start does not begin from stock. The fan stays at full speed for the whole session, so a warmer room is what moves the clocks.
+   A hold under a hashrate or silicon wall climbs again once the chip is 3°C cooler than when it hit that wall, or after 6 hours, as long as errors are at most half the budget.
+6. Restarts a miner once when its settled errors stay far over the budget (10%, or 5× a larger budget). That is not a silicon wall, and AxeOS can leave the ASIC like that after an overheat recovery. If a soft restart does not clear it, unplug the miner for 30 seconds.
 
 ![Dashboard while the tuner is running](docs/dashboard.png)
 

@@ -470,6 +470,57 @@ FIRMWARE_DROP_VOLT_MV = 50
 OVERHEAT_LATCH_SECONDS = 120
 
 
+# A hold that stopped under a hashrate or silicon wall climbs again once the
+# chip is this much cooler than when it hit that wall, or after this long.
+# Errors grow with heat, so a wall found on a hot afternoon may not be there at night.
+RECLIMB_COOLER_C = 3.0
+RECLIMB_AFTER_SECONDS = 6 * 60 * 60
+# Settled errors this far over budget, with no trial open, are not a silicon
+# wall. AxeOS can leave the ASIC like that after an overheat recovery. One
+# restart per episode re-initialises it.
+HIGH_ERROR_RESTART_PERCENT = 10.0
+
+
+def hold_may_reclimb(
+    temp,
+    wall_temp,
+    wall_since,
+    now,
+    max_temp,
+    temp_tolerance,
+    error_percentage,
+    max_error_percentage,
+):
+    """True when a hold under a wall should try climbing again.
+
+    Errors have to be at most half the budget and the chip a full tolerance
+    band under its cap. Then the chip has to be RECLIMB_COOLER_C cooler than
+    at the wall, or the wall has to be RECLIMB_AFTER_SECONDS old.
+    """
+    temp_value = _usable_temp(temp)
+    error = _as_float(error_percentage)
+    budget = _as_float(max_error_percentage)
+    if temp_value is None or error is None or budget is None or wall_since is None:
+        return False
+    if error > budget / 2:
+        return False
+    band = temp_tolerance if temp_tolerance and temp_tolerance > 0 else 0
+    if temp_value > max_temp - band:
+        return False
+    wall_value = _usable_temp(wall_temp)
+    if wall_value is not None and temp_value <= wall_value - RECLIMB_COOLER_C:
+        return True
+    return now - wall_since >= RECLIMB_AFTER_SECONDS
+
+
+def error_restart_limit(max_error_percentage):
+    """Settled error percentage that earns the ASIC a restart."""
+    budget = _as_float(max_error_percentage)
+    if budget is None or budget < 0:
+        budget = DEFAULT_MAX_ERROR_PERCENTAGE
+    return max(HIGH_ERROR_RESTART_PERCENT, 5 * budget)
+
+
 def near_firmware_trip(temp, vr_temp):
     """True when either sensor is inside the margin under the AxeOS overheat trip."""
     temp_value = _usable_temp(temp)
@@ -1185,7 +1236,14 @@ def _apply_step_down(
     reason_tag,
     frequency_steps=1,
     voltage_steps=0,
+    shed_voltage_at_floor=True,
 ):
+    """Step down with _step_down, or hold at the frequency floor.
+
+    `shed_voltage_at_floor=False` holds instead of lowering voltage once
+    frequency is at its floor. Errors and short hashrate come from too
+    little voltage, so a lower one only makes them worse.
+    """
     new_frequency, new_voltage, step_reason = _step_down(
         current_frequency,
         current_voltage,
@@ -1196,6 +1254,8 @@ def _apply_step_down(
         frequency_steps,
         voltage_steps,
     )
+    if step_reason == "step voltage down" and not shed_voltage_at_floor:
+        return current_frequency, current_voltage, "holding at minimum"
     if step_reason == "holding at minimum" or not reason_tag:
         chosen = step_reason
     else:
@@ -1281,11 +1341,18 @@ def decide_adjustment(
     over_temp = temp_value is not None and temp_value > max_temp
     over_power = power_value is not None and power_value > max_watts
     over_vr = vr_value is not None and vr_value > max_vr_temp
+    error = _as_float(error_percentage)
+    error_budget = (
+        DEFAULT_MAX_ERROR_PERCENTAGE
+        if max_error_percentage is None
+        else float(max_error_percentage)
+    )
     near_trip = near_firmware_trip(temp_value, vr_value)
     if over_temp or over_power or over_vr or near_trip:
         tag = None if (over_temp or over_vr) else "power limit"
         frequency_steps = 1
         voltage_steps = 0
+        shed_at_floor = True
         if over_temp or over_vr:
             counts = []
             if over_temp:
@@ -1297,12 +1364,21 @@ def decide_adjustment(
                     _thermal_frequency_steps(vr_value - max_vr_temp, vr_tolerance)
                 )
             frequency_steps = max(counts)
+            # Voltage raised for an earlier, higher clock is extra heat at a
+            # lower one. Shed a step with the frequency while errors show
+            # margin, so the heat budget goes to frequency instead.
+            if error is not None and error <= error_budget / 2:
+                voltage_steps = 1
+            # At the floor, a lower voltage trades heat for errors. Only do
+            # that while errors still fit the budget.
+            shed_at_floor = error is None or error <= error_budget
         if near_trip:
             # AxeOS would cut power and drop 100 MHz / 100 mV. Shed voltage
             # with frequency so the heat falls before it gets there.
             tag = "trip guard"
             frequency_steps = max(frequency_steps, TRIP_GUARD_FREQUENCY_STEPS)
             voltage_steps = 1
+            shed_at_floor = True
         return _apply_step_down(
             current_frequency,
             current_voltage,
@@ -1315,6 +1391,7 @@ def decide_adjustment(
             tag,
             frequency_steps,
             voltage_steps,
+            shed_at_floor,
         )
 
     if _overheat_mode_set(overheat_mode) or (
@@ -1427,12 +1504,6 @@ def decide_adjustment(
     if rate is not None and rate <= 0:
         return current_frequency, current_voltage, "holding at zero hashrate"
 
-    error = _as_float(error_percentage)
-    error_budget = (
-        DEFAULT_MAX_ERROR_PERCENTAGE
-        if max_error_percentage is None
-        else float(max_error_percentage)
-    )
     error_high = error is not None and error > error_budget
     short_hash = bool(hashrate_short)
     above_target_bad = bool(above_target_high)
@@ -1461,6 +1532,7 @@ def decide_adjustment(
             frequency_step,
             voltage_step,
             "rejected shares",
+            shed_voltage_at_floor=False,
         )
 
     if quality_bad:
@@ -1497,6 +1569,7 @@ def decide_adjustment(
                 frequency_step,
                 voltage_step,
                 quality_tag,
+                shed_voltage_at_floor=False,
             )
         if vr_value is None:
             return current_frequency, current_voltage, "holding for telemetry"
@@ -1523,6 +1596,7 @@ def decide_adjustment(
             frequency_step,
             voltage_step,
             quality_tag,
+            shed_voltage_at_floor=False,
         )
 
     if thermal_hold and phase == "climb":
@@ -2024,6 +2098,11 @@ def monitor_and_adjust(
     window_positive_hash = False
     window_zero_hash = False
     zero_restarted = False
+    error_restarted = False
+    error_restart_noted = False
+    # ASIC temperature and time when the current hashrate or silicon wall was hit.
+    wall_temp = None
+    wall_since = None
     flatline_restarted = False
     flatline_since = None
     flatline_live = None
@@ -2046,6 +2125,36 @@ def monitor_and_adjust(
     last_accepted = None
     last_rejected = None
     last_reasons = None
+
+    def _restart_on_floor(message):
+        """Restart the miner after putting clocks under the floor back on it.
+
+        A restart replays the clocks AxeOS saved, so the floor is written first.
+        The next decision waits out a fresh settle.
+        """
+        nonlocal pending, setpoint_since, settle_until, last_tune_time
+        nonlocal last_accepted, last_rejected, last_reasons
+        floor = floor_setpoint(
+            confirmed[0], confirmed[1], limits["min_freq"], limits["min_volt"]
+        )
+        if not _same_setpoint(floor, confirmed):
+            applied = set_system_settings(bitaxe_ip, floor[1], floor[0])
+            log_callback(applied, "info")
+            if settings_were_applied(applied):
+                pending = floor
+                setpoint_since = None
+        log_callback(message, "error")
+        log_callback(restart_bitaxe(bitaxe_ip), "warning")
+        error_samples.clear()
+        hashrate_history.clear()
+        rolling_hashrate.clear()
+        last_accepted = None
+        last_rejected = None
+        last_reasons = None
+        reject_sample.reset()
+        settle_until = time.time() + refresh_interval
+        last_tune_time = time.time()
+
     _publish_status(bitaxe_ip, phase=phase, wall_type=limit_wall, reason="")
 
     while not event.is_set():
@@ -2560,6 +2669,39 @@ def monitor_and_adjust(
                 hashrate_short = False
 
             error_budget = max_error_percentage
+            if (
+                probe is None
+                and error_percentage is not None
+                and error_percentage >= error_restart_limit(error_budget)
+                and not pool_is_down(info)
+            ):
+                if not error_restarted:
+                    error_restarted = True
+                    error_restart_noted = False
+                    _restart_on_floor(
+                        f"{bitaxe_ip} -> Errors averaged {error_percentage:.1f}% "
+                        "after settle. That is not a silicon wall. Restarting..."
+                    )
+                    _publish_status(
+                        bitaxe_ip,
+                        phase=phase,
+                        wall_type=limit_wall,
+                        error_percentage=error_percentage,
+                        reason="high error restart",
+                    )
+                    if _wait(event, interval):
+                        break
+                    continue
+                if not error_restart_noted:
+                    error_restart_noted = True
+                    log_callback(
+                        f"{bitaxe_ip} -> Errors still {error_percentage:.1f}% after "
+                        "restart. Tuning continues.",
+                        "error",
+                    )
+            elif error_percentage is not None and error_percentage <= error_budget:
+                error_restarted = False
+                error_restart_noted = False
             error_ok = (
                 error_percentage is not None
                 and error_percentage <= error_budget
@@ -2692,6 +2834,8 @@ def monitor_and_adjust(
                     else:
                         probe = None
                         hash_ceiling = back_frequency
+                        wall_temp = _usable_temp(temp)
+                        wall_since = time.time()
                         minute_retry_frequency = None
                         pll_retry_frequency = None
                         limit_wall = wall_type_from_reason(
@@ -2915,6 +3059,8 @@ def monitor_and_adjust(
                                 retreat_reason = "retry minute rate"
                             else:
                                 hash_ceiling = back_frequency
+                                wall_temp = _usable_temp(temp)
+                                wall_since = time.time()
                                 minute_retry_frequency = None
                                 pll_retry_frequency = None
                                 limit_wall = wall_type_from_reason(
@@ -2956,6 +3102,54 @@ def monitor_and_adjust(
                 probe = None
                 pll_retry_frequency = None
                 minute_retry_frequency = None
+
+            if (
+                phase == "hold"
+                and probe is None
+                and pending is None
+                and (hash_ceiling is not None or blocked_frequency is not None)
+                and not thermal_hold
+                and not safety_hold
+                and not hashrate_short
+                and hold_may_reclimb(
+                    temp,
+                    wall_temp,
+                    wall_since,
+                    now,
+                    limits["max_temp"],
+                    temp_tolerance,
+                    error_percentage,
+                    error_budget,
+                )
+            ):
+                # The wall may have been heat, not silicon. Try again from here.
+                wall_frequency = (
+                    blocked_frequency if blocked_frequency is not None else hash_ceiling
+                )
+                log_callback(
+                    f"{bitaxe_ip} -> Errors and heat have room under the "
+                    f"{wall_frequency} MHz wall. Climbing again.",
+                    "info",
+                )
+                hash_ceiling = None
+                blocked_frequency = None
+                blocked_voltage = None
+                blocked_needs_cool = False
+                blocked_for_rejects = False
+                wall_temp = None
+                wall_since = None
+                phase = "climb"
+                hold_since = None
+                ceiling_saved = False
+                trim_good_voltage = None
+                trim_after_retreat = False
+                _publish_status(
+                    bitaxe_ip,
+                    phase=phase,
+                    wall_type=limit_wall,
+                    error_percentage=error_percentage,
+                    reason="climb again",
+                )
 
             climb_cap = limits["max_freq"]
             if hash_ceiling is not None:
@@ -3110,37 +3304,10 @@ def monitor_and_adjust(
                     reason=reason,
                 )
                 if not zero_restarted:
-                    # A restart replays the clocks AxeOS saved. Clocks under
-                    # the floor go back onto it first.
-                    floor_frequency, floor_voltage = floor_setpoint(
-                        confirmed[0],
-                        confirmed[1],
-                        limits["min_freq"],
-                        limits["min_volt"],
+                    _restart_on_floor(
+                        f"{bitaxe_ip} -> Hashrate is 0 GH/s after settle. Restarting..."
                     )
-                    if not _same_setpoint((floor_frequency, floor_voltage), confirmed):
-                        applied_settings = set_system_settings(
-                            bitaxe_ip, floor_voltage, floor_frequency
-                        )
-                        log_callback(applied_settings, "info")
-                        if settings_were_applied(applied_settings):
-                            pending = (floor_frequency, floor_voltage)
-                            setpoint_since = None
-                    log_callback(
-                        f"{bitaxe_ip} -> Hashrate is 0 GH/s after settle. Restarting...",
-                        "error",
-                    )
-                    log_callback(restart_bitaxe(bitaxe_ip), "warning")
                     zero_restarted = True
-                    error_samples.clear()
-                    hashrate_history.clear()
-                    rolling_hashrate.clear()
-                    last_accepted = None
-                    last_rejected = None
-                    last_reasons = None
-                    reject_sample.reset()
-                    settle_until = time.time() + refresh_interval
-                    last_tune_time = time.time()
                 else:
                     log_callback(
                         f"{bitaxe_ip} -> Hashrate still 0 GH/s after restart. Holding.",
@@ -3285,6 +3452,8 @@ def monitor_and_adjust(
                     if new_frequency < confirmed[0] and _blocks_reclimb(reason):
                         blocked_frequency = confirmed[0]
                         blocked_voltage = confirmed[1]
+                        wall_temp = _usable_temp(temp)
+                        wall_since = time.time()
                         # Cool-down clears a thermal hold on its own. A silicon
                         # or reject block stays until voltage rises, and a
                         # reject block can also clear on a clean share sample.

@@ -190,7 +190,8 @@ class DecisionTests(unittest.TestCase):
             )
         )
         self.assertEqual(frequency, 695)
-        self.assertEqual(voltage, 1100)
+        # 0% errors leaves margin, so one voltage step goes with the heat retreat.
+        self.assertEqual(voltage, 1090)
         self.assertIn("frequency", reason)
 
     def test_regulator_under_its_cap_still_climbs(self):
@@ -219,7 +220,7 @@ class DecisionTests(unittest.TestCase):
             )
         )
         self.assertEqual(frequency, 480)
-        self.assertEqual(voltage, 1100)
+        self.assertEqual(voltage, 1090)
         self.assertIn("frequency", reason)
 
     def test_power_limit_still_takes_one_frequency_step(self):
@@ -260,6 +261,7 @@ class DecisionTests(unittest.TestCase):
                 min_freq=350,
                 temp=61,
                 max_temp=60,
+                error_percentage=1.5,
             )
         )
         self.assertEqual((stepped_frequency, stepped_voltage), (350, 1100))
@@ -631,7 +633,7 @@ class DecisionTests(unittest.TestCase):
             **_limits(temp=None, vr_temp=95, max_vr_temp=88, vr_temp_tolerance=3)
         )
         self.assertLess(frequency, 500)
-        self.assertEqual(voltage, 1100)
+        self.assertEqual(voltage, 1090)
         self.assertIn("frequency", reason)
 
     def test_zero_temp_does_not_climb_and_zero_core_voltage_is_not_droop(self):
@@ -699,6 +701,7 @@ class DecisionTests(unittest.TestCase):
                 temp=64,
                 max_temp=60,
                 temp_tolerance=3,
+                error_percentage=1.5,
             )
         )
         self.assertEqual(two_band[:2], (490, 1100))
@@ -708,6 +711,7 @@ class DecisionTests(unittest.TestCase):
                 temp=67,
                 max_temp=60,
                 temp_tolerance=3,
+                error_percentage=1.5,
             )
         )
         self.assertEqual(three_band[:2], (485, 1100))
@@ -717,6 +721,7 @@ class DecisionTests(unittest.TestCase):
                 temp=61,
                 max_temp=60,
                 temp_tolerance=3,
+                error_percentage=1.5,
                 vr_temp=100,
                 max_vr_temp=85,
                 vr_temp_tolerance=3,
@@ -730,6 +735,7 @@ class DecisionTests(unittest.TestCase):
                 temp=70,
                 max_temp=60,
                 temp_tolerance=0,
+                error_percentage=1.5,
             )
         )
         self.assertEqual(zero_tolerance[:2], (495, 1100))
@@ -741,17 +747,18 @@ class DecisionTests(unittest.TestCase):
                 temp=70,
                 max_temp=60,
                 temp_tolerance=2,
+                error_percentage=1.5,
             )
         )
         self.assertEqual(near_floor[:2], (400, 1100))
 
     def test_equal_to_a_cap_does_not_retreat_and_one_past_does(self):
         at_temp = autotune.decide_adjustment(
-            **_limits(temp=60, max_temp=60, temp_tolerance=2)
+            **_limits(temp=60, max_temp=60, temp_tolerance=2, error_percentage=1.5)
         )
         self.assertEqual(at_temp[:2], (505, 1100))
         past_temp = autotune.decide_adjustment(
-            **_limits(temp=61, max_temp=60, temp_tolerance=2)
+            **_limits(temp=61, max_temp=60, temp_tolerance=2, error_percentage=1.5)
         )
         self.assertEqual(past_temp[:2], (495, 1100))
         under_decimal = autotune.decide_adjustment(
@@ -769,6 +776,7 @@ class DecisionTests(unittest.TestCase):
                 vr_temp=85,
                 max_vr_temp=85,
                 vr_temp_tolerance=3,
+                error_percentage=1.5,
                 max_temp=68,
             )
         )
@@ -780,6 +788,7 @@ class DecisionTests(unittest.TestCase):
                 vr_temp=86,
                 max_vr_temp=85,
                 vr_temp_tolerance=3,
+                error_percentage=1.5,
                 max_temp=68,
             )
         )
@@ -1401,9 +1410,58 @@ class DecisionTests(unittest.TestCase):
         self.assertEqual(under_volt_floor[:2], (480, 950))
 
         under_margin = autotune.decide_adjustment(
-            **_limits(temp=70, max_temp=68, temp_tolerance=3)
+            **_limits(temp=70, max_temp=68, temp_tolerance=3, error_percentage=1.5)
         )
         self.assertEqual(under_margin[:2], (495, 1100))
+
+    def test_errors_at_the_frequency_floor_never_lower_voltage(self):
+        floor = {"current_frequency": 400, "current_voltage": 1050, "min_freq": 400}
+        for extra in (
+            {"phase": "hold", "error_percentage": 5},
+            {"phase": "climb", "error_percentage": 5, "thermal_hold": True},
+            {"phase": "hold", "hashrate_short": True},
+            {"phase": "hold", "above_target_high": True},
+            {"phase": "hold", "reject_share": 0.05},
+        ):
+            held = autotune.decide_adjustment(**_limits(**floor, **extra))
+            self.assertEqual(held, (400, 1050, "holding at minimum"), extra)
+
+    def test_heat_at_the_floor_sheds_voltage_only_while_errors_fit(self):
+        hot = {
+            "current_frequency": 400,
+            "current_voltage": 1050,
+            "min_freq": 400,
+            "temp": 65,
+            "max_temp": 60,
+        }
+        starved = autotune.decide_adjustment(**_limits(**hot, error_percentage=5))
+        self.assertEqual(starved, (400, 1050, "holding at minimum"))
+        fits = autotune.decide_adjustment(**_limits(**hot, error_percentage=1.5))
+        self.assertEqual(fits[:2], (400, 1040))
+        # The trip guard still sheds, errors or not.
+        tripping = autotune.decide_adjustment(
+            **_limits(**dict(hot, temp=72), error_percentage=5)
+        )
+        self.assertEqual(tripping[:2], (400, 1040))
+
+    def test_heat_retreat_sheds_a_voltage_step_only_with_error_margin(self):
+        margin = autotune.decide_adjustment(
+            **_limits(temp=61, max_temp=60, error_percentage=0.5)
+        )
+        self.assertEqual(margin, (495, 1090, "step frequency down"))
+        tight = autotune.decide_adjustment(
+            **_limits(temp=61, max_temp=60, error_percentage=1.5)
+        )
+        self.assertEqual(tight, (495, 1100, "step frequency down"))
+        unknown = autotune.decide_adjustment(
+            **_limits(temp=61, max_temp=60, error_percentage=None)
+        )
+        self.assertEqual(unknown[:2], (495, 1100))
+        # Power is not heat: its retreat keeps voltage.
+        power = autotune.decide_adjustment(
+            **_limits(power=30, max_watts=25, error_percentage=0)
+        )
+        self.assertEqual(power[:2], (495, 1100))
 
     def test_trip_guard_asks_for_an_immediate_retreat(self):
         self.assertTrue(_retreat(temp=72, max_temp=80))
@@ -1431,6 +1489,37 @@ class DecisionTests(unittest.TestCase):
         self.assertFalse(autotune.firmware_lowered_clocks((500, 1100), (400, 1150)))
         self.assertFalse(autotune.firmware_lowered_clocks(None, (250, 900)))
         self.assertFalse(autotune.firmware_lowered_clocks((500, 1100), None))
+
+    def test_hold_may_reclimb_when_cooler_than_the_wall_or_after_a_long_hold(self):
+        limit = autotune.RECLIMB_AFTER_SECONDS
+        args = {"max_temp": 68, "temp_tolerance": 3, "max_error_percentage": 2.0}
+        self.assertTrue(
+            autotune.hold_may_reclimb(60, 64, 0, 10, error_percentage=0.5, **args)
+        )
+        self.assertFalse(
+            autotune.hold_may_reclimb(62, 64, 0, 10, error_percentage=0.5, **args)
+        )
+        self.assertTrue(
+            autotune.hold_may_reclimb(62, 64, 0, limit, error_percentage=0.5, **args)
+        )
+        # Errors over half the budget or a chip inside its band stays put.
+        self.assertFalse(
+            autotune.hold_may_reclimb(60, 64, 0, limit, error_percentage=1.5, **args)
+        )
+        self.assertFalse(
+            autotune.hold_may_reclimb(66, 70, 0, limit, error_percentage=0.5, **args)
+        )
+        self.assertFalse(
+            autotune.hold_may_reclimb(60, 64, None, limit, error_percentage=0.5, **args)
+        )
+        self.assertFalse(
+            autotune.hold_may_reclimb(None, 64, 0, limit, error_percentage=0.5, **args)
+        )
+
+    def test_error_restart_limit_scales_with_the_budget(self):
+        self.assertEqual(autotune.error_restart_limit(2.0), 10.0)
+        self.assertEqual(autotune.error_restart_limit(4.0), 20.0)
+        self.assertEqual(autotune.error_restart_limit(None), 10.0)
 
     def test_overheat_latch_needs_time_no_power_and_a_cool_regulator(self):
         info = _info(overheat_mode=1, temp=0, vrTemp=50, power=0.2)
@@ -4950,6 +5039,110 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertLess(calls[1][0], calls[0][0])
         self.assertLess(calls[1][1], calls[0][1])
+
+    def test_errors_far_over_budget_restart_the_miner_once(self):
+        state = {"frequency": 250, "voltage": 1120}
+        calls = []
+        restarts = []
+        logs = []
+        stop_event = threading.Event()
+
+        def set_settings(ip, volt, freq):
+            calls.append((int(freq), int(volt)))
+            state["frequency"] = int(freq)
+            state["voltage"] = int(volt)
+            return (
+                f"{ip} -> Applied settings: Voltage = {volt}mV, Frequency = {freq}MHz"
+            )
+
+        def restart(ip):
+            restarts.append((state["frequency"], state["voltage"]))
+            return f"{ip} -> Restart initiated."
+
+        def get_info(ip):
+            # Warm enough that the floor restore waits. The ASIC is in a bad
+            # state, so errors stay high whatever the clocks are.
+            return _info(
+                frequency=state["frequency"],
+                voltage=state["voltage"],
+                temp=59,
+                errorPercentage=57,
+                hashRate=120,
+                expectedHashrate=state["frequency"] * 2.04,
+            )
+
+        with patched_io(get_info, set_settings, restart=restart):
+            thread = _start_miner(
+                "miner",
+                stop_event,
+                lambda message, level="info": logs.append(message),
+                start_freq=250,
+                start_volt=1120,
+                min_freq=400,
+            )
+            time.sleep(0.6)
+            stop_event.set()
+            thread.join(2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(restarts), 1)
+        # The floor went on before the restart, so the reboot does not replay 250 MHz.
+        self.assertEqual(restarts[0][0], 400)
+        self.assertTrue(any("not a silicon wall" in message for message in logs))
+        self.assertTrue(any("still 57.0%" in message for message in logs))
+
+    def test_a_hold_under_a_hot_wall_climbs_again_once_the_chip_cools(self):
+        state = {"frequency": 410, "voltage": 1100, "cool": False, "seen_wall": False}
+        calls = []
+        logs = []
+        stop_event = threading.Event()
+
+        def set_settings(ip, volt, freq):
+            freq = int(freq)
+            volt = int(volt)
+            calls.append((freq, volt))
+            if freq >= 420:
+                if state["cool"]:
+                    stop_event.set()
+                state["seen_wall"] = True
+            elif state["seen_wall"]:
+                # The tuner stepped back from 420. Let the room cool down.
+                state["cool"] = True
+            state["frequency"] = freq
+            state["voltage"] = volt
+            return (
+                f"{ip} -> Applied settings: Voltage = {volt}mV, Frequency = {freq}MHz"
+            )
+
+        def get_info(ip):
+            frequency = state["frequency"]
+            hot_wall = frequency >= 420 and not state["cool"]
+            rate = frequency * 2.04
+            return _info(
+                frequency=frequency,
+                voltage=state["voltage"],
+                temp=50 if state["cool"] else 55,
+                errorPercentage=5 if hot_wall else 0,
+                hashRate=rate,
+                hashRate_1m=rate,
+                hashRate_10m=rate,
+                expectedHashrate=rate,
+                actualFrequency=frequency,
+            )
+
+        with patched_io(get_info, set_settings):
+            thread = _start_miner(
+                "miner",
+                stop_event,
+                lambda message, level="info": logs.append(message),
+                start_freq=410,
+                start_volt=1100,
+                max_volt=1100,
+            )
+            thread.join(4)
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(state["cool"])
+        self.assertTrue(any("Climbing again" in message for message in logs))
+        self.assertGreaterEqual(calls[-1][0], 420)
 
     def test_temperature_caps_at_the_firmware_trip_are_lowered_and_logged(self):
         logs = []
