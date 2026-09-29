@@ -32,6 +32,13 @@ DEFAULT_MAX_ERROR_PERCENTAGE = 2.0
 DEFAULT_MAX_DROOP_MV = 40
 DEFAULT_CEILING_SOAK_SECONDS = 30 * 60
 
+# AxeOS v2.15.1 cuts ASIC power above 75°C on the ASIC or 105°C on the regulator.
+# After it cools, it saves clocks 100 MHz and 100 mV lower, with no floor.
+# User caps and the tuner's emergency retreat stay this margin under those trips.
+FIRMWARE_ASIC_TRIP_C = 75.0
+FIRMWARE_VR_TRIP_C = 105.0
+FIRMWARE_TRIP_MARGIN_C = 4.0
+
 # Gamma 601 clocks as they ship from the factory.
 STOCK_FREQ = 525
 STOCK_VOLT = 1150

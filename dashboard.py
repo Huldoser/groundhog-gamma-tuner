@@ -595,6 +595,8 @@ def alert_kind(row):
         return "overheat"
     if (row or {}).get("power_fault"):
         return "power_fault"
+    if (row or {}).get("floor_alert"):
+        return "below_floor"
     return ""
 
 
@@ -606,6 +608,8 @@ def alert_message(name, kind):
         return f"{label} is in overheat mode."
     if kind == "power_fault":
         return f"{label} reported a power fault."
+    if kind == "below_floor":
+        return f"{label} is running under its minimum clocks."
     return ""
 
 
@@ -761,6 +765,16 @@ def under_limit(value, limit):
     return number < floor
 
 
+def below_floor(frequency, core_voltage, stored):
+    """True when the miner reports clocks under its saved min frequency or voltage.
+
+    AxeOS can save clocks under the floor after an overheat trip.
+    """
+    return under_limit(frequency, _cap_or_default(stored, "min_freq")) or under_limit(
+        core_voltage, _cap_or_default(stored, "min_volt")
+    )
+
+
 def limit_level(value, limit, tolerance=0):
     """'bad' above the cap, 'warn' inside the tolerance band under it, else ''."""
     number = parse_display_number(value)
@@ -849,6 +863,7 @@ def blank_miner_row(nickname, ip):
         "error_alert": False,
         "watts_alert": False,
         "vin_alert": False,
+        "floor_alert": False,
         "name_title": "",
         "firmware_update": "",
         "mv_title": "",
@@ -2033,6 +2048,7 @@ class TunerDashboard:
             row["reason"] = ""
             row["power_fault"] = False
             row["overheat"] = False
+            row["floor_alert"] = False
             return
         self._maybe_adopt_hostname(ip, miner_data, row)
         stored = get_miner_defaults(ip)
@@ -2046,6 +2062,9 @@ class TunerDashboard:
         )
         row["mv_alert"] = droop_alert(
             miner_data.get("coreVoltage"), miner_data.get("coreVoltageActual"), stored
+        )
+        row["floor_alert"] = below_floor(
+            miner_data.get("frequency"), miner_data.get("coreVoltage"), stored
         )
         row["vin"] = format_input_voltage(miner_data.get("voltage"))
         row["asic"] = format_number(miner_data.get("temp"), 1)
@@ -2081,6 +2100,8 @@ class TunerDashboard:
             row["reason"] = "overheat mode"
         elif not row["reason"] and row["power_fault"]:
             row["reason"] = "power fault"
+        elif not row["reason"] and row["floor_alert"]:
+            row["reason"] = "under minimum clocks"
         host, fallback = pool_host(miner_data)
         row["pool"] = host
         row["fallback"] = fallback
@@ -2114,7 +2135,7 @@ class TunerDashboard:
             stored.get("max_temp"),
             stored.get("max_error_percentage"),
         )
-        if row["power_fault"] or row["overheat"]:
+        if row["power_fault"] or row["overheat"] or row["floor_alert"]:
             row["tag"] = "alert"
 
     def _drop_miner_runtime_locked(self, ip):

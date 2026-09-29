@@ -8,6 +8,9 @@ from config import (
     DEFAULT_MAX_DROOP_MV,
     DEFAULT_MAX_ERROR_PERCENTAGE,
     DEFAULT_MIN_INPUT_VOLTAGE,
+    FIRMWARE_ASIC_TRIP_C,
+    FIRMWARE_TRIP_MARGIN_C,
+    FIRMWARE_VR_TRIP_C,
     HARD_MAX_FREQ,
     HARD_MAX_VOLT,
     HARD_MIN_FREQ,
@@ -216,8 +219,17 @@ def _clamp(value, low, high):
     return max(low, min(high, value))
 
 
+# Highest ASIC and regulator caps the tuner will use. A cap at the firmware
+# trip would let AxeOS cut power and drop the clocks 100 MHz / 100 mV first.
+TRIP_SAFE_MAX_TEMP = FIRMWARE_ASIC_TRIP_C - FIRMWARE_TRIP_MARGIN_C
+TRIP_SAFE_MAX_VR_TEMP = FIRMWARE_VR_TRIP_C - FIRMWARE_TRIP_MARGIN_C
+
+
 def clamp_limits(limits):
-    """Pull user limits inside the Gamma 601 hard range. Max stays at or above min."""
+    """Pull user limits inside the Gamma 601 hard range. Max stays at or above min.
+
+    Temperature caps are pulled under the AxeOS overheat trip.
+    """
     clamped = dict(limits)
     clamped["min_freq"] = _clamp(int(clamped["min_freq"]), HARD_MIN_FREQ, HARD_MAX_FREQ)
     clamped["max_freq"] = _clamp(
@@ -227,6 +239,10 @@ def clamp_limits(limits):
     clamped["max_volt"] = _clamp(
         int(clamped["max_volt"]), clamped["min_volt"], HARD_MAX_VOLT
     )
+    if clamped.get("max_temp") is not None:
+        clamped["max_temp"] = min(clamped["max_temp"], TRIP_SAFE_MAX_TEMP)
+    if clamped.get("max_vr_temp") is not None:
+        clamped["max_vr_temp"] = min(clamped["max_vr_temp"], TRIP_SAFE_MAX_VR_TEMP)
     return clamped
 
 
@@ -357,13 +373,20 @@ def _step_down(
     frequency_step,
     voltage_step,
     frequency_steps=1,
+    voltage_steps=0,
 ):
-    """Drop frequency first. Drop voltage only after frequency is already at its floor."""
+    """Drop frequency first. Drop voltage only after frequency is already at its floor.
+
+    `voltage_steps` also sheds that many voltage steps with a frequency drop.
+    That voltage never goes under `min_volt`, and a voltage already under it stays.
+    """
     drop = frequency_step * max(int(frequency_steps), 1)
+    shed = voltage_step * max(int(voltage_steps), 0)
+    lowered = max(voltage - shed, min(voltage, min_volt)) if shed else voltage
     if frequency - drop >= min_freq:
-        return frequency - drop, voltage, "step frequency down"
+        return frequency - drop, lowered, "step frequency down"
     if frequency > min_freq:
-        return min_freq, voltage, "step frequency down"
+        return min_freq, lowered, "step frequency down"
     if voltage - voltage_step >= min_volt:
         return frequency, voltage - voltage_step, "step voltage down"
     if voltage > min_volt:
@@ -434,6 +457,69 @@ def _usable_core_voltage(value):
     return number
 
 
+# Inside the trip margin the retreat sheds this many frequency steps and one
+# voltage step, and may repeat after this many seconds instead of a full settle.
+TRIP_GUARD_FREQUENCY_STEPS = 4
+TRIP_GUARD_SETTLE_SECONDS = 30
+# AxeOS saves clocks 100 MHz and 100 mV lower after an overheat trip. A drop
+# this large that the session did not write is that trip.
+FIRMWARE_DROP_FREQ_MHZ = 50
+FIRMWARE_DROP_VOLT_MV = 50
+# overheat_mode still set this long, with the ASIC drawing no power, means
+# AxeOS could not bring the chip back after its cool-down.
+OVERHEAT_LATCH_SECONDS = 120
+
+
+def near_firmware_trip(temp, vr_temp):
+    """True when either sensor is inside the margin under the AxeOS overheat trip."""
+    temp_value = _usable_temp(temp)
+    if temp_value is not None and temp_value >= TRIP_SAFE_MAX_TEMP:
+        return True
+    vr_value = _usable_temp(vr_temp)
+    return vr_value is not None and vr_value >= TRIP_SAFE_MAX_VR_TEMP
+
+
+def firmware_lowered_clocks(expected, reported):
+    """True when the miner reports clocks well under the ones this session set.
+
+    Neither clock may be above `expected`, and one has to be down by at least
+    the AxeOS drop threshold. Missing clocks are not a drop.
+    """
+    if expected is None or reported is None:
+        return False
+    frequency_drop = int(expected[0]) - int(reported[0])
+    voltage_drop = int(expected[1]) - int(reported[1])
+    if frequency_drop < 0 or voltage_drop < 0:
+        return False
+    return (
+        frequency_drop >= FIRMWARE_DROP_FREQ_MHZ
+        or voltage_drop >= FIRMWARE_DROP_VOLT_MV
+    )
+
+
+def floor_setpoint(frequency, voltage, min_freq, min_volt):
+    """The clocks raised onto the configured floor. Clocks above it stay."""
+    return max(int(frequency), int(min_freq)), max(int(voltage), int(min_volt))
+
+
+def overheat_latched(info, overheat_since, now, max_vr_temp):
+    """True when AxeOS left overheat mode on and the ASIC is not running.
+
+    The flag has been set for OVERHEAT_LATCH_SECONDS, the board draws no more
+    than the idle floor, and the regulator reads at or under its cap.
+    """
+    if not isinstance(info, dict) or not _overheat_mode_set(info.get("overheat_mode")):
+        return False
+    if overheat_since is None or now - overheat_since < OVERHEAT_LATCH_SECONDS:
+        return False
+    power = _as_float(info.get("power"))
+    if power is not None and power > 0.5:
+        return False
+    vr_value = _usable_temp(info.get("vrTemp"))
+    vr_cap = _as_float(max_vr_temp)
+    return vr_value is not None and vr_cap is not None and vr_value <= vr_cap
+
+
 def _needs_immediate_retreat(
     temp,
     vr_temp,
@@ -463,6 +549,8 @@ def _needs_immediate_retreat(
     if temp_value is not None and temp_value > max_temp:
         return True
     if vr_value is not None and vr_value > max_vr_temp:
+        return True
+    if near_firmware_trip(temp_value, vr_value):
         return True
     if power_value is not None and power_value > max_watts:
         return True
@@ -1032,7 +1120,11 @@ def _guard_bounds(
     # A climb proposal is already above the live clock and is left alone.
     if new_frequency > current_frequency and requested <= current_frequency:
         new_frequency = current_frequency
-    new_voltage = _clamp(int(new_voltage), min_volt, max_volt)
+    requested_voltage = int(new_voltage)
+    new_voltage = _clamp(requested_voltage, min_volt, max_volt)
+    # The same holds for voltage. Only a raise proposal may lift it to the floor.
+    if new_voltage > current_voltage and requested_voltage <= current_voltage:
+        new_voltage = current_voltage
     if new_frequency < current_frequency and new_voltage > current_voltage:
         new_voltage = current_voltage
     return new_frequency, new_voltage, reason
@@ -1092,6 +1184,7 @@ def _apply_step_down(
     voltage_step,
     reason_tag,
     frequency_steps=1,
+    voltage_steps=0,
 ):
     new_frequency, new_voltage, step_reason = _step_down(
         current_frequency,
@@ -1101,6 +1194,7 @@ def _apply_step_down(
         frequency_step,
         voltage_step,
         frequency_steps,
+        voltage_steps,
     )
     if step_reason == "holding at minimum" or not reason_tag:
         chosen = step_reason
@@ -1187,9 +1281,11 @@ def decide_adjustment(
     over_temp = temp_value is not None and temp_value > max_temp
     over_power = power_value is not None and power_value > max_watts
     over_vr = vr_value is not None and vr_value > max_vr_temp
-    if over_temp or over_power or over_vr:
+    near_trip = near_firmware_trip(temp_value, vr_value)
+    if over_temp or over_power or over_vr or near_trip:
         tag = None if (over_temp or over_vr) else "power limit"
         frequency_steps = 1
+        voltage_steps = 0
         if over_temp or over_vr:
             counts = []
             if over_temp:
@@ -1201,6 +1297,12 @@ def decide_adjustment(
                     _thermal_frequency_steps(vr_value - max_vr_temp, vr_tolerance)
                 )
             frequency_steps = max(counts)
+        if near_trip:
+            # AxeOS would cut power and drop 100 MHz / 100 mV. Shed voltage
+            # with frequency so the heat falls before it gets there.
+            tag = "trip guard"
+            frequency_steps = max(frequency_steps, TRIP_GUARD_FREQUENCY_STEPS)
+            voltage_steps = 1
         return _apply_step_down(
             current_frequency,
             current_voltage,
@@ -1212,6 +1314,7 @@ def decide_adjustment(
             voltage_step,
             tag,
             frequency_steps,
+            voltage_steps,
         )
 
     if _overheat_mode_set(overheat_mode) or (
@@ -1272,6 +1375,37 @@ def decide_adjustment(
             frequency_step,
             voltage_step,
             "core voltage droop",
+        )
+
+    if (
+        (current_frequency < min_freq or current_voltage < min_volt)
+        and temp_value is not None
+        and vr_value is not None
+        and power_value is not None
+        and cooled_after_retreat(
+            temp_value,
+            vr_value,
+            max_temp,
+            max_vr_temp,
+            temp_tolerance,
+            vr_tolerance,
+        )
+    ):
+        # AxeOS can save clocks under the floor after an overheat trip.
+        # Once the chip is cool, go straight back to the floor.
+        floor_frequency, floor_voltage = floor_setpoint(
+            current_frequency, current_voltage, min_freq, min_volt
+        )
+        return _guard_bounds(
+            current_frequency,
+            current_voltage,
+            floor_frequency,
+            floor_voltage,
+            min_freq,
+            max_freq,
+            min_volt,
+            max_volt,
+            "restore floor",
         )
 
     if current_frequency > max_freq:
@@ -1681,7 +1815,14 @@ def monitor_and_adjust(
         )
         _publish_status(bitaxe_ip, phase="skipped", reason="limits reversed")
         return
+    requested_caps = (limits["max_temp"], limits["max_vr_temp"])
     limits = clamp_limits(limits)
+    if (limits["max_temp"], limits["max_vr_temp"]) != requested_caps:
+        log_callback(
+            f"{bitaxe_ip} -> Temperature caps are too close to the AxeOS overheat trip. "
+            f"Using {limits['max_temp']:g}°C ASIC / {limits['max_vr_temp']:g}°C VR.",
+            "warning",
+        )
 
     if _wait(event, startup_delay):
         log_callback(f"{bitaxe_ip} -> Autotuning stopped.", "warning")
@@ -1892,6 +2033,14 @@ def monitor_and_adjust(
     thermal_hold = wall_type_from_reason(opening_reason) == "thermal"
     safety_hold = _safety_hold_kind(opening_reason)
     safety_settle_until = settle_until if _is_safety_retreat(opening_reason) else 0.0
+    # Inside the trip margin a safety drop may repeat sooner than a full settle.
+    trip_settle_until = (
+        min(settle_until, now + TRIP_GUARD_SETTLE_SECONDS)
+        if _is_safety_retreat(opening_reason)
+        else 0.0
+    )
+    overheat_since = None
+    overheat_recovered = False
     fan_retry_at = 0.0
     setpoint_since = None
     last_accepted = None
@@ -1950,6 +2099,157 @@ def monitor_and_adjust(
             reported_frequency = info.get("frequency")
             reported_voltage = info.get("coreVoltage")
             now = time.time()
+
+            reported_pair = None
+            if (
+                _as_float(reported_frequency) is not None
+                and _as_float(reported_voltage) is not None
+            ):
+                reported_pair = (
+                    int(float(reported_frequency)),
+                    int(float(reported_voltage)),
+                )
+            # The lowest clocks this session has written or seen echoed. A
+            # retreat still in flight counts, so it is not mistaken for a trip.
+            session_clocks = confirmed
+            if confirmed is not None and pending is not None:
+                session_clocks = (
+                    min(int(confirmed[0]), int(pending[0])),
+                    min(int(confirmed[1]), int(pending[1])),
+                )
+            overheat_now = _overheat_mode_set(info.get("overheat_mode"))
+            if not overheat_now and firmware_lowered_clocks(
+                session_clocks, reported_pair
+            ):
+                # AxeOS tripped on heat and saved clocks 100 MHz / 100 mV lower.
+                # Start over from there in climb, cooled first, instead of
+                # holding whatever the firmware left.
+                log_callback(
+                    f"{bitaxe_ip} -> Miner reports {reported_pair[0]} MHz / "
+                    f"{reported_pair[1]} mV, under the {session_clocks[0]} MHz / "
+                    f"{session_clocks[1]} mV this session set. "
+                    "AxeOS overheat protection lowered the clocks.",
+                    "warning",
+                )
+                limit_wall = "thermal"
+                wall_frequency = max(
+                    limits["min_freq"], int(session_clocks[0]) - 2 * frequency_step
+                )
+                remember_setpoint(
+                    bitaxe_ip, wall_frequency, session_clocks[1], limit_wall
+                )
+                saved_signature = (wall_frequency, int(session_clocks[1]), limit_wall)
+                confirmed = reported_pair
+                pending = None
+                probe = None
+                pll_retry_frequency = None
+                minute_retry_frequency = None
+                phase = "climb"
+                hold_since = None
+                ceiling_saved = False
+                trim_good_voltage = None
+                trim_after_retreat = False
+                thermal_hold = True
+                droop_reference = None
+                setpoint_since = now
+                settle_until = now + refresh_interval
+                last_tune_time = now
+                hashrate_history.clear()
+                rolling_hashrate.clear()
+                error_samples.clear()
+                window_positive_hash = False
+                window_zero_hash = False
+                last_accepted = None
+                last_rejected = None
+                last_reasons = None
+                reject_sample.reset()
+                _publish_status(
+                    bitaxe_ip,
+                    phase=phase,
+                    wall_type=limit_wall,
+                    reason="firmware overheat",
+                    last_good_freq=confirmed[0],
+                    last_good_volt=confirmed[1],
+                )
+                if _wait(event, interval):
+                    break
+                continue
+
+            if overheat_now:
+                if overheat_since is None:
+                    overheat_since = now
+            else:
+                overheat_since = None
+                overheat_recovered = False
+            if not overheat_recovered and overheat_latched(
+                info, overheat_since, now, limits["max_vr_temp"]
+            ):
+                # AxeOS clears overheat_mode only when the ASIC comes back. At
+                # its lowered clocks it may not, and a restart alone replays
+                # them. Write the floor, clear the flag, then restart once.
+                overheat_recovered = True
+                base = (
+                    reported_pair
+                    or confirmed
+                    or (
+                        limits["min_freq"],
+                        limits["min_volt"],
+                    )
+                )
+                floor_frequency, floor_voltage = floor_setpoint(
+                    base[0], base[1], limits["min_freq"], limits["min_volt"]
+                )
+                log_callback(
+                    f"{bitaxe_ip} -> Overheat mode held for {OVERHEAT_LATCH_SECONDS}s "
+                    f"with the ASIC off. Writing {floor_frequency} MHz / "
+                    f"{floor_voltage} mV and restarting.",
+                    "error",
+                )
+                applied_settings = set_system_settings(
+                    bitaxe_ip, floor_voltage, floor_frequency
+                )
+                log_callback(applied_settings, "info")
+                cleared, clear_error = patch_system(bitaxe_ip, {"overheat_mode": 0})
+                if not cleared:
+                    log_callback(
+                        f"{bitaxe_ip} -> Could not clear overheat mode: {clear_error}",
+                        "warning",
+                    )
+                log_callback(restart_bitaxe(bitaxe_ip), "warning")
+                if settings_were_applied(applied_settings):
+                    pending = (floor_frequency, floor_voltage)
+                probe = None
+                pll_retry_frequency = None
+                minute_retry_frequency = None
+                phase = "climb"
+                hold_since = None
+                ceiling_saved = False
+                trim_good_voltage = None
+                trim_after_retreat = False
+                thermal_hold = True
+                limit_wall = "thermal"
+                droop_reference = None
+                setpoint_since = None
+                settle_until = time.time() + refresh_interval
+                last_tune_time = time.time()
+                hashrate_history.clear()
+                rolling_hashrate.clear()
+                error_samples.clear()
+                window_positive_hash = False
+                window_zero_hash = False
+                last_accepted = None
+                last_rejected = None
+                last_reasons = None
+                reject_sample.reset()
+                _publish_status(
+                    bitaxe_ip,
+                    phase=phase,
+                    wall_type=limit_wall,
+                    reason="overheat restart",
+                )
+                if _wait(event, interval):
+                    break
+                continue
 
             if (
                 pending is not None
@@ -2156,7 +2456,12 @@ def monitor_and_adjust(
                 )
             # A safety drop already written waits out its settle. The next hot
             # sample must not shed another step before the heatsink has moved.
-            immediate_retreat = now >= safety_settle_until and _needs_immediate_retreat(
+            # Inside the trip margin the next drop only waits a short settle.
+            retreat_open = now >= safety_settle_until or (
+                near_firmware_trip(_as_float(temp), _as_float(vr_temp))
+                and now >= trip_settle_until
+            )
+            immediate_retreat = retreat_open and _needs_immediate_retreat(
                 _as_float(temp),
                 _as_float(vr_temp),
                 _as_float(power),
@@ -2734,10 +3039,12 @@ def monitor_and_adjust(
                 new_frequency, new_voltage, reason = decide_adjustment(
                     confirmed[0], confirmed[1], **decision
                 )
-                if new_frequency > confirmed[0] + frequency_step:
-                    new_frequency = confirmed[0] + frequency_step
-                if new_voltage > confirmed[1] + voltage_step:
-                    new_voltage = confirmed[1] + voltage_step
+                # A floor restore lands on the floor in one write.
+                if reason != "restore floor":
+                    if new_frequency > confirmed[0] + frequency_step:
+                        new_frequency = confirmed[0] + frequency_step
+                    if new_voltage > confirmed[1] + voltage_step:
+                        new_voltage = confirmed[1] + voltage_step
 
             if reason in ("increase voltage", "trim voltage", "restore voltage"):
                 new_frequency = confirmed[0]
@@ -2803,6 +3110,22 @@ def monitor_and_adjust(
                     reason=reason,
                 )
                 if not zero_restarted:
+                    # A restart replays the clocks AxeOS saved. Clocks under
+                    # the floor go back onto it first.
+                    floor_frequency, floor_voltage = floor_setpoint(
+                        confirmed[0],
+                        confirmed[1],
+                        limits["min_freq"],
+                        limits["min_volt"],
+                    )
+                    if not _same_setpoint((floor_frequency, floor_voltage), confirmed):
+                        applied_settings = set_system_settings(
+                            bitaxe_ip, floor_voltage, floor_frequency
+                        )
+                        log_callback(applied_settings, "info")
+                        if settings_were_applied(applied_settings):
+                            pending = (floor_frequency, floor_voltage)
+                            setpoint_since = None
                     log_callback(
                         f"{bitaxe_ip} -> Hashrate is 0 GH/s after settle. Restarting...",
                         "error",
@@ -2916,6 +3239,9 @@ def monitor_and_adjust(
                     _arm_droop_grace(confirmed[1], new_voltage)
                     if _is_safety_retreat(reason):
                         safety_settle_until = time.time() + refresh_interval
+                        trip_settle_until = time.time() + min(
+                            TRIP_GUARD_SETTLE_SECONDS, refresh_interval
+                        )
                     if reason == "restore voltage":
                         phase = "hold"
                         hold_since = time.time()
@@ -3082,5 +3408,9 @@ def monitor_and_adjust(
 
     remembered = setpoint_to_remember(confirmed, probe, pending)
     if remembered is not None:
+        # Clocks AxeOS left under the floor are not a setpoint to resume on.
+        remembered = floor_setpoint(
+            remembered[0], remembered[1], limits["min_freq"], limits["min_volt"]
+        )
         remember_setpoint(bitaxe_ip, remembered[0], remembered[1], limit_wall)
     log_callback(f"{bitaxe_ip} -> Autotuning stopped.", "warning")

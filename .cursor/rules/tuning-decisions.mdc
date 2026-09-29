@@ -8,9 +8,9 @@ alwaysApply: false
 
 `decide_adjustment` stays pure: inputs in, `(frequency, voltage, reason)` out. It does not call HTTP, read `config.json`, or start threads.
 
-Frequency steps down on heat, power, input sag, power fault, core-voltage droop, and rejected shares. It also steps down when quality is bad (error percentage, short hashrate, or above-target) and voltage cannot rise. Voltage rises when quality is bad and it is under the cap. At the ceiling, trim lowers voltage. The session sets the fan once with `{"autofanspeed": 0, "fanspeed": 100}`.
+Frequency steps down on heat, power, input sag, power fault, core-voltage droop, and rejected shares. Within `FIRMWARE_TRIP_MARGIN_C` of the AxeOS overheat trip (75°C ASIC, 105°C VR), the trip guard sheds `TRIP_GUARD_FREQUENCY_STEPS` and one voltage step. `clamp_limits` keeps `max_temp` and `max_vr_temp` under that margin. Clocks under `min_freq` or `min_volt` (AxeOS saves clocks 100 MHz / 100 mV lower after a trip) return `restore floor` once the chip is cool. Frequency also steps down when quality is bad (error percentage, short hashrate, or above-target) and voltage cannot rise. Voltage rises when quality is bad and it is under the cap. At the ceiling, trim lowers voltage. The session sets the fan once with `{"autofanspeed": 0, "fanspeed": 100}`.
 
-Leave `GAMMA601_LIMITS`, `HARD_*`, and `STOCK_*` in `config.py` unchanged unless the user asks. Those numbers match this cooling and this supply. `HARD_MIN_FREQ` is 350 MHz, the lowest BM1370 preset in AxeOS v2.15.1. `HARD_MIN_VOLT` stays 1000 mV, the lowest BM1370 voltage preset, because voltage is stepped down only after frequency is already at its floor.
+Leave `GAMMA601_LIMITS`, `HARD_*`, and `STOCK_*` in `config.py` unchanged unless the user asks. Those numbers match this cooling and this supply. `HARD_MIN_FREQ` is 350 MHz, the lowest BM1370 preset in AxeOS v2.15.1. `HARD_MIN_VOLT` stays 1000 mV, the lowest BM1370 voltage preset, because voltage is stepped down only after frequency is already at its floor. The trip guard is the one exception.
 
 A new branch gets a `DecisionTests` case that calls `decide_adjustment` directly.
 

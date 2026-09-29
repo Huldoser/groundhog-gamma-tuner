@@ -646,6 +646,37 @@ class SnapshotTests(unittest.TestCase):
         self.assertFalse(clear["error_alert"])
         self.assertFalse(clear["vin_alert"])
 
+    def test_row_flags_clocks_under_the_saved_floor(self):
+        app = TunerDashboard()
+        app._rows = [blank_miner_row("Alpha", "10.0.0.8")]
+        info = {"frequency": 250, "coreVoltage": 950, "temp": 50, "vrTemp": 50}
+        stored = {"min_freq": 400, "min_volt": 1000}
+        with (
+            mock.patch("dashboard.get_system_info", return_value=info),
+            mock.patch("dashboard.get_miner_status", return_value={"phase": "hold"}),
+            mock.patch("dashboard.get_miner_defaults", return_value=stored),
+            mock.patch("dashboard.load_config", return_value={}),
+        ):
+            app.refresh_once()
+        row = app.get_snapshot(0)["miners"][0]
+        self.assertTrue(row["floor_alert"])
+        self.assertEqual(row["tag"], "alert")
+        self.assertEqual(row["reason"], "under minimum clocks")
+        self.assertEqual(dashboard.alert_kind(row), "below_floor")
+        self.assertIn("minimum clocks", dashboard.alert_message("Alpha", "below_floor"))
+
+        info.update({"frequency": 400, "coreVoltage": 1000})
+        with (
+            mock.patch("dashboard.get_system_info", return_value=info),
+            mock.patch("dashboard.get_miner_status", return_value={"phase": "hold"}),
+            mock.patch("dashboard.get_miner_defaults", return_value=stored),
+            mock.patch("dashboard.load_config", return_value={}),
+        ):
+            app.refresh_once()
+        clear = app.get_snapshot(0)["miners"][0]
+        self.assertFalse(clear["floor_alert"])
+        self.assertEqual(dashboard.alert_kind(clear), "")
+
     def test_activity_log_drops_lines_past_the_limit(self):
         app = TunerDashboard()
         extra = 50

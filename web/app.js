@@ -298,8 +298,11 @@ function renderCell(miner, column) {
   if (column === "freq") {
     if (!shown(miner.freq) && !shown(miner.mv)) cell.textContent = "-";
     else {
-      if (shown(miner.freq)) addLine(cell, `${miner.freq} MHz`);
-      if (shown(miner.mv)) addLine(cell, `${miner.mv} mV`, miner.mv_alert ? "droop" : "muted");
+      if (shown(miner.freq)) addLine(cell, `${miner.freq} MHz`, miner.floor_alert ? "bad" : "");
+      if (shown(miner.mv)) {
+        const mvClass = miner.mv_alert ? "droop" : miner.floor_alert ? "bad" : "muted";
+        addLine(cell, `${miner.mv} mV`, mvClass);
+      }
     }
     setTitle(cell, miner.mv_title);
     return cell;

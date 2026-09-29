@@ -177,7 +177,8 @@ class DecisionTests(unittest.TestCase):
             )
         )
         self.assertEqual(frequency, 660)
-        self.assertEqual(voltage, 1100)
+        # 75°C is inside the AxeOS trip margin, so one voltage step goes too.
+        self.assertEqual(voltage, 1090)
         self.assertIn("frequency", reason)
 
     def test_small_overshoot_takes_one_frequency_step(self):
@@ -667,7 +668,7 @@ class DecisionTests(unittest.TestCase):
             900, 1250, hot, limits, 5, 10, 3, 3, 4.9, 2.0, 40
         )
         self.assertEqual(lowered[0], 880)
-        self.assertEqual(lowered[1], 1250)
+        self.assertEqual(lowered[1], 1240)
         self.assertIn("frequency", lowered[2])
         errors = _info(temp=60, vrTemp=70, power=20, errorPercentage=8, hashRate=1400)
         held = autotune.opening_setpoint(
@@ -726,7 +727,7 @@ class DecisionTests(unittest.TestCase):
 
         zero_tolerance = autotune.decide_adjustment(
             **_limits(
-                temp=80,
+                temp=70,
                 max_temp=60,
                 temp_tolerance=0,
             )
@@ -737,7 +738,7 @@ class DecisionTests(unittest.TestCase):
             **_limits(
                 current_frequency=410,
                 min_freq=400,
-                temp=80,
+                temp=70,
                 max_temp=60,
                 temp_tolerance=2,
             )
@@ -1312,6 +1313,137 @@ class DecisionTests(unittest.TestCase):
         self.assertEqual(held[:2], (500, 1100))
         self.assertIn("telemetry", held[2])
 
+    def test_clocks_under_the_floor_go_back_onto_it_once_cool(self):
+        for phase in ("climb", "hold", "trim"):
+            for hash_rate, error in ((100, 0), (0, 0), (5, 8)):
+                restored = autotune.decide_adjustment(
+                    **_limits(
+                        current_frequency=250,
+                        current_voltage=950,
+                        phase=phase,
+                        hash_rate=hash_rate,
+                        error_percentage=error,
+                    )
+                )
+                self.assertEqual(restored, (400, 1000, "restore floor"))
+        only_voltage = autotune.decide_adjustment(
+            **_limits(current_frequency=450, current_voltage=900, phase="hold")
+        )
+        self.assertEqual(only_voltage, (450, 1000, "restore floor"))
+
+    def test_clocks_under_the_floor_wait_while_warm_or_unreported(self):
+        warm = autotune.decide_adjustment(
+            **_limits(
+                current_frequency=250,
+                current_voltage=950,
+                phase="hold",
+                temp=59,
+                max_temp=60,
+                temp_tolerance=2,
+            )
+        )
+        self.assertEqual(warm[:2], (250, 950))
+        no_regulator = autotune.decide_adjustment(
+            **_limits(
+                current_frequency=250, current_voltage=950, phase="hold", vr_temp=None
+            )
+        )
+        self.assertEqual(no_regulator[:2], (250, 950))
+        latched = autotune.decide_adjustment(
+            **_limits(
+                current_frequency=250,
+                current_voltage=950,
+                overheat_mode=1,
+                temp=None,
+                power=0.2,
+            )
+        )
+        self.assertEqual(latched[:2], (250, 950))
+        self.assertIn("overheat", latched[2])
+
+    def test_a_retreat_under_the_voltage_floor_does_not_raise_voltage(self):
+        held = autotune.decide_adjustment(
+            **_limits(
+                current_frequency=400,
+                current_voltage=950,
+                temp=65,
+                max_temp=60,
+                temp_tolerance=2,
+            )
+        )
+        self.assertEqual(held[:2], (400, 950))
+
+    def test_trip_guard_sheds_frequency_and_voltage_near_the_firmware_trip(self):
+        asic = autotune.decide_adjustment(
+            **_limits(temp=72, max_temp=68, temp_tolerance=3)
+        )
+        self.assertEqual(asic, (480, 1090, "step frequency down after trip guard"))
+        self.assertEqual(autotune.wall_type_from_reason(asic[2]), "thermal")
+        self.assertTrue(autotune._is_safety_retreat(asic[2]))
+
+        regulator = autotune.decide_adjustment(
+            **_limits(vr_temp=102, max_vr_temp=88, vr_temp_tolerance=3)
+        )
+        self.assertEqual(regulator[:2], (475, 1090))
+
+        # A cap left above the trip still gets the guard.
+        high_cap = autotune.decide_adjustment(**_limits(temp=72, max_temp=80))
+        self.assertEqual(high_cap[:2], (480, 1090))
+
+        at_floor = autotune.decide_adjustment(
+            **_limits(current_frequency=400, temp=72, max_temp=68)
+        )
+        self.assertEqual(at_floor[:2], (400, 1090))
+
+        under_volt_floor = autotune.decide_adjustment(
+            **_limits(current_voltage=950, temp=72, max_temp=68)
+        )
+        self.assertEqual(under_volt_floor[:2], (480, 950))
+
+        under_margin = autotune.decide_adjustment(
+            **_limits(temp=70, max_temp=68, temp_tolerance=3)
+        )
+        self.assertEqual(under_margin[:2], (495, 1100))
+
+    def test_trip_guard_asks_for_an_immediate_retreat(self):
+        self.assertTrue(_retreat(temp=72, max_temp=80))
+        self.assertTrue(_retreat(vr_temp=101, max_vr_temp=110))
+        self.assertFalse(_retreat(temp=70.9, max_temp=80))
+
+    def test_temperature_caps_stay_under_the_firmware_trip(self):
+        base = {"min_freq": 400, "max_freq": 800, "min_volt": 1000, "max_volt": 1300}
+        capped = autotune.clamp_limits(dict(base, max_temp=80, max_vr_temp=110))
+        self.assertEqual(capped["max_temp"], 71)
+        self.assertEqual(capped["max_vr_temp"], 101)
+        kept = autotune.clamp_limits(dict(base, max_temp=68, max_vr_temp=88))
+        self.assertEqual(kept["max_temp"], 68)
+        self.assertEqual(kept["max_vr_temp"], 88)
+        running = autotune.refresh_running_limits(
+            dict(kept, max_watts=50), {"max_temp": 90}
+        )
+        self.assertEqual(running["max_temp"], 71)
+
+    def test_firmware_lowered_clocks_needs_a_large_drop_and_no_rise(self):
+        self.assertTrue(autotune.firmware_lowered_clocks((550, 1150), (450, 1050)))
+        self.assertTrue(autotune.firmware_lowered_clocks((350, 1000), (250, 900)))
+        self.assertTrue(autotune.firmware_lowered_clocks((500, 1100), (500, 1050)))
+        self.assertFalse(autotune.firmware_lowered_clocks((500, 1100), (480, 1090)))
+        self.assertFalse(autotune.firmware_lowered_clocks((500, 1100), (400, 1150)))
+        self.assertFalse(autotune.firmware_lowered_clocks(None, (250, 900)))
+        self.assertFalse(autotune.firmware_lowered_clocks((500, 1100), None))
+
+    def test_overheat_latch_needs_time_no_power_and_a_cool_regulator(self):
+        info = _info(overheat_mode=1, temp=0, vrTemp=50, power=0.2)
+        latch = autotune.OVERHEAT_LATCH_SECONDS
+        self.assertTrue(autotune.overheat_latched(info, 0, latch, 85))
+        self.assertFalse(autotune.overheat_latched(info, 0, latch - 1, 85))
+        self.assertFalse(autotune.overheat_latched(info, None, latch, 85))
+        self.assertFalse(autotune.overheat_latched(dict(info, power=12), 0, latch, 85))
+        self.assertFalse(autotune.overheat_latched(dict(info, vrTemp=90), 0, latch, 85))
+        self.assertFalse(
+            autotune.overheat_latched(dict(info, overheat_mode=0), 0, latch, 85)
+        )
+
 
 class SessionTests(unittest.TestCase):
     def test_missing_settings_do_not_stop_another_miner(self):
@@ -1874,7 +2006,7 @@ class SessionTests(unittest.TestCase):
             stop_event.set()
             thread.join(2)
         self.assertFalse(thread.is_alive())
-        self.assertEqual(calls, [(450, 1100)])
+        self.assertEqual(calls, [(450, 1090)])
 
     def test_hot_chip_drops_again_after_the_safety_settle(self):
         state = {"frequency": 500, "voltage": 1100}
@@ -1909,8 +2041,8 @@ class SessionTests(unittest.TestCase):
             )
             thread.join(2)
         self.assertFalse(thread.is_alive())
-        self.assertEqual(calls[0], (450, 1100))
-        self.assertEqual(calls[1], (400, 1100))
+        self.assertEqual(calls[0], (450, 1090))
+        self.assertEqual(calls[1], (400, 1080))
 
     def test_opening_heat_drop_holds_until_the_chip_cools_a_full_band(self):
         state = {"frequency": 500, "voltage": 1100, "temp": 80, "calls": []}
@@ -2008,7 +2140,7 @@ class SessionTests(unittest.TestCase):
         self.assertGreaterEqual(len(calls), 2)
         self.assertEqual(calls[0], (500, 1100))
         self.assertLess(calls[1][0], 520)
-        self.assertEqual(calls[1][1], 1100)
+        self.assertEqual(calls[1][1], 1090)
 
     def test_climb_still_waits_for_the_refresh_interval(self):
         calls = []
@@ -4125,7 +4257,7 @@ class SessionTests(unittest.TestCase):
             )
             thread.join(2)
         self.assertFalse(thread.is_alive())
-        self.assertEqual(calls, [(500, 1100), (400, 1100)])
+        self.assertEqual(calls, [(500, 1100), (400, 1090)])
 
     def test_reversed_limits_skip_and_a_low_floor_still_clamps(self):
         clamped = autotune.clamp_limits(
@@ -4278,7 +4410,7 @@ class SessionTests(unittest.TestCase):
             stop_event.set()
             thread.join(2)
         self.assertFalse(thread.is_alive())
-        self.assertEqual(calls, [(450, 1100)])
+        self.assertEqual(calls, [(450, 1090)])
 
     def test_unconfirmed_apply_adopts_the_reported_clocks(self):
         calls = []
@@ -4308,8 +4440,9 @@ class SessionTests(unittest.TestCase):
             )
             thread.join(2)
         self.assertFalse(thread.is_alive())
-        self.assertEqual(calls.count((400, 1100)), 1)
-        self.assertEqual([freq for freq, _volt in calls if freq >= 400], [400])
+        # 390 MHz is under the 400 MHz floor, so the floor may be written again.
+        # Nothing goes above it.
+        self.assertEqual(set(calls), {(400, 1100)})
         self.assertTrue(any("not confirmed" in message for message in logs))
 
     def test_fan_update_failure_does_not_raise_clocks(self):
@@ -4639,6 +4772,205 @@ class SessionTests(unittest.TestCase):
         self.assertGreaterEqual(len(calls), 2)
         self.assertEqual(calls[0], (500, 1100))
         self.assertLess(calls[1][0], 500)
+
+    def test_firmware_overheat_drop_restarts_the_climb_and_restores_the_floor(self):
+        state = {"frequency": 400, "voltage": 1100, "polls_after_write": 0}
+        calls = []
+        logs = []
+        saved = []
+        stop_event = threading.Event()
+
+        def set_settings(ip, volt, freq):
+            calls.append((int(freq), int(volt)))
+            state["frequency"] = int(freq)
+            state["voltage"] = int(volt)
+            if (int(freq), int(volt)) == (400, 1000):
+                stop_event.set()
+            return (
+                f"{ip} -> Applied settings: Voltage = {volt}mV, Frequency = {freq}MHz"
+            )
+
+        def get_info(ip):
+            if calls:
+                state["polls_after_write"] += 1
+                if state["polls_after_write"] == 3:
+                    # AxeOS tripped, cooled, and saved 100 MHz / 100 mV lower.
+                    state["frequency"] = state["frequency"] - 100
+                    state["voltage"] = state["voltage"] - 100
+            return _info(frequency=state["frequency"], voltage=state["voltage"])
+
+        def remember(ip, frequency, voltage, wall_type):
+            saved.append((int(frequency), int(voltage), wall_type))
+
+        with (
+            patched_io(get_info, set_settings),
+            mock.patch.object(autotune, "remember_setpoint", remember),
+        ):
+            thread = _start_miner(
+                "miner",
+                stop_event,
+                lambda message, level="info": logs.append(message),
+                start_freq=450,
+                start_volt=1050,
+            )
+            thread.join(2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(calls[0], (450, 1050))
+        self.assertIn((400, 1000), calls)
+        self.assertTrue(any("overheat protection" in message for message in logs))
+        self.assertIn((440, 1050, "thermal"), saved)
+        self.assertFalse(any(frequency < 400 for frequency, _volt, _wall in saved))
+        self.assertEqual(autotune.get_miner_status("miner").get("wall_type"), "thermal")
+
+    def test_latched_overheat_writes_the_floor_clears_the_flag_and_restarts_once(self):
+        calls = []
+        patches = []
+        restarts = []
+        stop_event = threading.Event()
+
+        def set_settings(ip, volt, freq):
+            calls.append((int(freq), int(volt)))
+            return (
+                f"{ip} -> Applied settings: Voltage = {volt}mV, Frequency = {freq}MHz"
+            )
+
+        def patch(ip, settings):
+            patches.append(dict(settings))
+            return True, ""
+
+        def restart(ip):
+            restarts.append(ip)
+            return f"{ip} -> Restart initiated."
+
+        def get_info(ip):
+            # The chip never came back after AxeOS lowered it to 250 / 900.
+            return _info(
+                frequency=250,
+                voltage=900,
+                overheat_mode=1,
+                temp=0,
+                power=0.2,
+                hashRate=0,
+            )
+
+        with (
+            patched_io(get_info, set_settings, restart=restart),
+            mock.patch.object(autotune, "patch_system", patch),
+            mock.patch.object(autotune, "OVERHEAT_LATCH_SECONDS", 0.05),
+        ):
+            thread = _start_miner("miner", stop_event, lambda *args: None)
+            time.sleep(0.5)
+            stop_event.set()
+            thread.join(2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(restarts, ["miner"])
+        self.assertIn({"overheat_mode": 0}, patches)
+        self.assertIn((400, 1000), calls)
+        self.assertEqual(calls.count((400, 1000)), 1)
+
+    def test_zero_hashrate_under_the_floor_writes_the_floor_before_restarting(self):
+        state = {"frequency": 400, "voltage": 1100, "polls_after_write": 0}
+        events = []
+        stop_event = threading.Event()
+
+        def set_settings(ip, volt, freq):
+            events.append(("write", int(freq), int(volt)))
+            state["frequency"] = int(freq)
+            state["voltage"] = int(volt)
+            return (
+                f"{ip} -> Applied settings: Voltage = {volt}mV, Frequency = {freq}MHz"
+            )
+
+        def restart(ip):
+            events.append(("restart",))
+            stop_event.set()
+            return f"{ip} -> Restart initiated."
+
+        def get_info(ip):
+            if events:
+                state["polls_after_write"] += 1
+                if state["polls_after_write"] == 3:
+                    state["frequency"] = 250
+                    state["voltage"] = 950
+            # Warm enough that the floor restore waits, and not hashing.
+            return _info(
+                frequency=state["frequency"],
+                voltage=state["voltage"],
+                temp=59,
+                hashRate=0,
+            )
+
+        with patched_io(get_info, set_settings, restart=restart):
+            thread = _start_miner("miner", stop_event, lambda *args: None)
+            thread.join(2)
+        self.assertFalse(thread.is_alive())
+        self.assertIn(("restart",), events)
+        restart_at = events.index(("restart",))
+        self.assertEqual(events[restart_at - 1], ("write", 400, 1000))
+
+    def test_trip_guard_drops_again_before_the_full_settle(self):
+        state = {"frequency": 500, "voltage": 1100}
+        calls = []
+        stop_event = threading.Event()
+
+        def set_settings(ip, volt, freq):
+            calls.append((int(freq), int(volt)))
+            state["frequency"] = int(freq)
+            state["voltage"] = int(volt)
+            if len(calls) >= 2:
+                stop_event.set()
+            return (
+                f"{ip} -> Applied settings: Voltage = {volt}mV, Frequency = {freq}MHz"
+            )
+
+        def get_info(ip):
+            return _info(
+                frequency=state["frequency"],
+                voltage=state["voltage"],
+                temp=73,
+                vrTemp=40,
+            )
+
+        runtime = dict(FAST_CONFIG)
+        runtime["refresh_interval"] = 30
+        with (
+            patched_io(get_info, set_settings, runtime_config=runtime),
+            mock.patch.object(autotune, "TRIP_GUARD_SETTLE_SECONDS", 0.05),
+        ):
+            thread = _start_miner(
+                "miner",
+                stop_event,
+                lambda *args: None,
+                start_freq=500,
+                start_volt=1100,
+                max_temp=68,
+            )
+            thread.join(2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(calls), 2)
+        self.assertLess(calls[1][0], calls[0][0])
+        self.assertLess(calls[1][1], calls[0][1])
+
+    def test_temperature_caps_at_the_firmware_trip_are_lowered_and_logged(self):
+        logs = []
+        stop_event = threading.Event()
+
+        def set_settings(ip, volt, freq):
+            stop_event.set()
+            return (
+                f"{ip} -> Applied settings: Voltage = {volt}mV, Frequency = {freq}MHz"
+            )
+
+        with patched_io(lambda ip: _info(), set_settings):
+            thread = _start_miner(
+                "miner",
+                stop_event,
+                lambda message, level="info": logs.append(message),
+                max_temp=80,
+            )
+            thread.join(2)
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(any("71°C ASIC" in message for message in logs))
 
 
 class InstallAndConfigTests(unittest.TestCase):
@@ -4991,6 +5323,7 @@ class InstallAndConfigTests(unittest.TestCase):
                 "error_alert": False,
                 "watts_alert": False,
                 "vin_alert": False,
+                "floor_alert": False,
                 "name_title": "",
                 "firmware_update": "",
                 "mv_title": "",
