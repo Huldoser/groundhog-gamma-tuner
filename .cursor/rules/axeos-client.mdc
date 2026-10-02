@@ -9,7 +9,7 @@ alwaysApply: false
 Miner traffic is these three calls:
 
 - `GET http://{ip}/api/system/info`
-- `PATCH http://{ip}/api/system` with `coreVoltage`, `frequency`, `overclockEnabled`, and fan keys `autofanspeed` / `fanspeed`
+- `PATCH http://{ip}/api/system` with `coreVoltage`, `frequency`, `overclockEnabled`, and fan keys `autofanspeed` / `manualFanSpeed` (GET reports the live fan percent as `fanspeed`; v2.15.1 ignores a PATCH `fanspeed`)
 - `POST http://{ip}/api/system/restart`
 
 `get_system_info` returns a dict or an error string. `patch_system` returns `(ok, error_text)`. A missing `errorPercentage` skips that miner. Read `ASICModel` and `boardVersion` through `is_gamma_601`.

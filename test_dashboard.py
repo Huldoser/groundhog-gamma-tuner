@@ -60,6 +60,12 @@ def temp_config(miners=None):
 
 
 class DisplayHelperTests(unittest.TestCase):
+    def test_over_limit_reads_text_numbers(self):
+        self.assertTrue(dashboard.over_limit("15.2", 15))
+        self.assertFalse(dashboard.over_limit("0.4", "2"))
+        self.assertFalse(dashboard.over_limit("n/a", 2))
+        self.assertFalse(dashboard.over_limit(None, 2))
+
     def test_format_number_and_learned_wall(self):
         self.assertEqual(format_number(None, 0), "-")
         self.assertEqual(format_number("12.3%", 1), "12.3")
@@ -1077,6 +1083,64 @@ class SnapshotTests(unittest.TestCase):
             self.assertIn("start", rejected["message"])
             self.assertEqual(config.get_miners()[0]["start_volt"], miner["start_volt"])
 
+    def test_config_reads_utf8_with_a_byte_order_mark(self):
+        with temp_config() as path:
+            with open(path, "w", encoding="utf-8-sig") as file:
+                file.write('{"miners": [{"ip": "10.0.0.8", "nickname": "Ångström"}]}')
+            config._last_good_config = None
+            self.assertEqual(config.get_miners()[0]["nickname"], "Ångström")
+            self.assertEqual(config.config_problem(), "")
+
+    def test_config_that_is_not_an_object_is_reported_as_damaged(self):
+        with temp_config() as path:
+            with open(path, "w", encoding="utf-8") as file:
+                file.write("[]")
+            config._last_good_config = None
+            self.assertEqual(config.get_miners(), [])
+            self.assertEqual(config.config_problem(), config.CONFIG_CORRUPT_MESSAGE)
+
+    def test_scan_refuses_a_range_larger_than_the_limit(self):
+        with temp_config():
+            app = TunerDashboard()
+            with mock.patch("dashboard.detect_miners") as detect:
+                result = app.start_scan("10.0.0.0", "10.0.255.255")
+            self.assertFalse(result["ok"])
+            self.assertIn("1024", result["message"])
+            detect.assert_not_called()
+
+    def test_reload_keeps_the_last_reading_for_a_saved_miner(self):
+        miner = config.new_miner_record(
+            "BM1370 601", "10.0.0.8", "Alpha", config.get_default_config()
+        )
+        with temp_config([miner]):
+            app = TunerDashboard()
+            app.load_rows()
+            app._rows[0]["freq"] = "700"
+            config.update_miner("10.0.0.8", {"nickname": "Beta"})
+            app.load_rows()
+            self.assertEqual(app._rows[0]["freq"], "700")
+            self.assertEqual(app._rows[0]["name"], "Beta")
+
+    def test_nan_and_inf_limits_are_rejected_and_not_saved(self):
+        miner = config.new_miner_record(
+            "BM1370 601", "10.0.0.8", "Alpha", config.get_default_config()
+        )
+        with temp_config([miner]):
+            app = TunerDashboard()
+            for field, text in (
+                ("max_temp", "nan"),
+                ("max_watts", "inf"),
+                ("max_freq", "inf"),
+                ("max_volt", "1e999"),
+            ):
+                fields = {key: str(miner[key]) for key in ALL_AUTOTUNE_FIELDS}
+                fields[field] = text
+                rejected = app.save_autotuner_settings(
+                    [{"ip": "10.0.0.8", "enabled": True, "fields": fields}]
+                )
+                self.assertFalse(rejected["ok"], field)
+                self.assertEqual(config.get_miners()[0][field], miner[field])
+
     def test_clearing_tune_stops_that_miner(self):
         miner = config.new_miner_record(
             "BM1370 601", "10.0.0.8", "Alpha", config.get_default_config()
@@ -1092,6 +1156,42 @@ class SnapshotTests(unittest.TestCase):
             self.assertTrue(saved["ok"])
             self.assertTrue(event.is_set())
             self.assertFalse(config.get_miners()[0]["enabled"])
+
+    def test_turning_a_miner_back_on_before_its_tuner_exits_starts_a_new_one(self):
+        miner = config.new_miner_record(
+            "BM1370 601", "10.0.0.8", "Alpha", config.get_default_config()
+        )
+        with temp_config([miner]):
+            app = TunerDashboard()
+            release_old = threading.Event()
+            old_event = threading.Event()
+            old_thread = threading.Thread(target=release_old.wait, args=(2,))
+            old_thread.miner_ip = "10.0.0.8"
+            old_thread.start()
+            app.running = True
+            app.threads = [old_thread]
+            app._miner_stops["10.0.0.8"] = old_event
+            fields = {field: str(miner[field]) for field in ALL_AUTOTUNE_FIELDS}
+            started = []
+            new_started = threading.Event()
+
+            def fake_monitor(ip, *_args, **_kwargs):
+                started.append((ip, old_thread.is_alive()))
+                new_started.set()
+
+            with mock.patch("dashboard.monitor_and_adjust", fake_monitor):
+                app.save_autotuner_settings(
+                    [{"ip": "10.0.0.8", "enabled": False, "fields": fields}]
+                )
+                self.assertTrue(old_event.is_set())
+                app.save_autotuner_settings(
+                    [{"ip": "10.0.0.8", "enabled": True, "fields": fields}]
+                )
+                self.assertEqual(len(app.threads), 2)
+                self.assertFalse(new_started.wait(0.2))
+                release_old.set()
+                self.assertTrue(new_started.wait(2))
+            self.assertEqual(started, [("10.0.0.8", False)])
 
     def test_corrupt_config_is_reported_and_not_overwritten(self):
         with temp_config():

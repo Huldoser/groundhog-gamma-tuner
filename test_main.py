@@ -1,5 +1,8 @@
+import sys
 import unittest
+from unittest import mock
 
+import main
 from main import (
     arch_from_platform,
     choose_amd64_python,
@@ -67,6 +70,26 @@ class InterpreterDiscoveryTests(unittest.TestCase):
             ),
             AMD64,
         )
+
+
+class RelaunchTests(unittest.TestCase):
+    def test_arm64_process_relaunches_with_each_argument_kept_whole(self):
+        script = r"C:\Users\First Last\groundhog-gamma-tuner\main.py"
+        completed = mock.Mock(returncode=3)
+        with (
+            mock.patch.object(sys, "platform", "win32"),
+            mock.patch.object(sys, "argv", [script]),
+            mock.patch.object(sys, "executable", ARM64),
+            mock.patch.object(main, "interpreter_arch", return_value="ARM64"),
+            mock.patch.object(main, "discover_interpreters", return_value=[AMD64]),
+            mock.patch.object(main, "machine_of", return_value="AMD64"),
+            mock.patch.object(main.os.path, "isfile", return_value=True),
+            mock.patch.object(main.subprocess, "run", return_value=completed) as run,
+        ):
+            with self.assertRaises(SystemExit) as stopped:
+                main.ensure_amd64_python()
+        run.assert_called_once_with([AMD64, script], check=False)
+        self.assertEqual(stopped.exception.code, 3)
 
 
 if __name__ == "__main__":

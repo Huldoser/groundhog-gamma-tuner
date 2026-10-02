@@ -1,3 +1,4 @@
+import math
 import threading
 import time
 
@@ -172,12 +173,8 @@ def _wait(stop_event, seconds):
 
 def coerce_limit(value):
     """Return an int limit, or None when the value is missing or not numeric."""
-    if value is None or value == "":
-        return None
-    try:
-        return int(float(value))
-    except (TypeError, ValueError):
-        return None
+    number = coerce_real_limit(value)
+    return None if number is None else int(number)
 
 
 def coerce_real_limit(value):
@@ -188,17 +185,16 @@ def coerce_real_limit(value):
     """
     if value is None or value == "":
         return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
+    return _as_float(value)
 
 
 def _as_float(value):
+    """A finite float, or None. NaN and infinity count as missing."""
     try:
-        return float(value)
+        number = float(value)
     except (TypeError, ValueError):
         return None
+    return number if math.isfinite(number) else None
 
 
 def _positive_int(value, default):
@@ -362,7 +358,8 @@ def _thermal_frequency_steps(overshoot, tolerance):
     band = tolerance if tolerance and tolerance > 0 else 0
     if band <= 0:
         return 1
-    return max(1, int((overshoot + band - 1) // band))
+    # Readings carry decimals, so 3.5°C over a 3°C band is two bands.
+    return max(1, math.ceil(overshoot / band))
 
 
 def _step_down(
@@ -405,6 +402,12 @@ def _overheat_mode_set(value):
         return bool(value)
 
 
+# AxeOS v2.15.1 reports Gamma power as regulator output plus a fixed 5 W for
+# the rest of the board, so a board with the ASIC powered off still reads 5 W.
+# At or under this the ASIC is off. The lowest running clocks read well above it.
+ASIC_OFF_POWER_WATTS = 5.5
+
+
 def overheat_ready_to_clear(info, max_temp, max_vr_temp):
     """True when a sticky overheat flag can be cleared.
 
@@ -425,7 +428,7 @@ def overheat_ready_to_clear(info, max_temp, max_vr_temp):
         or power is None
         or temp_cap is None
         or vr_cap is None
-        or power <= 0.5
+        or power <= ASIC_OFF_POWER_WATTS
         or temp > temp_cap
         or vr_temp > vr_cap
     ):
@@ -564,7 +567,7 @@ def overheat_latched(info, overheat_since, now, max_vr_temp):
     if overheat_since is None or now - overheat_since < OVERHEAT_LATCH_SECONDS:
         return False
     power = _as_float(info.get("power"))
-    if power is not None and power > 0.5:
+    if power is not None and power > ASIC_OFF_POWER_WATTS:
         return False
     vr_value = _usable_temp(info.get("vrTemp"))
     vr_cap = _as_float(max_vr_temp)
@@ -606,7 +609,7 @@ def _needs_immediate_retreat(
     if power_value is not None and power_value > max_watts:
         return True
     if _overheat_mode_set(overheat_mode) or (
-        power_value is not None and power_value <= 0.5
+        power_value is not None and power_value <= ASIC_OFF_POWER_WATTS
     ):
         return False
     if (
@@ -666,8 +669,9 @@ def expected_hashrate_from_info(info, frequency):
 def good_hashrate(hash_rate, error_percentage):
     """Measured hashes that were not invalid ASIC jobs.
 
-    None when the rate or the error percentage is missing. Error percentage is
-    the share of invalid jobs, reported separately from hashrate.
+    None when the rate or the error percentage is missing. AxeOS v2.15.1
+    computes errorPercentage from the ASIC's own counters: error hashrate over
+    total hashrate across about one second. It is not a share count.
     """
     rate = _as_float(hash_rate)
     error = _as_float(error_percentage)
@@ -726,7 +730,10 @@ def pool_is_down(info):
 
     A missing difficulty is not a stall, so older samples keep the old rules.
     A zero difficulty means the pool is not handing out work. A dead or short
-    hashrate then is not the chip.
+    hashrate then is not the chip. AxeOS v2.15.1 only reads 0 here from boot
+    until the first difficulty, and keeps the last value after a pool drops.
+    When every pool is unreachable it powers the ASIC off instead, and the
+    ASIC_OFF_POWER_WATTS hold covers that.
     """
     if not isinstance(info, dict) or "poolDifficulty" not in info:
         return False
@@ -1395,7 +1402,7 @@ def decide_adjustment(
         )
 
     if _overheat_mode_set(overheat_mode) or (
-        power_value is not None and power_value <= 0.5
+        power_value is not None and power_value <= ASIC_OFF_POWER_WATTS
     ):
         return (
             current_frequency,
@@ -1695,7 +1702,11 @@ def patch_system(bitaxe_ip, settings):
 
 
 def set_system_settings(bitaxe_ip, core_voltage, frequency):
-    """Set frequency and core voltage. Overclock must be on or AxeOS ignores values past the dropdown."""
+    """Set frequency and core voltage.
+
+    AxeOS v2.15.1 applies any value in range. overclockEnabled only unlocks the
+    free-entry fields on its own settings page, and is sent to match that page.
+    """
     settings = {
         "coreVoltage": int(core_voltage),
         "frequency": int(frequency),
@@ -1756,7 +1767,11 @@ def _apply_fan(bitaxe_ip, payload, log_callback):
         log_callback(f"{bitaxe_ip} -> Fan update failed: {error}", "warning")
 
 
-MANUAL_FULL_FAN = {"autofanspeed": 0, "fanspeed": 100}
+# AxeOS v2.15.1 takes the manual fan percent as "manualFanSpeed". It renamed
+# "fanspeed" in v2.11.0 and ignores unknown PATCH keys, so the old key would turn
+# auto fan off and leave the fan on whatever manual speed was saved before.
+# GET still reports the live fan percent as "fanspeed".
+MANUAL_FULL_FAN = {"autofanspeed": 0, "manualFanSpeed": 100}
 
 
 def _fan_is_manual_full(info):
@@ -2120,6 +2135,8 @@ def monitor_and_adjust(
     )
     overheat_since = None
     overheat_recovered = False
+    hardware_fault_restarted = False
+    hardware_fault_noted = False
     fan_retry_at = 0.0
     setpoint_since = None
     last_accepted = None
@@ -2359,6 +2376,42 @@ def monitor_and_adjust(
                 if _wait(event, interval):
                     break
                 continue
+
+            hardware_fault = str(info.get("hardware_fault") or "").strip()
+            if hardware_fault:
+                # AxeOS v2.15.1 sets this when it cannot drive the fan. It stops
+                # mining and only a reboot clears it. Restart once; if the fault
+                # comes back, leave the miner stopped and say so.
+                if not hardware_fault_restarted:
+                    hardware_fault_restarted = True
+                    hardware_fault_noted = False
+                    log_callback(
+                        f"{bitaxe_ip} -> AxeOS reports a hardware fault "
+                        f"({hardware_fault}) and stopped mining. Restarting...",
+                        "error",
+                    )
+                    log_callback(restart_bitaxe(bitaxe_ip), "warning")
+                    settle_until = time.time() + refresh_interval
+                    last_tune_time = time.time()
+                elif not hardware_fault_noted:
+                    hardware_fault_noted = True
+                    log_callback(
+                        f"{bitaxe_ip} -> Hardware fault ({hardware_fault}) is back "
+                        "after a restart. Check the fan and its cable.",
+                        "error",
+                    )
+                _publish_status(
+                    bitaxe_ip,
+                    phase=phase,
+                    wall_type=limit_wall,
+                    reason="hardware fault",
+                )
+                if _wait(event, interval):
+                    break
+                continue
+            if hardware_fault_restarted and not board_hashrate_is_dead(info):
+                hardware_fault_restarted = False
+                hardware_fault_noted = False
 
             if (
                 pending is not None

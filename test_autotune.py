@@ -616,6 +616,9 @@ class DecisionTests(unittest.TestCase):
         self.assertEqual(reason, "holding")
 
     def test_overheat_mode_or_idle_power_holds(self):
+        off = autotune.decide_adjustment(**_limits(temp=45, power=5.0))
+        self.assertEqual(off[:2], (500, 1100))
+        self.assertIn("offline", off[2])
         idle = autotune.decide_adjustment(**_limits(temp=45, power=0))
         self.assertEqual(idle[:2], (500, 1100))
         hot = autotune.decide_adjustment(**_limits(temp=80, power=0))
@@ -689,6 +692,22 @@ class DecisionTests(unittest.TestCase):
             1000,
         )
         self.assertEqual(autotune.expected_hashrate_from_info({}, 500), 0)
+
+    def test_fractional_overshoot_rounds_up_to_whole_bands(self):
+        self.assertEqual(autotune._thermal_frequency_steps(0.5, 3), 1)
+        self.assertEqual(autotune._thermal_frequency_steps(3, 3), 1)
+        self.assertEqual(autotune._thermal_frequency_steps(3.5, 3), 2)
+        frequency, _voltage, reason = autotune.decide_adjustment(
+            **_limits(temp=63.5, max_temp=60, temp_tolerance=3)
+        )
+        self.assertEqual(frequency, 490)
+        self.assertIn("frequency", reason)
+
+    def test_non_finite_limits_count_as_missing(self):
+        for text in ("nan", "inf", "-inf"):
+            self.assertIsNone(autotune.coerce_real_limit(text))
+            self.assertIsNone(autotune.coerce_limit(text))
+        self.assertEqual(autotune.coerce_limit("700.9"), 700)
 
     def test_thermal_step_count_follows_the_hotter_sensor(self):
         self.assertEqual(autotune._thermal_frequency_steps(4, 3), 2)
@@ -1528,6 +1547,8 @@ class DecisionTests(unittest.TestCase):
         self.assertFalse(autotune.overheat_latched(info, 0, latch - 1, 85))
         self.assertFalse(autotune.overheat_latched(info, None, latch, 85))
         self.assertFalse(autotune.overheat_latched(dict(info, power=12), 0, latch, 85))
+        # AxeOS adds a fixed 5 W to Gamma power, so a powered-down ASIC reads 5 W.
+        self.assertTrue(autotune.overheat_latched(dict(info, power=5.0), 0, latch, 85))
         self.assertFalse(autotune.overheat_latched(dict(info, vrTemp=90), 0, latch, 85))
         self.assertFalse(
             autotune.overheat_latched(dict(info, overheat_mode=0), 0, latch, 85)
@@ -3479,7 +3500,7 @@ class SessionTests(unittest.TestCase):
         self.assertTrue(fan_calls)
         self.assertTrue(
             all(
-                call.get("autofanspeed") == 0 and call.get("fanspeed") == 100
+                call.get("autofanspeed") == 0 and call.get("manualFanSpeed") == 100
                 for call in fan_calls
             )
         )
@@ -4956,6 +4977,81 @@ class SessionTests(unittest.TestCase):
         self.assertIn({"overheat_mode": 0}, patches)
         self.assertIn((400, 1000), calls)
         self.assertEqual(calls.count((400, 1000)), 1)
+
+    def test_latched_overheat_is_found_at_the_firmware_5_watt_idle_reading(self):
+        restarts = []
+        patches = []
+        stop_event = threading.Event()
+
+        def set_settings(ip, volt, freq):
+            return (
+                f"{ip} -> Applied settings: Voltage = {volt}mV, Frequency = {freq}MHz"
+            )
+
+        def patch(ip, settings):
+            patches.append(dict(settings))
+            return True, ""
+
+        def restart(ip):
+            restarts.append(ip)
+            return f"{ip} -> Restart initiated."
+
+        def get_info(ip):
+            return _info(
+                frequency=250,
+                voltage=900,
+                overheat_mode=1,
+                temp=-1,
+                power=5.0,
+                hashRate=0,
+            )
+
+        with (
+            patched_io(get_info, set_settings, restart=restart),
+            mock.patch.object(autotune, "patch_system", patch),
+            mock.patch.object(autotune, "OVERHEAT_LATCH_SECONDS", 0.05),
+        ):
+            thread = _start_miner("miner", stop_event, lambda *args: None)
+            time.sleep(0.5)
+            stop_event.set()
+            thread.join(2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(restarts, ["miner"])
+        self.assertIn({"overheat_mode": 0}, patches)
+
+    def test_hardware_fault_restarts_once_and_then_reports_it(self):
+        restarts = []
+        logs = []
+        stop_event = threading.Event()
+
+        def set_settings(ip, volt, freq):
+            return (
+                f"{ip} -> Applied settings: Voltage = {volt}mV, Frequency = {freq}MHz"
+            )
+
+        def restart(ip):
+            restarts.append(ip)
+            return f"{ip} -> Restart initiated."
+
+        def get_info(ip):
+            return _info(
+                hardware_fault="Fan Control Failed (init)",
+                power=5.0,
+                hashRate=0,
+            )
+
+        def log(message, level="info"):
+            logs.append(message)
+
+        with patched_io(get_info, set_settings, restart=restart):
+            thread = _start_miner("miner", stop_event, log)
+            time.sleep(0.4)
+            stop_event.set()
+            thread.join(2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(restarts, ["miner"])
+        self.assertTrue(any("Fan Control Failed" in line for line in logs))
+        self.assertEqual(sum("is back after a restart" in line for line in logs), 1)
 
     def test_zero_hashrate_under_the_floor_writes_the_floor_before_restarting(self):
         state = {"frequency": 400, "voltage": 1100, "polls_after_write": 0}

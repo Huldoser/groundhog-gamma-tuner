@@ -5,6 +5,7 @@ and hands the page a snapshot to poll. Nothing listens on the network.
 """
 
 import ipaddress
+import math
 import os
 import platform
 import re
@@ -98,6 +99,8 @@ GLOBAL_INT_FIELDS = (
     "vr_temp_tolerance",
     "ceiling_soak_seconds",
 )
+# A /22. A home network is a /24 (254 addresses).
+MAX_SCAN_ADDRESSES = 1024
 START_REQUIRED_FIELDS = (
     "min_freq",
     "max_freq",
@@ -149,6 +152,11 @@ def parse_autotuner_value(field, raw):
     text = str(raw).strip()
     if text == "":
         return ""
+    value = float(text)
+    # float() accepts "nan" and "inf". A NaN cap makes every "over the cap"
+    # test false, so it would switch that limit off.
+    if not math.isfinite(value):
+        raise ValueError(f"{field} must be a finite number")
     if field in (
         "min_input_voltage",
         "max_error_percentage",
@@ -156,8 +164,8 @@ def parse_autotuner_value(field, raw):
         "max_watts",
         "max_vr_temp",
     ):
-        return float(text)
-    number = int(float(text))
+        return value
+    number = int(value)
     if field in ("min_freq", "max_freq", "start_freq"):
         return max(HARD_MIN_FREQ, min(HARD_MAX_FREQ, number))
     if field in ("min_volt", "max_volt", "start_volt"):
@@ -237,9 +245,10 @@ def parse_display_number(value):
         .strip()
     )
     try:
-        return float(cleaned)
+        number = float(cleaned)
     except ValueError:
         return None
+    return number if math.isfinite(number) else None
 
 
 def format_number(value, digits):
@@ -750,10 +759,12 @@ def read_latest_stable_firmware(get=None):
 
 
 def over_limit(value, limit):
+    """True when a reading is above its cap. A text reading is parsed first."""
+    number = parse_display_number(value)
     limit_number = parse_display_number(limit)
-    if value is None or limit_number is None:
+    if number is None or limit_number is None:
         return False
-    return value > limit_number
+    return number > limit_number
 
 
 def under_limit(value, limit):
@@ -1253,12 +1264,22 @@ class TunerDashboard:
 
     def load_rows(self):
         """Replace the table with the miners saved in config.json."""
-        rows = []
-        for miner in get_miners():
-            ip = miner["ip"]
-            nickname = miner.get("nickname") or f"Miner-{ip}"
-            rows.append(blank_miner_row(nickname, ip))
+        saved = [
+            (miner["ip"], miner.get("nickname") or f"Miner-{miner['ip']}")
+            for miner in get_miners()
+        ]
         with self._lock:
+            # Keep the last reading for a miner that is still saved, so a scan
+            # or an edit does not blank the table until the next refresh.
+            current = {row["ip"]: row for row in self._rows}
+            rows = []
+            for ip, nickname in saved:
+                row = current.get(ip)
+                if row is None:
+                    row = blank_miner_row(nickname, ip)
+                else:
+                    row["name"] = nickname
+                rows.append(row)
             self._rows = rows
             kept = {row["ip"] for row in rows}
             for ip in list(self._alerts):
@@ -1683,6 +1704,11 @@ class TunerDashboard:
             return _fail("Ending IP must be the same as or after the starting IP.")
 
         total = int(end) - int(start) + 1
+        if total > MAX_SCAN_ADDRESSES:
+            return _fail(
+                f"Scan at most {MAX_SCAN_ADDRESSES} addresses at a time. "
+                f"This range has {total}."
+            )
         with self._lock:
             if self._scan_running:
                 return _fail("A scan is already running.", "Scan Network", "warning")
@@ -2006,8 +2032,22 @@ class TunerDashboard:
                 return
             self._status_refresh_running = True
         try:
-            results = [(ip, get_system_info(ip)) for ip in ips]
-            self._apply_results(results)
+            # Read the miners in parallel. One at a time, each offline miner
+            # held every other row back by its full request timeout.
+            results = [None] * len(ips)
+
+            def read(index, ip):
+                results[index] = (ip, get_system_info(ip))
+
+            readers = [
+                threading.Thread(target=read, args=(index, ip), daemon=True)
+                for index, ip in enumerate(ips)
+            ]
+            for reader in readers:
+                reader.start()
+            for reader in readers:
+                reader.join()
+            self._apply_results([result for result in results if result])
         finally:
             with self._lock:
                 self._status_refresh_running = False
@@ -2245,12 +2285,18 @@ class TunerDashboard:
             or any(thread.is_alive() for thread in self.threads)
         )
 
-    def _miner_thread(self, miner, interval, startup_delay):
-        """One tuner thread and the event that asks it to leave."""
+    def _miner_thread(self, miner, interval, startup_delay, after=None):
+        """One tuner thread and the event that asks it to leave.
+
+        `after` is a tuner thread for the same miner that was asked to stop and
+        has not exited yet. The new one waits for it, so two never tune at once.
+        """
         miner_event = threading.Event()
         thread = threading.Thread(
-            target=monitor_and_adjust,
+            target=_run_after,
             args=(
+                after,
+                monitor_and_adjust,
                 miner["ip"],
                 miner.get("type", "Unknown"),
                 interval,
@@ -2288,11 +2334,17 @@ class TunerDashboard:
             ):
                 return
             self._reap_threads_locked()
-            alive = {
-                getattr(thread, "miner_ip", None)
-                for thread in self.threads
-                if thread.is_alive()
-            }
+            # A thread already asked to stop is leaving. Turning the miner off
+            # and on again before it exits must still start a new tuner.
+            alive = set()
+            stopping = {}
+            for thread in self.threads:
+                ip = getattr(thread, "miner_ip", None)
+                event = self._miner_stops.get(ip)
+                if event is not None and event.is_set():
+                    stopping[ip] = thread
+                else:
+                    alive.add(ip)
         runtime = load_config()
         interval = runtime.get("monitor_interval", 5)
         ready = []
@@ -2311,7 +2363,9 @@ class TunerDashboard:
         events = {}
         threads = []
         for miner in ready:
-            event, thread = self._miner_thread(miner, interval, 0)
+            event, thread = self._miner_thread(
+                miner, interval, 0, after=stopping.get(miner["ip"])
+            )
             events[miner["ip"]] = event
             threads.append(thread)
         with self._lock:
@@ -2404,9 +2458,16 @@ class TunerDashboard:
     def _publish_stopped_phases(self, threads):
         """Leave a finished tuner on Stopped. Keep the saved setpoint fields."""
         stopped_ips = []
+        with self._lock:
+            running_ips = {
+                getattr(thread, "miner_ip", "")
+                for thread in self.threads
+                if thread.is_alive()
+            }
         for thread in threads:
             ip = getattr(thread, "miner_ip", "")
-            if not ip:
+            # A newer tuner for this miner owns its status now.
+            if not ip or ip in running_ips:
                 continue
             phase = str(get_miner_status(ip).get("phase") or "").strip().lower()
             if phase in ("climb", "hold", "trim"):
@@ -2442,6 +2503,13 @@ class TunerDashboard:
         else:
             self.log_message("Autotuning stopped.", "warning")
         self._publish_stopped_phases(finished)
+
+
+def _run_after(previous, target, *args, **kwargs):
+    """Wait for `previous` to exit when there is one, then run `target`."""
+    if previous is not None:
+        previous.join()
+    target(*args, **kwargs)
 
 
 class DashboardApi:

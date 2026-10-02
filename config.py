@@ -8,6 +8,8 @@ import threading
 import requests
 
 SYSTEM_INFO_TIMEOUT = 10
+# Addresses a network scan probes at the same time.
+SCAN_WORKERS = 32
 
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 CONFIG_CORRUPT_MESSAGE = (
@@ -34,6 +36,9 @@ DEFAULT_CEILING_SOAK_SECONDS = 30 * 60
 
 # AxeOS v2.15.1 cuts ASIC power above 75°C on the ASIC or 105°C on the regulator.
 # After it cools, it saves clocks 100 MHz and 100 mV lower, with no floor.
+# The regulator refuses anything under 1000 mV, so a trip from under 1100 mV
+# leaves the ASIC off with overheat_mode set until the clocks are rewritten and
+# the miner restarts. The tuner does that (autotune.overheat_latched).
 # User caps and the tuner's emergency retreat stay this margin under those trips.
 FIRMWARE_ASIC_TRIP_C = 75.0
 FIRMWARE_VR_TRIP_C = 105.0
@@ -133,40 +138,80 @@ def detect_miners(start_ip, end_ip, on_progress=None, should_cancel=None):
         print("Error: Invalid IP range provided.")
         return []
 
-    detected_miners = []
     config = load_config()
+    known_ips = {m["ip"] for m in config["miners"]}
     addresses = list(range(int(start_ip), int(end_ip) + 1))
     total = len(addresses)
+    found = {}
+    next_index = 0
+    stopped = False
+    claim_lock = threading.Lock()
 
-    for index, ip in enumerate(addresses, start=1):
-        if should_cancel is not None and should_cancel():
-            break
-        ip_str = str(ipaddress.IPv4Address(ip))
-        if on_progress is not None:
-            on_progress(index, total, ip_str)
+    def claim():
+        """Next (index, ip) to probe, or None once the range is done or cancelled.
+
+        Progress is reported in address order, before that address is probed.
+        """
+        nonlocal next_index, stopped
+        with claim_lock:
+            if stopped or next_index >= total:
+                return None
+            if should_cancel is not None and should_cancel():
+                stopped = True
+                return None
+            index = next_index + 1
+            ip_str = str(ipaddress.IPv4Address(addresses[next_index]))
+            next_index += 1
+            if on_progress is not None:
+                on_progress(index, total, ip_str)
+            return index, ip_str
+
+    def probe(ip_str):
         try:
             response = requests.get(
                 f"http://{ip_str}/api/system/info", timeout=SYSTEM_INFO_TIMEOUT
             )
-            if response.status_code == 200:
-                miner_info = response.json()
-                if not is_gamma_601(miner_info):
-                    print(f"Skipping {ip_str}: not a Bitaxe Gamma 601.")
-                    continue
-                model = miner_type_from_info(miner_info)
-
-                # Prevent duplicate miner entries
-                if not any(m["ip"] == ip_str for m in config["miners"]):
-                    detected = new_miner_record(
-                        model, ip_str, miner_name_from_info(miner_info, ip_str), config
-                    )
-                    detected_miners.append(detected)
-                    print(
-                        f"Detected miner: {model} at {ip_str}, added as {detected_miners[-1]['nickname']}"
-                    )
-
+            if response.status_code != 200:
+                return None
+            miner_info = response.json()
         except (requests.exceptions.RequestException, ValueError):
-            continue
+            return None
+        if not is_gamma_601(miner_info):
+            print(f"Skipping {ip_str}: not a Bitaxe Gamma 601.")
+            return None
+        return miner_info
+
+    def worker():
+        while True:
+            claimed = claim()
+            if claimed is None:
+                return
+            index, ip_str = claimed
+            miner_info = probe(ip_str)
+            # Prevent duplicate miner entries
+            if miner_info is None or ip_str in known_ips:
+                continue
+            model = miner_type_from_info(miner_info)
+            detected = new_miner_record(
+                model, ip_str, miner_name_from_info(miner_info, ip_str), config
+            )
+            with claim_lock:
+                found[index] = detected
+            print(
+                f"Detected miner: {model} at {ip_str}, added as {detected['nickname']}"
+            )
+
+    # Probe several addresses at once. One at a time, each empty address could
+    # cost the full timeout, so a /24 took many minutes.
+    workers = [
+        threading.Thread(target=worker, daemon=True)
+        for _ in range(min(SCAN_WORKERS, total))
+    ]
+    for thread in workers:
+        thread.start()
+    for thread in workers:
+        thread.join()
+    detected_miners = [found[index] for index in sorted(found)]
 
     if not detected_miners:
         return []
@@ -210,9 +255,14 @@ def load_config():
             return default
 
         try:
-            with open(CONFIG_FILE, "r") as file:
+            # utf-8-sig also reads a file Notepad saved with a byte-order mark.
+            # Without an encoding, Windows would decode it as cp1252.
+            with open(CONFIG_FILE, "r", encoding="utf-8-sig") as file:
                 loaded = json.load(file)
-        except json.JSONDecodeError:
+            if not isinstance(loaded, dict):
+                raise ValueError("config.json is not a JSON object")
+        except ValueError:
+            # JSONDecodeError and UnicodeDecodeError are both ValueErrors.
             if _last_good_config is not None:
                 return copy.deepcopy(_last_good_config)
             _config_corrupt = True
@@ -278,7 +328,7 @@ def _write_config(config):
     directory = os.path.dirname(config_path) or "."
     fd, temp_path = tempfile.mkstemp(dir=directory, prefix=".config-", suffix=".json")
     try:
-        with os.fdopen(fd, "w") as file:
+        with os.fdopen(fd, "w", encoding="utf-8") as file:
             json.dump(config, file, indent=4)
             file.flush()
             os.fsync(file.fileno())

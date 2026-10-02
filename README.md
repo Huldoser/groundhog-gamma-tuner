@@ -22,7 +22,7 @@ This is an unofficial tool. It is not affiliated with Hurllz or the Bitaxe proje
 2. Polls AxeOS and waits until the miner reports the new setpoint before the next step.
 3. Lowers frequency if ASIC temperature, regulator temperature, power, input voltage, or core-voltage droop crosses the limit.
    Temperature caps stay at least 4°C under the AxeOS overheat trip (75°C ASIC, 105°C regulator). Inside that margin the tuner sheds 20 MHz and 10 mV at a time, every 30 seconds, so AxeOS does not cut power and drop the clocks by 100 MHz and 100 mV on its own.
-   If AxeOS does trip, the tuner notices the lower clocks, puts them back on the saved minimum once the chip is cool, and climbs again from there. If AxeOS leaves the chip off in overheat mode, the tuner writes the minimum clocks, clears the flag, and restarts the miner once.
+   If AxeOS does trip, the tuner notices the lower clocks, puts them back on the saved minimum once the chip is cool, and climbs again from there. If AxeOS leaves the chip off in overheat mode, the tuner writes the minimum clocks, clears the flag, and restarts the miner once. That happens after a trip from under 1100 mV: AxeOS saves a voltage under 1000 mV, which the regulator refuses.
    A heat retreat also drops one voltage step while errors are at most half the budget, so voltage raised for a higher clock does not keep heating a lower one. At the frequency floor, voltage only drops for heat while errors still fit the budget, and never for errors.
 4. Raises voltage only when the ASIC error percentage is above the budget, then raises frequency while errors stay inside that budget.
 5. Trims voltage down at the ceiling, then holds. The last good setpoint is saved so the next start does not begin from stock. The fan stays at full speed for the whole session, so a warmer room is what moves the clocks.
@@ -45,7 +45,7 @@ The power supply is oversized for this setup and is not the tuning limit. The 50
 
 Operating targets are about 65°C on the chip and 85°C on the regulator. The tuner stops climbing there and steps frequency down before 70°C on the chip and 90°C on the regulator. A hotter afternoon takes a larger step than a one-degree drift. A cooler night lets a chip that is still under its frequency cap climb again.
 
-AxeOS will still emergency-stop at 75°C on the ASIC or 105°C on the regulator, then restart about 100 MHz and 100 mV lower. These limits stay under that, so the tuner remains the controller. Core voltage stays at or below 1300 mV.
+AxeOS will still emergency-stop at 75°C on the ASIC or 105°C on the regulator, then restart about 100 MHz and 100 mV lower. These limits stay under that, so the tuner remains the controller. Max core voltage defaults to 1300 mV. The field accepts up to 1400 mV, the hard cap in `config.py`.
 
 Frequency can step down to 350 MHz. That is the lowest BM1370 clock in the AxeOS v2.15.1 preset list (the Gamma Duo list; the Gamma list starts at 400). A Min frequency typed under 350 is saved as 350. Core voltage stays at or above 1000 mV, the lowest BM1370 voltage preset. The tuner lowers voltage only after frequency is already at its minimum, so a weak chip is settled with a lower clock, not a lower voltage. A saved miner keeps its Min frequency until that field is changed. Miners already saved at 400 MHz stay there.
 

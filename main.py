@@ -105,10 +105,14 @@ def ensure_amd64_python():
         launch = chosen
     if not launch or _same_file(launch, sys.executable):
         _missing_x64_python()
+    # os.execv on Windows does not quote its arguments, so "C:\Program Files\..."
+    # or a user folder with a space would split into several arguments.
+    # subprocess quotes each one. This process waits and passes on the exit code.
     try:
-        os.execv(launch, [launch, *sys.argv])
+        completed = subprocess.run([launch, *sys.argv], check=False)
     except OSError:
         _missing_x64_python()
+    raise SystemExit(completed.returncode)
 
 
 def _missing_x64_python():

@@ -417,6 +417,10 @@ function renderTable(miners) {
 
 function appendLog(lines) {
   if (!lines || !lines.length) return;
+  // Two snapshot calls can overlap and return the same lines, or an older
+  // reply can land after a newer one. Keep only lines past the cursor.
+  lines = lines.filter((line) => Number(line.id) > logCursor);
+  if (!lines.length) return;
   const log = $("log");
   const stick = log.scrollHeight - log.scrollTop - log.clientHeight < 48;
   lines.forEach((line) => {
@@ -427,7 +431,7 @@ function appendLog(lines) {
   });
   while (log.children.length > 500) log.removeChild(log.firstChild);
   if (stick) log.scrollTop = log.scrollHeight;
-  logCursor = lines[lines.length - 1].id;
+  logCursor = Math.max(logCursor, Number(lines[lines.length - 1].id) || 0);
 }
 
 function syncScan(scan) {
