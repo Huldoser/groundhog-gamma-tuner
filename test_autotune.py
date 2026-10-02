@@ -1540,13 +1540,19 @@ class DecisionTests(unittest.TestCase):
         self.assertEqual(autotune.error_restart_limit(4.0), 20.0)
         self.assertEqual(autotune.error_restart_limit(None), 10.0)
 
-    def test_overheat_latch_needs_time_no_power_and_a_cool_regulator(self):
+    def test_overheat_latch_needs_time_and_a_cool_regulator(self):
         info = _info(overheat_mode=1, temp=0, vrTemp=50, power=0.2)
         latch = autotune.OVERHEAT_LATCH_SECONDS
         self.assertTrue(autotune.overheat_latched(info, 0, latch, 85))
         self.assertFalse(autotune.overheat_latched(info, 0, latch - 1, 85))
         self.assertFalse(autotune.overheat_latched(info, None, latch, 85))
-        self.assertFalse(autotune.overheat_latched(dict(info, power=12), 0, latch, 85))
+        # AxeOS turns the regulator back on before a failed ASIC start, so
+        # power does not decide it.
+        self.assertTrue(autotune.overheat_latched(dict(info, power=12), 0, latch, 85))
+        # Over 91°C the firmware may still be cooling, whatever the cap.
+        self.assertFalse(
+            autotune.overheat_latched(dict(info, vrTemp=93), 0, latch, 101)
+        )
         # AxeOS adds a fixed 5 W to Gamma power, so a powered-down ASIC reads 5 W.
         self.assertTrue(autotune.overheat_latched(dict(info, power=5.0), 0, latch, 85))
         self.assertFalse(autotune.overheat_latched(dict(info, vrTemp=90), 0, latch, 85))
@@ -5018,6 +5024,102 @@ class SessionTests(unittest.TestCase):
         self.assertFalse(thread.is_alive())
         self.assertEqual(restarts, ["miner"])
         self.assertIn({"overheat_mode": 0}, patches)
+
+    def test_latched_overheat_with_the_regulator_back_on_still_restarts(self):
+        restarts = []
+        patches = []
+        stop_event = threading.Event()
+
+        def set_settings(ip, volt, freq):
+            return (
+                f"{ip} -> Applied settings: Voltage = {volt}mV, Frequency = {freq}MHz"
+            )
+
+        def patch(ip, settings):
+            patches.append(dict(settings))
+            return True, ""
+
+        def restart(ip):
+            restarts.append(ip)
+            return f"{ip} -> Restart initiated."
+
+        def get_info(ip):
+            # AxeOS saved 1050 mV, powered the regulator, and the ASIC did not start.
+            return _info(
+                frequency=550,
+                voltage=1050,
+                overheat_mode=1,
+                temp=21,
+                power=9.5,
+                hashRate=0,
+            )
+
+        with (
+            patched_io(get_info, set_settings, restart=restart),
+            mock.patch.object(autotune, "patch_system", patch),
+            mock.patch.object(autotune, "OVERHEAT_LATCH_SECONDS", 0.05),
+        ):
+            thread = _start_miner("miner", stop_event, lambda *args: None)
+            time.sleep(0.5)
+            stop_event.set()
+            thread.join(2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(restarts, ["miner"])
+        self.assertIn({"overheat_mode": 0}, patches)
+
+    def test_asic_off_without_overheat_restarts_once(self):
+        restarts = []
+        stop_event = threading.Event()
+
+        def set_settings(ip, volt, freq):
+            return (
+                f"{ip} -> Applied settings: Voltage = {volt}mV, Frequency = {freq}MHz"
+            )
+
+        def restart(ip):
+            restarts.append(ip)
+            return f"{ip} -> Restart initiated."
+
+        def get_info(ip):
+            return _info(power=5.0, hashRate=0, temp=21)
+
+        with (
+            patched_io(get_info, set_settings, restart=restart),
+            mock.patch.object(autotune, "ASIC_OFF_RESTART_SECONDS", 0.05),
+        ):
+            thread = _start_miner("miner", stop_event, lambda *args: None)
+            time.sleep(0.5)
+            stop_event.set()
+            thread.join(2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(restarts, ["miner"])
+
+    def test_paused_miner_is_not_restarted(self):
+        restarts = []
+        stop_event = threading.Event()
+
+        def set_settings(ip, volt, freq):
+            return (
+                f"{ip} -> Applied settings: Voltage = {volt}mV, Frequency = {freq}MHz"
+            )
+
+        def restart(ip):
+            restarts.append(ip)
+            return f"{ip} -> Restart initiated."
+
+        def get_info(ip):
+            return _info(power=5.0, hashRate=0, miningPaused=True)
+
+        with (
+            patched_io(get_info, set_settings, restart=restart),
+            mock.patch.object(autotune, "ASIC_OFF_RESTART_SECONDS", 0.05),
+        ):
+            thread = _start_miner("miner", stop_event, lambda *args: None)
+            time.sleep(0.4)
+            stop_event.set()
+            thread.join(2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(restarts, [])
 
     def test_hardware_fault_restarts_once_and_then_reports_it(self):
         restarts = []

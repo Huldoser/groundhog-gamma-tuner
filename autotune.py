@@ -468,9 +468,16 @@ TRIP_GUARD_SETTLE_SECONDS = 30
 # this large that the session did not write is that trip.
 FIRMWARE_DROP_FREQ_MHZ = 50
 FIRMWARE_DROP_VOLT_MV = 50
-# overheat_mode still set this long, with the ASIC drawing no power, means
-# AxeOS could not bring the chip back after its cool-down.
+# overheat_mode still set this long, with the regulator cool, means AxeOS
+# could not bring the chip back after its cool-down.
 OVERHEAT_LATCH_SECONDS = 120
+# AxeOS leaves its cool-down once the regulator is at or under 95°C. A few
+# degrees under that, the cool-down is over for certain.
+OVERHEAT_LATCH_VR_C = FIRMWARE_VR_TRIP_C - 10 - FIRMWARE_TRIP_MARGIN_C
+# The ASIC reading as powered off this long without overheat mode or a user
+# pause earns one restart. A failed start or a regulator that shut itself off
+# otherwise holds forever.
+ASIC_OFF_RESTART_SECONDS = 5 * 60
 
 
 # A hold that stopped under a hashrate or silicon wall climbs again once the
@@ -557,21 +564,26 @@ def floor_setpoint(frequency, voltage, min_freq, min_volt):
 
 
 def overheat_latched(info, overheat_since, now, max_vr_temp):
-    """True when AxeOS left overheat mode on and the ASIC is not running.
+    """True when AxeOS left overheat mode on after its own recovery failed.
 
-    The flag has been set for OVERHEAT_LATCH_SECONDS, the board draws no more
-    than the idle floor, and the regulator reads at or under its cap.
+    The flag has been set for OVERHEAT_LATCH_SECONDS and the regulator reads at
+    or under its cap and under OVERHEAT_LATCH_VR_C. AxeOS v2.15.1 cools for 30 s
+    and resumes once the regulator is at or under 95°C, then clears the flag
+    only if the ASIC starts. Still set after that means the restart failed.
+
+    Power is not checked. The restart turns the regulator back on at the saved
+    voltage before it tries the ASIC, so a failed start can read well above
+    the 5 W the board shows with the regulator off.
     """
     if not isinstance(info, dict) or not _overheat_mode_set(info.get("overheat_mode")):
         return False
     if overheat_since is None or now - overheat_since < OVERHEAT_LATCH_SECONDS:
         return False
-    power = _as_float(info.get("power"))
-    if power is not None and power > ASIC_OFF_POWER_WATTS:
-        return False
     vr_value = _usable_temp(info.get("vrTemp"))
     vr_cap = _as_float(max_vr_temp)
-    return vr_value is not None and vr_cap is not None and vr_value <= vr_cap
+    if vr_value is None or vr_cap is None:
+        return False
+    return vr_value <= min(vr_cap, OVERHEAT_LATCH_VR_C)
 
 
 def _needs_immediate_retreat(
@@ -2137,6 +2149,8 @@ def monitor_and_adjust(
     overheat_recovered = False
     hardware_fault_restarted = False
     hardware_fault_noted = False
+    asic_off_since = None
+    asic_off_restarted = False
     fan_retry_at = 0.0
     setpoint_since = None
     last_accepted = None
@@ -2372,6 +2386,60 @@ def monitor_and_adjust(
                     phase=phase,
                     wall_type=limit_wall,
                     reason="overheat restart",
+                )
+                if _wait(event, interval):
+                    break
+                continue
+
+            power_now = _as_float(info.get("power"))
+            asic_off = (
+                not overheat_now
+                and not _overheat_mode_set(info.get("miningPaused"))
+                and not info.get("hardware_fault")
+                and power_now is not None
+                and power_now <= ASIC_OFF_POWER_WATTS
+            )
+            if not asic_off:
+                asic_off_since = None
+                if power_now is not None and power_now > ASIC_OFF_POWER_WATTS:
+                    asic_off_restarted = False
+            elif asic_off_since is None:
+                asic_off_since = now
+            elif (
+                not asic_off_restarted
+                and now - asic_off_since >= ASIC_OFF_RESTART_SECONDS
+            ):
+                # Nothing is mining and AxeOS is not saying why. Put clocks
+                # under the floor back on it, then restart once. A pool that is
+                # down also reads like this; the restart then changes nothing.
+                asic_off_restarted = True
+                base = reported_pair or confirmed
+                if base is not None:
+                    floor = floor_setpoint(
+                        base[0], base[1], limits["min_freq"], limits["min_volt"]
+                    )
+                    if not _same_setpoint(floor, base):
+                        applied_settings = set_system_settings(
+                            bitaxe_ip, floor[1], floor[0]
+                        )
+                        log_callback(applied_settings, "info")
+                        if settings_were_applied(applied_settings):
+                            pending = floor
+                            setpoint_since = None
+                log_callback(
+                    f"{bitaxe_ip} -> The ASIC has been off for "
+                    f"{int(now - asic_off_since)}s without overheat mode or a "
+                    "pause. Restarting...",
+                    "error",
+                )
+                log_callback(restart_bitaxe(bitaxe_ip), "warning")
+                settle_until = time.time() + refresh_interval
+                last_tune_time = time.time()
+                _publish_status(
+                    bitaxe_ip,
+                    phase=phase,
+                    wall_type=limit_wall,
+                    reason="asic off restart",
                 )
                 if _wait(event, interval):
                     break
