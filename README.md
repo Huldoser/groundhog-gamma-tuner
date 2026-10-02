@@ -43,7 +43,7 @@ These Gammas use a custom shell with better cooling than a stock board. Most can
 
 The power supply is oversized for this setup and is not the tuning limit. The 50 W figure is a fault guard. If a barrel jack or board trace ever runs hot, lower that miner's watt cap.
 
-Operating targets are about 65°C on the chip and 85°C on the regulator. The tuner stops climbing there and steps frequency down before 70°C on the chip and 90°C on the regulator. A hotter afternoon takes a larger step than a one-degree drift. A cooler night lets a chip that is still under its frequency cap climb again.
+The default caps are 68°C on the chip and 88°C on the regulator. The tuner climbs while both sensors are at or under their caps and steps frequency down once one goes over. After a heat retreat it holds until both are a tolerance band (3°C by default) under their caps, about 65°C and 85°C, then climbs again. A hotter afternoon takes a larger step than a one-degree drift. A cooler night lets a chip that is still under its frequency cap climb again.
 
 AxeOS will still emergency-stop at 75°C on the ASIC or 105°C on the regulator, then restart about 100 MHz and 100 mV lower. These limits stay under that, so the tuner remains the controller. Max core voltage defaults to 1300 mV. The field accepts up to 1400 mV, the hard cap in `config.py`.
 

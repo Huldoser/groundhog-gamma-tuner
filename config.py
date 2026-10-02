@@ -49,8 +49,9 @@ STOCK_FREQ = 525
 STOCK_VOLT = 1150
 
 # Per-miner caps for a custom-cooled Gamma 601. Still editable per chip.
-# The tuner holds near 65°C on the ASIC and 85°C on the regulator, and steps
-# down above 68°C / 88°C. max_watts is a runaway guard, not the performance limit.
+# The tuner climbs while the ASIC is at or under 68°C and the regulator at or
+# under 88°C, and steps down above them. After a heat retreat it waits until
+# both are a tolerance band under their caps before climbing again. max_watts is a runaway guard, not the performance limit.
 # max_freq is the hard cap so a strong chip is not stopped early.
 GAMMA601_LIMITS = {
     "min_freq": HARD_MIN_FREQ,
