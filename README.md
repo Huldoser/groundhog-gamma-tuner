@@ -25,6 +25,7 @@ This is an unofficial tool. It is not affiliated with Hurllz or the Bitaxe proje
    If AxeOS does trip, the tuner notices the lower clocks, puts them back on the saved minimum once the chip is cool, and climbs again from there. If AxeOS leaves the chip off in overheat mode, the tuner writes the minimum clocks, clears the flag, and restarts the miner once. That happens after a trip from under 1100 mV: AxeOS saves a voltage under 1000 mV, which the regulator refuses.
    A heat retreat also drops one voltage step while errors are at most half the budget, so voltage raised for a higher clock does not keep heating a lower one. At the frequency floor, voltage only drops for heat while errors still fit the budget, and never for errors.
 4. Raises voltage only when the ASIC error percentage is above the budget, then raises frequency while errors stay inside that budget.
+   A cool chip climbs up to 4 frequency steps (20 MHz) per settle. The jump is sized so that even if power and heat rose in full proportion to frequency, the chip and regulator would still be a tolerance band under their caps and power would stay under its cap. Within two tolerance bands of a cap, or with errors over half the budget, it climbs one step. A jump that loses hashrate steps back without raising voltage. The next climbs up to that clock go one step at a time. Set `"max_climb_steps": 1` in `config.json` to always climb one step.
 5. Trims voltage down at the ceiling, then holds. The last good setpoint is saved so the next start does not begin from stock. The fan stays at full speed for the whole session, so a warmer room is what moves the clocks.
    A hold under a hashrate or silicon wall climbs again once the chip is 3°C cooler than when it hit that wall, or after 6 hours, as long as errors are at most half the budget.
 6. Restarts a miner once when its settled errors stay far over the budget (10%, or 5× a larger budget). That is not a silicon wall, and AxeOS can leave the ASIC like that after an overheat recovery. If a soft restart does not clear it, unplug the miner for 30 seconds.
@@ -50,6 +51,20 @@ AxeOS will still emergency-stop at 75°C on the ASIC or 105°C on the regulator,
 Frequency can step down to 350 MHz. That is the lowest BM1370 clock in the AxeOS v2.15.1 preset list (the Gamma Duo list; the Gamma list starts at 400). A Min frequency typed under 350 is saved as 350. Core voltage stays at or above 1000 mV, the lowest BM1370 voltage preset. The tuner lowers voltage only after frequency is already at its minimum, so a weak chip is settled with a lower clock, not a lower voltage. A saved miner keeps its Min frequency until that field is changed. Miners already saved at 400 MHz stay there.
 
 Those targets match this cooling and this power supply. Another board, a stock cooler, or a smaller supply needs its own limits.
+
+## History and weather
+
+The **History** tab next to the status pill shows how each miner ran and what the weather outside was at the time. The miners sit in an entrance room with the windows open, so the outdoor temperature drives the air they breathe.
+
+- While the window is open, every miner is saved every 10 minutes in `history.db` next to `config.json`. Each sample has the clock, the 10-minute hashrate less the error share, the temperatures, the power, and the weather outside. A sample counts as settled when its setpoint and the miner's uptime are both at least 10 minutes old. The results use only settled samples.
+- The filters pick one miner or the whole fleet, a period (24 hours to everything, or **Since reset**), and a measure: good hashrate, efficiency (J/TH, lower is better), or clock.
+- **Over time** has one line per miner, with the outdoor temperature on its own strip under it. **When it runs best** averages each hour of the day against each 3 °C band of outdoor temperature. **Best combinations** ranks outdoor temperature, time of day, and sky by the chosen measure. The tiles show the best result and its conditions, the typical (median) result, and how much each 1 °C warmer outside costs.
+- Weather comes from [Open-Meteo](https://open-meteo.com/) every 15 minutes. It is free for personal use and needs no key; the data is under CC BY 4.0. A sample saved while the weather could not be read is filled in later from Open-Meteo's hourly history, up to 92 days back.
+- **Settings > Weather Location** sets the place. **Use This Device's Location** asks Windows location services for the tablet's position. That needs Location on under Settings > Privacy & security > Location, with **Let desktop apps access your location** on. The place name then comes from one [Nominatim](https://nominatim.org/) lookup. You can also search for a city, for example `Moose Jaw, Saskatchewan`. With no place saved, the app tries the device once when it starts.
+
+### Fresh start
+
+After a repaste, a new heatsink, or any change that makes a miner run differently, double-click it (or right-click and choose **Reset to Baseline**). That writes the stock 525 MHz / 1150 mV and forgets the miner's saved setpoint and wall, so the next Start Autotuner tunes it from scratch. **Settings > Reset All to Baseline** does the same for every miner. Both stop at a confirmation first. A reset is also marked in the history, so **Since reset** shows only what the miner did after it.
 
 ## Requirements
 

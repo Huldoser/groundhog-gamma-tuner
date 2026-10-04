@@ -16,6 +16,8 @@ Miner traffic is these three calls:
 
 Two other HTTP reads stay as they are, and they are not miner endpoints: `DIFFICULTY_URL` for mempool difficulty, and `FIRMWARE_RELEASES_URL` for the official stable-tag notice. Both live in `dashboard.py`.
 
+Weather reads live in `weather.py` and are not miner endpoints either: Open-Meteo forecast (current every 15 minutes, hourly for backfill), Open-Meteo geocoding for a typed place, and one Nominatim reverse lookup with the app's `User-Agent` after a device location. The device location itself comes from Windows `GeoCoordinateWatcher` through PowerShell, with no extra package.
+
 ```python
 # BAD — extra endpoint
 requests.get(f"http://{ip}/api/system/asic")

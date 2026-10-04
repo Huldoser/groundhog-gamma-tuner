@@ -10,14 +10,19 @@ import os
 import platform
 import re
 import socket
+import sqlite3
 import subprocess
+import sys
 import threading
+import time
 from collections import deque
 from datetime import datetime
 from xml.sax.saxutils import escape as xml_escape
 
 import requests
 
+import history
+import weather
 from autotune import (
     HASHRATE_1M_SETTLE_SECONDS,
     STARTUP_STAGGER_SECONDS,
@@ -896,6 +901,12 @@ BASELINE_PROMPT = (
     "and forget the saved setpoint?\n\n"
     "The next Start Autotuner will climb or step down from there."
 )
+# {miner} is replaced on the page with the selected miner's name and address.
+MINER_BASELINE_PROMPT = (
+    f"Set {{miner}} to the Gamma 601 stock clocks ({STOCK_FREQ} MHz / {STOCK_VOLT} mV) "
+    "and forget its saved setpoint?\n\n"
+    "The next Start Autotuner tunes it fresh, as after a repaste or a new heatsink."
+)
 
 
 def _as_bool(value):
@@ -1205,6 +1216,10 @@ class TunerDashboard:
         self._window = None
         self._fullscreen = False
         self._background_started = False
+        self._history = history.HistoryRecorder()
+        self._weather_now = None
+        self._weather_checked = 0.0
+        self._location_detect_tried = False
 
     def run(self):
         """Open the local dashboard window and block until it closes."""
@@ -1335,8 +1350,12 @@ class TunerDashboard:
                 "log": [dict(line) for line in self._log if line["id"] > since],
                 "scan": None if self._scan is None else dict(self._scan),
                 "controls": self._controls_locked(),
-                "prompts": {"baseline": BASELINE_PROMPT},
+                "prompts": {
+                    "baseline": BASELINE_PROMPT,
+                    "miner_baseline": MINER_BASELINE_PROMPT,
+                },
                 "network": self._network_locked(),
+                "weather": self._weather_payload_locked(),
                 "fleet": {
                     "online": summary["online"],
                     "offline": summary["offline"],
@@ -1392,8 +1411,130 @@ class TunerDashboard:
                 self._refresh_firmware_if_due()
             except Exception:
                 pass
+            try:
+                self._refresh_weather_if_due()
+            except Exception:
+                pass
             if self._closed.wait(NETWORK_REFRESH_SECONDS):
                 return
+
+    def _weather_payload_locked(self):
+        """Outdoor conditions for the status bar and the History screen."""
+        current = self._weather_now
+        if not current:
+            return None
+        return {
+            "temp": current.get("outdoor_temp"),
+            "apparent": current.get("apparent_temp"),
+            "humidity": current.get("humidity"),
+            "wind": current.get("wind_speed"),
+            "sky": weather.sky_group(current.get("weather_code")),
+            "label": weather.sky_label(current.get("weather_code")),
+            "is_day": current.get("is_day"),
+            "place": current.get("place") or "",
+            "fetched_at": current.get("fetched_at"),
+        }
+
+    def _store_location(self, place):
+        def mutate(config):
+            config["location"] = place
+
+        return modify_config(mutate) not in (None, False)
+
+    def _auto_detect_location(self):
+        """Find this computer's position once per run when no place is saved."""
+        with self._lock:
+            if self._location_detect_tried:
+                return None
+            self._location_detect_tried = True
+        place, error = weather.detect_device_location()
+        if place is None:
+            self.log_message(
+                f"No weather location yet. {error} "
+                "Pick one in Settings > Weather Location.",
+                "warning",
+            )
+            return None
+        if not self._store_location(place):
+            return None
+        self.log_message(
+            f"Weather location set to {place['name']} from this device.", "success"
+        )
+        return place
+
+    def _refresh_weather_if_due(self, now=None, force=False):
+        """Read outdoor weather every 15 minutes and fill gaps in the history."""
+        now = time.time() if now is None else now
+        with self._lock:
+            if (
+                not force
+                and now - self._weather_checked < weather.WEATHER_REFRESH_SECONDS
+            ):
+                return
+            self._weather_checked = now
+        place = weather.normalize_location(load_config().get("location"))
+        if place is None:
+            place = self._auto_detect_location()
+        if place is None:
+            return
+        current = weather.read_current_weather(place["latitude"], place["longitude"])
+        if current is None:
+            # Try again in two minutes instead of a full refresh.
+            with self._lock:
+                self._weather_checked = now - weather.WEATHER_REFRESH_SECONDS + 120
+            return
+        current["fetched_at"] = now
+        current["place"] = place["name"]
+        with self._lock:
+            self._weather_now = current
+        self._backfill_weather(place, now)
+
+    def _backfill_weather(self, place, now):
+        """Give saved samples with no outdoor reading the hourly weather for their time."""
+        since = now - weather.MAX_PAST_DAYS * 86400
+        try:
+            oldest = history.oldest_missing_weather(since)
+        except sqlite3.Error:
+            return
+        if oldest is None:
+            return
+        days = int((now - oldest) // 86400) + 1
+        hours = weather.read_hourly_weather(place["latitude"], place["longitude"], days)
+        try:
+            filled = history.fill_missing_weather(hours)
+        except sqlite3.Error:
+            return
+        if filled:
+            self.log_message(
+                f"Added outdoor weather to {filled} history sample(s).", "info"
+            )
+
+    def _record_history(self, results):
+        """Hand this round of readings to the ten-minute history."""
+        with self._lock:
+            names = {row["ip"]: row.get("name") or row["ip"] for row in self._rows}
+            current = dict(self._weather_now) if self._weather_now else None
+        readings = [
+            (ip, names.get(ip, ip), info, get_miner_status(ip).get("phase") or "")
+            for ip, info in results
+            if ip in names
+        ]
+        try:
+            self._history.observe(readings, current)
+        except sqlite3.Error as exc:
+            self.log_message(f"History sample was not saved: {exc}", "warning")
+
+    def _note_fresh_start(self, ips):
+        """Mark a baseline reset in the history so the screen can start there."""
+        for ip in ips:
+            self._history.forget(ip)
+            try:
+                history.record_event(ip, "reset")
+            except sqlite3.Error as exc:
+                self.log_message(
+                    f"The reset of {ip} was not marked in the history: {exc}",
+                    "warning",
+                )
 
     def start_autotuner(self):
         """Start one tuner thread per enabled miner that has the required limits."""
@@ -1597,6 +1738,9 @@ class TunerDashboard:
             try:
                 failed = reset_miners_to_baseline(miners, self.log_message)
             finally:
+                self._note_fresh_start(
+                    [miner.get("ip") for miner in miners if miner.get("ip")]
+                )
                 with self._lock:
                     self._baseline_reset_running = False
                 if failed:
@@ -1614,7 +1758,181 @@ class TunerDashboard:
                     )
 
         threading.Thread(target=work, daemon=True).start()
-        return {"ok": True}
+        return {
+            "ok": True,
+            "notice": _notice(
+                "info",
+                "Baseline Reset Started",
+                f"Setting {len(miners)} miner(s) to {STOCK_FREQ} MHz / {STOCK_VOLT} mV "
+                "and forgetting their saved setpoints. The log shows when it finishes.",
+            ),
+        }
+
+    def reset_miner_baseline(self, ip):
+        """Write factory clocks to one miner and forget its learned setpoint.
+
+        The page confirms before it calls this.
+        """
+        ip = str(ip or "").strip()
+        if not ip:
+            return _fail("Please select a miner first.", "No Selection", "warning")
+        miner = next((row for row in get_miners() if row.get("ip") == ip), None)
+        if miner is None:
+            return _fail(f"{ip} is not a saved miner.", "Miner Not Found", "warning")
+        with self._lock:
+            self._reap_threads_locked()
+            if self._baseline_reset_running:
+                blocked = "baseline"
+            elif self._restart_all_running:
+                blocked = "restart"
+            elif self._start_pending or any(
+                getattr(thread, "miner_ip", None) == ip and thread.is_alive()
+                for thread in self.threads
+            ):
+                blocked = "tuning"
+            else:
+                blocked = None
+                self._baseline_reset_running = True
+        if blocked == "baseline":
+            self.log_message(
+                "A baseline reset is already in progress.",
+                "warning",
+            )
+            return _fail(
+                "A baseline reset is already in progress.",
+                "Reset in Progress",
+                "warning",
+            )
+        if blocked == "restart":
+            self.log_message(
+                "Wait for the miner restart to finish before resetting this miner.",
+                "warning",
+            )
+            return _fail(
+                "Wait for the miner restart to finish before resetting this miner.",
+                "Restart in Progress",
+                "warning",
+            )
+        if blocked == "tuning":
+            self.log_message(
+                f"Stop the autotuner before resetting {ip} to baseline.", "warning"
+            )
+            return _fail(
+                "Stop the autotuner before resetting this miner to baseline.",
+                "Autotuner Running",
+                "warning",
+            )
+        self.log_message(
+            f"Resetting {ip} to {STOCK_FREQ} MHz / {STOCK_VOLT} mV.", "info"
+        )
+        try:
+            failed = reset_miners_to_baseline([miner], self.log_message)
+        finally:
+            self._note_fresh_start([ip])
+            with self._lock:
+                self._baseline_reset_running = False
+        name = miner.get("nickname") or ip
+        if failed:
+            message = (
+                f"{name} did not accept {STOCK_FREQ} MHz / {STOCK_VOLT} mV. "
+                "Its saved setpoint was still cleared."
+            )
+            self.log_message(message, "error")
+            return _fail(message, "Reset Failed")
+        message = (
+            f"{name} is at {STOCK_FREQ} MHz / {STOCK_VOLT} mV with no saved setpoint. "
+            "The next Start Autotuner tunes it fresh."
+        )
+        self.log_message(message, "success")
+        return {"ok": True, "message": message}
+
+    def get_location(self):
+        """The saved weather location and the latest outdoor reading."""
+        with self._lock:
+            current = self._weather_payload_locked()
+        return {
+            "ok": True,
+            "location": weather.normalize_location(load_config().get("location")),
+            "weather": current,
+            "device_supported": sys.platform == "win32",
+        }
+
+    def search_location(self, query):
+        """Places matching a typed city name."""
+        text = str(query or "").strip()
+        try:
+            places = weather.search_places(text)
+        except (ValueError, RuntimeError) as exc:
+            return _fail(str(exc), "Weather Location", "warning")
+        if not places:
+            return _fail(
+                f"No place called {text} was found. Try the nearest city.",
+                "Weather Location",
+                "warning",
+            )
+        return {"ok": True, "places": places}
+
+    def detect_location(self):
+        """Save this computer's position from Windows location services."""
+        place, error = weather.detect_device_location()
+        if place is None:
+            return _fail(error, "Device Location", "warning")
+        return self.save_location(place)
+
+    def save_location(self, place):
+        """Save the place the outdoor weather is read for, then read it now."""
+        place = weather.normalize_location(place)
+        if place is None:
+            return _fail("Pick a place from the list.", "Weather Location", "warning")
+        if not self._store_location(place):
+            return _fail(CONFIG_CORRUPT_MESSAGE, "Config file damaged", "error")
+        self.log_message(f"Weather location set to {place['name']}.", "success")
+        threading.Thread(
+            target=self._refresh_weather_if_due, kwargs={"force": True}, daemon=True
+        ).start()
+        return {"ok": True, "location": place}
+
+    def get_history(self, filters=None):
+        """Saved samples, summarized for the History screen."""
+        filters = filters if isinstance(filters, dict) else {}
+        metric = filters.get("metric")
+        if metric not in history.METRICS:
+            metric = "good_hashrate"
+        period = filters.get("period")
+        if period not in history.PERIODS:
+            period = "7d"
+        miners = [
+            {
+                "ip": miner["ip"],
+                "name": miner.get("nickname") or miner["ip"],
+                "slot": index % 8,
+            }
+            for index, miner in enumerate(get_miners())
+            if miner.get("ip")
+        ]
+        ip = str(filters.get("ip") or "").strip()
+        if ip not in {miner["ip"] for miner in miners}:
+            ip = ""
+        try:
+            samples = history.period_samples(period, time.time(), ip or None)
+            summary = history.summarize(samples, metric, ip or None)
+            resets = history.last_events("reset")
+        except sqlite3.Error as exc:
+            return _fail(f"The history could not be read: {exc}", "History")
+        with self._lock:
+            current = self._weather_payload_locked()
+        return {
+            "ok": True,
+            "filters": {"ip": ip, "metric": metric, "period": period},
+            "miners": miners,
+            "location": weather.normalize_location(load_config().get("location")),
+            "weather": current,
+            "attribution": weather.ATTRIBUTION,
+            "resets": resets,
+            "sample_minutes": history.SAMPLE_SECONDS // 60,
+            "band_c": history.TEMP_BAND_C,
+            **summary,
+        }
 
     def restart_all_miners(self):
         """Restart every saved miner. The page confirms before it calls this."""
@@ -1684,12 +2002,7 @@ class TunerDashboard:
                     self.log_message("Restart of all miners finished.", "success")
 
         threading.Thread(target=work, daemon=True).start()
-        return {
-            "ok": True,
-            "notice": _notice(
-                "info", "Restart Triggered", "Restarting every saved miner."
-            ),
-        }
+        return {"ok": True}
 
     def start_scan(self, start_ip, end_ip):
         """Scan an inclusive IPv4 range. Only a Gamma 601 is saved."""
@@ -2080,6 +2393,7 @@ class TunerDashboard:
             self._updated = format_local_time()
         self._deliver_alerts(messages)
         self._clear_cooled_overheat(results)
+        self._record_history(results)
 
     def _apply_one_locked(self, row, ip, miner_data):
         if isinstance(miner_data, str) or not isinstance(miner_data, dict):
@@ -2529,6 +2843,24 @@ class DashboardApi:
 
     def reset_baseline(self):
         return self._dashboard.reset_baseline()
+
+    def reset_miner_baseline(self, ip):
+        return self._dashboard.reset_miner_baseline(ip)
+
+    def get_history(self, filters=None):
+        return self._dashboard.get_history(filters)
+
+    def get_location(self):
+        return self._dashboard.get_location()
+
+    def search_location(self, query):
+        return self._dashboard.search_location(query)
+
+    def detect_location(self):
+        return self._dashboard.detect_location()
+
+    def save_location(self, place):
+        return self._dashboard.save_location(place)
 
     def start_scan(self, start_ip, end_ip):
         return self._dashboard.start_scan(start_ip, end_ip)

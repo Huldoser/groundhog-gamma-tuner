@@ -1,6 +1,6 @@
 ---
 description: pywebview window bridge and the plain local page
-globs: dashboard.py,web/**
+globs: dashboard.py,history.py,weather.py,web/**
 alwaysApply: false
 ---
 
@@ -10,7 +10,9 @@ The window loads an absolute path to `web/index.html` with `js_api=DashboardApi`
 
 A new page action is a public method on `DashboardApi` plus a call through `api()` in `web/app.js`. Method names stay public; pywebview skips `_` names. The page polls `get_snapshot`.
 
-The page is `web/index.html`, `web/app.css`, and `web/app.js`. Keep it plain: no npm, framework, bundler, or extra listener.
+The page is `web/index.html`, `web/app.css`, `web/app.js`, and `web/history.js` (the History screen and the weather location dialog). Keep it plain: no npm, framework, bundler, chart library, or extra listener. Charts are inline SVG drawn in `history.js`, with the categorical `--series-*` colors in fixed order by miner.
+
+The History screen reads `get_history`. The display loop hands each round of readings to `history.HistoryRecorder`, which writes `history.db` next to `config.json` every 10 minutes. Tests that touch it run under a temporary config.
 
 ```python
 # BAD

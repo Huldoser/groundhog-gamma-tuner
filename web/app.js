@@ -11,6 +11,7 @@ const GLOBAL_FIELDS = [
   "flatline_hashrate_repeat_count",
 ];
 const FALLBACK_PROMPT = "Set every miner to the Gamma 601 stock clocks (525 MHz / 1150 mV) and forget the saved setpoint?\n\nThe next Start Autotuner will climb or step down from there.";
+const FALLBACK_MINER_PROMPT = "Set {miner} to the Gamma 601 stock clocks (525 MHz / 1150 mV) and forget its saved setpoint?\n\nThe next Start Autotuner tunes it fresh, as after a repaste or a new heatsink.";
 
 const $ = (id) => document.getElementById(id);
 
@@ -28,7 +29,7 @@ let tunerClipboard = null;
 let lastSnapshot = {
   miners: [],
   updated: "--:--:--",
-  prompts: { baseline: FALLBACK_PROMPT },
+  prompts: { baseline: FALLBACK_PROMPT, miner_baseline: FALLBACK_MINER_PROMPT },
   controls: {
     status: "idle",
     status_label: "Idle",
@@ -535,6 +536,7 @@ function applySnapshot(snapshot) {
   syncScan(snapshot.scan);
   renderNetwork(snapshot.network);
   renderFleet(snapshot.fleet, snapshot.miners || []);
+  if (typeof renderWeatherChip === "function") renderWeatherChip(snapshot.weather);
 }
 
 function windowFocused() {
@@ -729,6 +731,24 @@ async function restartSelected() {
   });
   if (!yes) return;
   const result = await bridge.restart_miner(miner.ip);
+  if (result && result.notice) showNotice(result.notice);
+  poll();
+}
+
+async function resetSelected() {
+  hideMenu();
+  const miner = requireSelection("Please select a miner first.");
+  const bridge = api();
+  if (!miner || !bridge) return;
+  const template = (lastSnapshot.prompts && lastSnapshot.prompts.miner_baseline) || FALLBACK_MINER_PROMPT;
+  const yes = await confirmAction({
+    title: "Reset Miner to Baseline",
+    message: template.replace("{miner}", `${miner.name} (${miner.ip})`),
+    confirmLabel: "Reset",
+    danger: true,
+  });
+  if (!yes) return;
+  const result = await bridge.reset_miner_baseline(miner.ip);
   if (result && result.notice) showNotice(result.notice);
   poll();
 }
@@ -956,6 +976,7 @@ function bind() {
     if (!action) return;
     hideSettingsMenu();
     if (action === "global") openGlobal();
+    if (action === "location") openLocation();
     if (action === "tuner") openTuner();
     if (action === "restart-all") restartAll();
     if (action === "reset") onReset();
@@ -965,6 +986,7 @@ function bind() {
     const action = event.target.getAttribute("data-menu");
     if (action === "edit") openEdit();
     if (action === "restart") restartSelected();
+    if (action === "reset-miner") resetSelected();
     if (action === "remove") removeSelected();
   });
 
@@ -980,6 +1002,13 @@ function bind() {
     if (event.target.closest(".modal:not([hidden])")) return;
     clearSelection();
   }, true);
+  $("miner-body").addEventListener("dblclick", (event) => {
+    const row = event.target.closest("tr");
+    if (!row || !row.dataset.ip) return;
+    selectedIp = row.dataset.ip;
+    renderTable(lastSnapshot.miners || []);
+    resetSelected();
+  });
   $("miner-body").addEventListener("contextmenu", (event) => {
     const row = event.target.closest("tr");
     if (!row) return;
@@ -1008,7 +1037,7 @@ function bind() {
         settleConfirm(false);
         return;
       }
-      const open = ["tuner", "global", "edit", "scan"].find((id) => !$(id).hidden);
+      const open = ["tuner", "global", "edit", "scan", "location"].find((id) => !$(id).hidden);
       if (open === "scan") {
         closeScan();
         return;

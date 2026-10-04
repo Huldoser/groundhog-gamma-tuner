@@ -12,6 +12,9 @@ venv/
 # Live miner list and learned setpoints. The app creates config.json if it is missing.
 config.json
 .config-*.json
+# Ten-minute history for the History screen. The app creates it.
+history.db
+history.db-journal
 
 # Local logs and secrets
 *.log

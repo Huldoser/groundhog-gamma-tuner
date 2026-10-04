@@ -16,6 +16,10 @@
           </h1>
         </div>
         <span id="status-pill" class="pill idle" aria-live="polite">Idle</span>
+        <nav class="view-tabs" role="tablist" aria-label="Screens">
+          <button type="button" role="tab" id="tab-miners" class="view-tab" data-view="miners" aria-selected="true" aria-controls="miners-view">Miners</button>
+          <button type="button" role="tab" id="tab-history" class="view-tab" data-view="history" aria-selected="false" aria-controls="history-view">History</button>
+        </nav>
       </div>
       <div class="commands">
         <button type="button" id="run" class="accent" data-action="start" aria-busy="false">Start Autotuner</button>
@@ -47,7 +51,7 @@
       </div>
     </header>
 
-    <main class="workspace">
+    <main id="miners-view" class="workspace" role="tabpanel" aria-labelledby="tab-miners">
       <div id="summary" class="summary" hidden>
         <span id="fleet"></span>
       </div>
@@ -86,9 +90,99 @@
         <div id="log" class="log" aria-live="polite"></div>
       </section>
     </main>
+
+    <main id="history-view" class="workspace history-view" role="tabpanel" aria-labelledby="tab-history" hidden>
+      <div class="history-bar">
+        <div class="filters">
+          <label class="filter">Miner
+            <select id="history-miner"><option value="">All miners</option></select>
+          </label>
+          <div id="history-period" class="segmented" role="radiogroup" aria-label="Period">
+            <button type="button" role="radio" data-period="24h">24 h</button>
+            <button type="button" role="radio" data-period="7d">7 days</button>
+            <button type="button" role="radio" data-period="30d">30 days</button>
+            <button type="button" role="radio" data-period="90d">90 days</button>
+            <button type="button" role="radio" data-period="all">All</button>
+            <button type="button" role="radio" data-period="reset" title="Since the last Reset to Baseline">Since reset</button>
+          </div>
+          <div id="history-metric" class="segmented" role="radiogroup" aria-label="Measure">
+            <button type="button" role="radio" data-metric="good_hashrate" title="Hashrate less the error share">Good hashrate</button>
+            <button type="button" role="radio" data-metric="efficiency" title="Watts per terahash. Lower is better">Efficiency</button>
+            <button type="button" role="radio" data-metric="frequency">Clock</button>
+          </div>
+        </div>
+        <button type="button" id="history-location" class="location-chip" title="Change the weather location">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21s-6.5-5.6-6.5-11a6.5 6.5 0 0 1 13 0c0 5.4-6.5 11-6.5 11z"></path><circle cx="12" cy="10" r="2.3"></circle></svg>
+          <span id="history-place">Set weather location</span>
+          <strong id="history-now" class="chip-now"></strong>
+        </button>
+      </div>
+
+      <div id="history-body" class="history-body">
+        <div id="history-notice" class="history-notice" hidden></div>
+        <div id="history-kpis" class="kpi-row"></div>
+
+        <section class="card chart-card">
+          <div class="card-head">
+            <div>
+              <h2 id="trend-title">Over time</h2>
+              <p id="trend-sub" class="card-sub"></p>
+            </div>
+            <div id="trend-legend" class="legend"></div>
+          </div>
+          <div id="trend-chart" class="chart chart-tall"></div>
+          <div class="card-head card-head-sub">
+            <h3>Outdoor temperature</h3>
+          </div>
+          <div id="outdoor-chart" class="chart chart-short"></div>
+        </section>
+
+        <div class="history-grid">
+          <section class="card chart-card">
+            <div class="card-head">
+              <div>
+                <h2>When it runs best</h2>
+                <p id="heat-sub" class="card-sub"></p>
+              </div>
+              <div id="heat-legend" class="heat-legend"></div>
+            </div>
+            <div id="heatmap" class="chart"></div>
+          </section>
+          <section class="card chart-card">
+            <div class="card-head">
+              <div>
+                <h2>Best combinations</h2>
+                <p id="combo-sub" class="card-sub"></p>
+              </div>
+            </div>
+            <div class="combo-scroll">
+              <table class="combo-table">
+                <thead>
+                  <tr>
+                    <th class="left">Outdoor</th>
+                    <th class="left">Time of day</th>
+                    <th class="left">Sky</th>
+                    <th id="combo-metric" class="left">Average</th>
+                    <th title="Average ASIC temperature">ASIC</th>
+                    <th title="Average clock and core voltage">Clock</th>
+                    <th title="Settled hours behind the average">Hours</th>
+                  </tr>
+                </thead>
+                <tbody id="combo-body"></tbody>
+              </table>
+              <p id="combo-empty" class="chart-empty" hidden></p>
+            </div>
+          </section>
+        </div>
+        <p id="history-attribution" class="attribution"></p>
+      </div>
+      <div id="chart-tip" class="chart-tip" role="status" hidden></div>
+    </main>
+
     <footer class="statusbar">
       <span id="updated" class="updated">Updated --:--:--</span>
       <div class="network" id="network">
+        <button type="button" id="weather-chip" class="weather-chip" title="Outdoor weather. Click to change the location" hidden></button>
         <span class="network-diff" title="Difficulty a share must beat to find a block">
           Network <strong id="network-diff">--</strong>
         </span>
@@ -101,6 +195,7 @@
   <div id="settings-menu" class="menu" hidden>
     <button type="button" data-settings="tuner">AutoTuner Settings</button>
     <button type="button" data-settings="global">Global Settings</button>
+    <button type="button" data-settings="location">Weather Location</button>
     <div class="menu-separator" role="separator"></div>
     <button type="button" id="restart-all" data-settings="restart-all">Restart All Miners</button>
     <button type="button" id="reset" class="menu-danger" data-settings="reset">Reset All to Baseline</button>
@@ -109,6 +204,7 @@
   <div id="row-menu" class="menu" hidden>
     <button type="button" data-menu="edit">Edit Miner Settings</button>
     <button type="button" data-menu="restart">Restart Miner</button>
+    <button type="button" data-menu="reset-miner" class="menu-danger" title="Double-click a miner to do the same">Reset to Baseline</button>
     <button type="button" data-menu="remove" class="menu-danger">Remove Miner</button>
   </div>
 
@@ -220,6 +316,31 @@
     </form>
   </div>
 
+  <div id="location" class="modal" hidden>
+    <div class="backdrop" data-close="location"></div>
+    <form id="location-form" class="dialog dialog-wide">
+      <h2>Weather Location</h2>
+      <p class="hint">The History screen compares each miner with the weather outside. It is read for this place every 15 minutes from Open-Meteo.</p>
+      <div class="location-current">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21s-6.5-5.6-6.5-11a6.5 6.5 0 0 1 13 0c0 5.4-6.5 11-6.5 11z"></path><circle cx="12" cy="10" r="2.3"></circle></svg>
+        <div>
+          <strong id="location-name">Not set</strong>
+          <span id="location-detail" class="location-detail"></span>
+        </div>
+      </div>
+      <button type="button" id="location-detect" class="quiet location-detect">Use This Device's Location</button>
+      <div class="location-search">
+        <input id="location-query" data-autofocus autocomplete="off" spellcheck="false" placeholder="City, e.g. Moose Jaw, Saskatchewan">
+        <button type="submit" id="location-search" class="quiet">Search</button>
+      </div>
+      <div id="location-results" class="location-results" role="listbox" aria-label="Places" hidden></div>
+      <p id="location-error" class="form-error"></p>
+      <div class="dialog-actions">
+        <button type="button" class="accent" data-close="location">Done</button>
+      </div>
+    </form>
+  </div>
+
   <div id="confirm" class="modal front" hidden>
     <div class="backdrop" data-close="confirm"></div>
     <div class="dialog" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title">
@@ -244,5 +365,6 @@
   </div>
 
   <script src="app.js"></script>
+  <script src="history.js"></script>
 </body>
 </html>

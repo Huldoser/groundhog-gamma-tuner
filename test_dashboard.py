@@ -9,6 +9,7 @@ from unittest import mock
 
 import config
 import dashboard
+import history
 from dashboard import (
     ALL_AUTOTUNE_FIELDS,
     LOG_LIMIT,
@@ -1298,8 +1299,66 @@ class SnapshotTests(unittest.TestCase):
             with mock.patch("dashboard.reset_miners_to_baseline", fake_reset):
                 result = app.reset_baseline()
                 self.assertTrue(result["ok"])
+                self.assertEqual(result["notice"]["title"], "Baseline Reset Started")
                 self.assertTrue(called.wait(2))
         self.assertFalse(seen["kwargs"].get("parallel", False))
+
+    def test_reset_miner_baseline_resets_only_that_miner(self):
+        first = config.new_miner_record(
+            "BM1370 601", "10.0.0.8", "Alpha", config.get_default_config()
+        )
+        second = config.new_miner_record(
+            "BM1370 601", "10.0.0.9", "Beta", config.get_default_config()
+        )
+        seen = []
+
+        def fake_reset(miners, log_callback, **kwargs):
+            seen.extend(miner["ip"] for miner in miners)
+            return 0
+
+        with temp_config([first, second]):
+            app = TunerDashboard()
+            with mock.patch("dashboard.reset_miners_to_baseline", fake_reset):
+                result = DashboardApi(app).reset_miner_baseline("10.0.0.9")
+        self.assertTrue(result["ok"])
+        self.assertEqual(seen, ["10.0.0.9"])
+        self.assertIn("Beta", result["message"])
+        self.assertFalse(app._baseline_reset_running)
+
+    def test_reset_miner_baseline_is_blocked_while_that_miner_is_tuning(self):
+        miner = config.new_miner_record(
+            "BM1370 601", "10.0.0.8", "Alpha", config.get_default_config()
+        )
+        reset = mock.Mock(return_value=0)
+        with temp_config([miner]):
+            app = TunerDashboard()
+
+            class _Alive:
+                def is_alive(self):
+                    return True
+
+            thread = _Alive()
+            thread.miner_ip = "10.0.0.8"
+            app.threads = [thread]
+            app.running = True
+            with mock.patch("dashboard.reset_miners_to_baseline", reset):
+                blocked = app.reset_miner_baseline("10.0.0.8")
+                missing = app.reset_miner_baseline("10.0.0.99")
+        self.assertFalse(blocked["ok"])
+        self.assertIn("Stop the autotuner", blocked["message"])
+        self.assertFalse(missing["ok"])
+        reset.assert_not_called()
+
+    def test_reset_miner_baseline_reports_a_rejected_write(self):
+        miner = config.new_miner_record(
+            "BM1370 601", "10.0.0.8", "Alpha", config.get_default_config()
+        )
+        with temp_config([miner]):
+            app = TunerDashboard()
+            with mock.patch("dashboard.reset_miners_to_baseline", return_value=1):
+                result = app.reset_miner_baseline("10.0.0.8")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["notice"]["title"], "Reset Failed")
 
     def test_restart_all_miners_restarts_each_saved_miner(self):
         first = config.new_miner_record(
@@ -1323,7 +1382,7 @@ class SnapshotTests(unittest.TestCase):
             with mock.patch("dashboard.restart_miners", fake_restart):
                 result = DashboardApi(app).restart_all_miners()
                 self.assertTrue(result["ok"])
-                self.assertEqual(result["notice"]["title"], "Restart Triggered")
+                self.assertNotIn("notice", result)
                 self.assertTrue(called.wait(2))
                 blocked = app.restart_all_miners()
                 self.assertFalse(blocked["ok"])
@@ -1674,6 +1733,204 @@ class SnapshotTests(unittest.TestCase):
             self.assertIsNotNone(line)
             self.assertEqual(line["level"], "error")
             self.assertIn("failure", line["text"])
+
+
+MOOSE_JAW = {
+    "name": "Moose Jaw, Saskatchewan, Canada",
+    "latitude": 50.40005,
+    "longitude": -105.53445,
+    "timezone": "America/Regina",
+    "source": "search",
+}
+
+
+def _gamma(ip, name):
+    return config.new_miner_record("BM1370 601", ip, name, config.get_default_config())
+
+
+class HistoryScreenTests(unittest.TestCase):
+    def test_history_reads_samples_beside_the_config(self):
+        with temp_config([_gamma("10.0.0.8", "Alpha"), _gamma("10.0.0.9", "Beta")]):
+            now = int(time.time())
+            history.record_samples(
+                [
+                    {
+                        "ts": now - 600,
+                        "ip": ip,
+                        "good_hashrate": rate,
+                        "hashrate": rate,
+                        "power": 17.0,
+                        "frequency": 550,
+                        "voltage": 1150,
+                        "settled": 1,
+                        "outdoor_temp": 9.0,
+                        "weather_code": 0,
+                    }
+                    for ip, rate in (("10.0.0.8", 1000.0), ("10.0.0.9", 900.0))
+                ]
+            )
+            app = TunerDashboard()
+            result = DashboardApi(app).get_history(
+                {"ip": "unknown", "period": "bogus", "metric": "nope"}
+            )
+            self.assertTrue(result["ok"])
+            self.assertEqual(
+                result["filters"],
+                {"ip": "", "metric": "good_hashrate", "period": "7d"},
+            )
+            self.assertEqual(
+                [miner["name"] for miner in result["miners"]], ["Alpha", "Beta"]
+            )
+            self.assertEqual([miner["slot"] for miner in result["miners"]], [0, 1])
+            self.assertEqual(result["best"]["value"], 1900.0)
+            self.assertEqual(set(result["series"]), {"10.0.0.8", "10.0.0.9"})
+            self.assertIsNone(result["location"])
+            one = app.get_history({"ip": "10.0.0.9", "period": "24h"})
+            self.assertEqual(one["best"]["value"], 900.0)
+            self.assertEqual(set(one["series"]), {"10.0.0.9"})
+
+    def test_baseline_resets_are_marked_as_fresh_starts(self):
+        miners = [_gamma("10.0.0.8", "Alpha"), _gamma("10.0.0.9", "Beta")]
+        with temp_config(miners):
+            app = TunerDashboard()
+            with mock.patch("dashboard.reset_miners_to_baseline", return_value=0):
+                self.assertTrue(app.reset_miner_baseline("10.0.0.9")["ok"])
+                self.assertEqual(set(history.last_events("reset")), {"10.0.0.9"})
+                self.assertTrue(app.reset_baseline()["ok"])
+                for _ in range(40):
+                    if not app._baseline_reset_running:
+                        break
+                    time.sleep(0.05)
+            self.assertEqual(
+                set(history.last_events("reset")), {"10.0.0.8", "10.0.0.9"}
+            )
+
+    def test_each_poll_feeds_the_history_recorder(self):
+        with temp_config([_gamma("10.0.0.8", "Alpha")]):
+            app = TunerDashboard()
+            app.load_rows()
+            clock = {"now": 1_800_000_000.0}
+            app._history = history.HistoryRecorder(clock=lambda: clock["now"])
+            info = {
+                "frequency": 550,
+                "coreVoltage": 1150,
+                "hashRate": 1000,
+                "hashRate_10m": 1000,
+                "errorPercentage": 0,
+                "temp": 60,
+                "vrTemp": 65,
+                "power": 17,
+                "uptimeSeconds": 9000,
+            }
+            app._weather_now = {"outdoor_temp": 7.5, "fetched_at": clock["now"]}
+            app._apply_results([("10.0.0.8", info)])
+            clock["now"] += history.SAMPLE_SECONDS
+            app._weather_now["fetched_at"] = clock["now"]
+            app._apply_results([("10.0.0.8", info)])
+            rows = history.load_samples()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["name"], "Alpha")
+        self.assertEqual(rows[0]["outdoor_temp"], 7.5)
+        self.assertEqual(rows[0]["settled"], 1)
+
+
+class WeatherLocationTests(unittest.TestCase):
+    def test_saving_a_place_stores_it_and_reads_the_weather(self):
+        with temp_config():
+            app = TunerDashboard()
+            with mock.patch.object(app, "_refresh_weather_if_due") as refresh:
+                saved = DashboardApi(app).save_location(dict(MOOSE_JAW))
+                self.assertTrue(saved["ok"])
+                for _ in range(40):
+                    if refresh.called:
+                        break
+                    time.sleep(0.02)
+            self.assertEqual(config.load_config()["location"], MOOSE_JAW)
+            self.assertEqual(app.get_location()["location"], MOOSE_JAW)
+            refresh.assert_called_with(force=True)
+            rejected = app.save_location({"name": "Mars", "latitude": 200})
+            self.assertFalse(rejected["ok"])
+
+    def test_search_failures_come_back_as_notices(self):
+        with temp_config():
+            app = TunerDashboard()
+            with mock.patch("dashboard.weather.search_places", return_value=[]):
+                empty = app.search_location("Atlantis")
+            self.assertFalse(empty["ok"])
+            self.assertIn("Atlantis", empty["message"])
+            with mock.patch(
+                "dashboard.weather.search_places", side_effect=RuntimeError("down")
+            ):
+                failed = app.search_location("Moose Jaw")
+            self.assertEqual(failed["message"], "down")
+            with mock.patch(
+                "dashboard.weather.search_places", return_value=[MOOSE_JAW]
+            ):
+                found = app.search_location("Moose Jaw")
+            self.assertEqual(found["places"], [MOOSE_JAW])
+
+    def test_detected_location_is_saved(self):
+        with temp_config():
+            app = TunerDashboard()
+            place = dict(MOOSE_JAW, source="device")
+            with (
+                mock.patch(
+                    "dashboard.weather.detect_device_location", return_value=(place, "")
+                ),
+                mock.patch.object(app, "_refresh_weather_if_due"),
+            ):
+                result = app.detect_location()
+            self.assertTrue(result["ok"])
+            self.assertEqual(config.load_config()["location"]["source"], "device")
+            with mock.patch(
+                "dashboard.weather.detect_device_location",
+                return_value=(None, "Windows blocked the location."),
+            ):
+                blocked = app.detect_location()
+            self.assertFalse(blocked["ok"])
+            self.assertEqual(blocked["notice"]["title"], "Device Location")
+
+    def test_weather_refresh_uses_the_saved_place_and_backfills(self):
+        with temp_config():
+            config.modify_config(lambda saved: saved.update(location=MOOSE_JAW))
+            history.record_samples([{"ts": 1_799_999_400, "ip": "10.0.0.8"}])
+            app = TunerDashboard()
+            current = {"outdoor_temp": 3.5, "weather_code": 71}
+            hours = [(1_799_998_200, {"outdoor_temp": 2.0})]
+            with (
+                mock.patch(
+                    "dashboard.weather.read_current_weather", return_value=current
+                ) as read_current,
+                mock.patch(
+                    "dashboard.weather.read_hourly_weather", return_value=hours
+                ) as read_hourly,
+                mock.patch("dashboard.weather.detect_device_location") as detect,
+            ):
+                app._refresh_weather_if_due(now=1_800_000_000)
+                app._refresh_weather_if_due(now=1_800_000_060)
+            read_current.assert_called_once_with(50.40005, -105.53445)
+            read_hourly.assert_called_once()
+            detect.assert_not_called()
+            self.assertEqual(history.load_samples()[0]["outdoor_temp"], 2.0)
+            snapshot = app.get_snapshot()
+            self.assertEqual(snapshot["weather"]["temp"], 3.5)
+            self.assertEqual(snapshot["weather"]["sky"], "snow")
+            self.assertEqual(snapshot["weather"]["place"], MOOSE_JAW["name"])
+
+    def test_no_saved_place_tries_the_device_once(self):
+        with temp_config():
+            app = TunerDashboard()
+            with mock.patch(
+                "dashboard.weather.detect_device_location",
+                return_value=(None, "Device location needs Windows."),
+            ) as detect:
+                app._refresh_weather_if_due(now=1_800_000_000)
+                app._refresh_weather_if_due(now=1_800_000_000, force=True)
+            detect.assert_called_once()
+            self.assertIsNone(app.get_snapshot()["weather"])
+            self.assertTrue(
+                any("Weather Location" in line["text"] for line in app._log)
+            )
 
 
 class FullscreenTests(unittest.TestCase):

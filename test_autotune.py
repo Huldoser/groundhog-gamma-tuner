@@ -19,6 +19,7 @@ FAST_CONFIG = {
     "enforce_safe_pairing": False,
     "flatline_detection_enabled": False,
     "flatline_hashrate_repeat_count": 5,
+    "max_climb_steps": 1,
 }
 
 
@@ -1103,6 +1104,59 @@ class DecisionTests(unittest.TestCase):
         self.assertFalse(autotune.frequency_step_paid(before, better, 800, 800))
         self.assertIsNone(autotune.frequency_step_paid(before, None, 800, 805))
         self.assertTrue(autotune.frequency_step_paid(before, better, None, None))
+
+    def test_cool_chip_climbs_several_steps_at_once(self):
+        frequency, voltage, reason = autotune.decide_adjustment(
+            **_limits(max_climb_steps=4)
+        )
+        self.assertEqual((frequency, voltage), (520, 1100))
+        self.assertEqual(reason, "increase frequency")
+
+    def test_climb_takes_one_step_within_two_bands_of_a_cap(self):
+        asic = autotune.decide_adjustment(**_limits(temp=57, max_climb_steps=4))
+        self.assertEqual(asic[:2], (505, 1100))
+        regulator = autotune.decide_adjustment(**_limits(vr_temp=80, max_climb_steps=4))
+        self.assertEqual(regulator[:2], (505, 1100))
+
+    def test_climb_jump_is_sized_by_power_headroom(self):
+        # 24.5 W at 500 MHz is at most 0.245 W per 5 MHz step: two steps fit in 0.5 W.
+        frequency, _voltage, _reason = autotune.decide_adjustment(
+            **_limits(power=24.5, max_climb_steps=4)
+        )
+        self.assertEqual(frequency, 510)
+
+    def test_climb_takes_one_step_when_errors_use_half_the_budget(self):
+        frequency, _voltage, _reason = autotune.decide_adjustment(
+            **_limits(error_percentage=1.5, max_climb_steps=4)
+        )
+        self.assertEqual(frequency, 505)
+
+    def test_climb_jump_stops_short_of_a_blocked_frequency(self):
+        frequency, _voltage, reason = autotune.decide_adjustment(
+            **_limits(blocked_frequency=515, max_climb_steps=4)
+        )
+        self.assertEqual(frequency, 510)
+        self.assertEqual(reason, "increase frequency")
+
+    def test_climb_frequency_steps_needs_every_reading(self):
+        steps = dict(
+            frequency=500,
+            temp=45,
+            vr_temp=40,
+            power=12,
+            max_temp=60,
+            max_vr_temp=85,
+            max_watts=25,
+            temp_tolerance=2,
+            vr_tolerance=3,
+            frequency_step=5,
+        )
+        self.assertEqual(autotune.climb_frequency_steps(**steps), 4)
+        self.assertEqual(autotune.climb_frequency_steps(**steps, max_steps=1), 1)
+        for missing in ("temp", "vr_temp", "power"):
+            self.assertEqual(
+                autotune.climb_frequency_steps(**{**steps, missing: None}), 1
+            )
 
     def test_blocked_frequency_does_not_climb_back(self):
         held = autotune.decide_adjustment(
@@ -2747,6 +2801,88 @@ class SessionTests(unittest.TestCase):
             any(freq == 405 and volt > 1100 for freq, volt in state["calls"])
         )
         self.assertFalse(any(freq > 405 for freq, _volt in state["calls"]))
+
+    def test_cool_miner_climbs_several_steps_per_settle(self):
+        state = {"frequency": 400, "voltage": 1100, "calls": []}
+        stop_event = threading.Event()
+        runtime = dict(FAST_CONFIG, max_climb_steps=4)
+
+        def set_settings(ip, volt, freq):
+            state["calls"].append((int(freq), int(volt)))
+            state["frequency"] = int(freq)
+            state["voltage"] = int(volt)
+            if int(freq) > 400:
+                stop_event.set()
+            return (
+                f"{ip} -> Applied settings: Voltage = {volt}mV, Frequency = {freq}MHz"
+            )
+
+        def get_info(ip):
+            return _info(
+                frequency=state["frequency"],
+                voltage=state["voltage"],
+                hashRate=820,
+                hashRate_1m=820,
+                expectedHashrate=816,
+                errorPercentage=0.2,
+                actualFrequency=state["frequency"],
+                temp=40,
+                vrTemp=30,
+            )
+
+        with patched_io(get_info, set_settings, runtime_config=runtime):
+            thread = _start_miner(
+                "miner", stop_event, lambda *args: None, start_freq=400
+            )
+            thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(state["calls"][-1], (420, 1100))
+
+    def test_failed_jump_steps_back_and_climbs_one_step_without_a_wall(self):
+        state = {"frequency": 400, "voltage": 1100, "calls": []}
+        stop_event = threading.Event()
+        logs = []
+        runtime = dict(FAST_CONFIG, max_climb_steps=4)
+
+        def set_settings(ip, volt, freq):
+            state["calls"].append((int(freq), int(volt)))
+            state["frequency"] = int(freq)
+            state["voltage"] = int(volt)
+            if (int(freq), int(volt)) == (405, 1100):
+                stop_event.set()
+            return (
+                f"{ip} -> Applied settings: Voltage = {volt}mV, Frequency = {freq}MHz"
+            )
+
+        def get_info(ip):
+            # Over 410 MHz this chip loses good hashrate at 1100 mV.
+            rate = 820 if state["frequency"] <= 410 else 700
+            return _info(
+                frequency=state["frequency"],
+                voltage=state["voltage"],
+                hashRate=rate,
+                hashRate_1m=rate,
+                expectedHashrate=state["frequency"] * 2.04,
+                errorPercentage=0.2,
+                actualFrequency=state["frequency"],
+                temp=40,
+                vrTemp=30,
+            )
+
+        with (
+            patched_io(get_info, set_settings, runtime_config=runtime),
+            mock.patch.object(autotune, "HASHRATE_1M_SETTLE_SECONDS", 0),
+        ):
+            thread = _start_miner(
+                "miner",
+                stop_event,
+                lambda message, *args: logs.append(message),
+                start_freq=400,
+            )
+            thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(state["calls"][-3:], [(420, 1100), (400, 1100), (405, 1100)])
+        self.assertTrue(any("one step at a time" in line for line in logs))
 
     def test_under_cap_climbs_then_holds_until_the_retreat_band_clears(self):
         state = {"temp": 67, "frequency": 500, "voltage": 1100, "calls": []}

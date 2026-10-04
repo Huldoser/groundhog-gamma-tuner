@@ -362,6 +362,55 @@ def _thermal_frequency_steps(overshoot, tolerance):
     return max(1, math.ceil(overshoot / band))
 
 
+# A climb far under every cap takes up to this many frequency steps at once.
+MAX_CLIMB_FREQUENCY_STEPS = 4
+
+
+def climb_frequency_steps(
+    frequency,
+    temp,
+    vr_temp,
+    power,
+    max_temp,
+    max_vr_temp,
+    max_watts,
+    temp_tolerance,
+    vr_tolerance,
+    frequency_step,
+    max_steps=MAX_CLIMB_FREQUENCY_STEPS,
+):
+    """How many frequency steps one climb may take on this much headroom.
+
+    At a fixed voltage, power grows at most in proportion to frequency, so one
+    step adds at most `power * step / frequency` W, and at most
+    `temp * step / frequency` °C over an ambient above 0°C. The regulator's
+    conduction loss grows with the square of current, so its rise counts twice.
+    The jump still has to leave both sensors a tolerance band under their caps
+    and keep power under its cap. A missing reading, or a sensor within two
+    bands of its cap, takes one step. A band is at least 1°C.
+    """
+    max_steps = max(int(max_steps or 1), 1)
+    clock = _as_float(frequency)
+    watts = _as_float(power)
+    if max_steps == 1 or clock is None or clock <= 0 or watts is None or watts <= 0:
+        return 1
+    share = max(int(frequency_step), 1) / clock
+    allowed = max_steps
+    for value, cap, tolerance, weight in (
+        (_usable_temp(temp), max_temp, temp_tolerance, 1),
+        (_usable_temp(vr_temp), max_vr_temp, vr_tolerance, 2),
+    ):
+        if value is None:
+            return 1
+        band = max(float(tolerance or 0), 1.0)
+        room = cap - band - value
+        if room < band:
+            return 1
+        allowed = min(allowed, int(room // (weight * value * share)))
+    allowed = min(allowed, int((max_watts - watts) // (watts * share)))
+    return _clamp(allowed, 1, max_steps)
+
+
 def _step_down(
     frequency,
     voltage,
@@ -652,7 +701,11 @@ def _proposal_jumps_above_report(
     frequency_step,
     voltage_step,
 ):
-    """True when a write would move more than one step above the clocks the miner reports."""
+    """True when a write would move more than one step above the clocks the miner reports.
+
+    `frequency_step` is the frequency move the write meant to make, so a
+    multi-step climb from the reported clock is not a jump.
+    """
     frequency_step = max(int(frequency_step), 1)
     voltage_step = max(int(voltage_step), 1)
     if (
@@ -1331,6 +1384,7 @@ def decide_adjustment(
     blocked_frequency=None,
     above_target_high=False,
     droop_voltage=None,
+    max_climb_steps=1,
 ):
     """Choose the next frequency and voltage.
 
@@ -1344,6 +1398,9 @@ def decide_adjustment(
     A breach on any sensor that did report still steps down.
     `droop_voltage` scores sag against an earlier setpoint. The step still uses
     the live voltage. Pass it for one settle after a voltage raise.
+    `max_climb_steps` lets a climb take more than one frequency step while
+    errors are at most half the budget and `climb_frequency_steps` finds the
+    headroom. The climb still stops short of `blocked_frequency`.
     `tier_list`, `expected_hashrate`, and `shares_rejected_delta` stay in the
     signature so older callers keep working.
     """
@@ -1668,8 +1725,26 @@ def decide_adjustment(
     if vr_value is None:
         return current_frequency, current_voltage, "holding for telemetry"
 
-    new_frequency = min(max_freq, current_frequency + frequency_step)
+    steps = 1
+    if error <= error_budget / 2:
+        steps = climb_frequency_steps(
+            current_frequency,
+            temp_value,
+            vr_value,
+            power_value,
+            max_temp,
+            max_vr_temp,
+            max_watts,
+            temp_tolerance,
+            vr_tolerance,
+            frequency_step,
+            max_climb_steps,
+        )
+    new_frequency = min(max_freq, current_frequency + frequency_step * steps)
     blocked = coerce_limit(blocked_frequency)
+    while steps > 1 and blocked is not None and new_frequency >= blocked:
+        steps -= 1
+        new_frequency = min(max_freq, current_frequency + frequency_step * steps)
     if (
         blocked is not None
         and new_frequency > current_frequency
@@ -1998,6 +2073,9 @@ def monitor_and_adjust(
     temp_tolerance = _non_negative_float(runtime.get("temp_tolerance"), 3)
     vr_temp_tolerance = _non_negative_float(runtime.get("vr_temp_tolerance"), 3)
     refresh_interval = _non_negative_float(runtime.get("refresh_interval"), 180)
+    max_climb_steps = _positive_int(
+        runtime.get("max_climb_steps"), MAX_CLIMB_FREQUENCY_STEPS
+    )
     resume_frequency = start_frequency
     resume_voltage = start_voltage
     # After a voltage raise, score droop against the previous setpoint until
@@ -2109,6 +2187,9 @@ def monitor_and_adjust(
     # Frequency that already failed one probe because the 1-minute rate was
     # zero while live hashrate was still up. A second miss locks the ceiling.
     minute_retry_frequency = None
+    # A multi-step climb that failed is not a wall. Climbs under the clock it
+    # tried go one step at a time.
+    single_step_until = None
     blocked_frequency = None
     blocked_voltage = None
     blocked_needs_cool = False
@@ -2212,6 +2293,9 @@ def monitor_and_adjust(
             vr_temp_tolerance = _non_negative_float(runtime.get("vr_temp_tolerance"), 3)
             interval = _non_negative_float(runtime.get("monitor_interval", interval), 5)
             refresh_interval = _non_negative_float(runtime.get("refresh_interval"), 180)
+            max_climb_steps = _positive_int(
+                runtime.get("max_climb_steps"), MAX_CLIMB_FREQUENCY_STEPS
+            )
             soak_seconds = _non_negative_float(
                 runtime.get("ceiling_soak_seconds"), DEFAULT_CEILING_SOAK_SECONDS
             )
@@ -2899,6 +2983,7 @@ def monitor_and_adjust(
                 back_voltage = probe["from_volt"]
                 failed_frequency = probe["to_freq"]
                 kind = probe.get("kind") or "frequency"
+                jumped = bool(probe.get("jumped"))
                 if kind == "trim":
                     log_callback(
                         f"{bitaxe_ip} -> {confirmed[1]} mV stopped hashing. "
@@ -2906,9 +2991,10 @@ def monitor_and_adjust(
                         "info",
                     )
                 else:
+                    single_note = " Climbing one step at a time." if jumped else ""
                     log_callback(
                         f"{bitaxe_ip} -> {failed_frequency} MHz stopped hashing. "
-                        f"Stepping back to {back_frequency} MHz.",
+                        f"Stepping back to {back_frequency} MHz.{single_note}",
                         "info",
                     )
                 reverted = _same_setpoint((back_frequency, back_voltage), confirmed)
@@ -2952,6 +3038,12 @@ def monitor_and_adjust(
                                 limit_wall,
                             )
                             saved_signature = signature
+                    elif jumped:
+                        probe = None
+                        single_step_until = failed_frequency
+                        minute_retry_frequency = None
+                        pll_retry_frequency = None
+                        retreat_reason = "retry single steps"
                     else:
                         probe = None
                         hash_ceiling = back_frequency
@@ -3023,6 +3115,9 @@ def monitor_and_adjust(
                     back_frequency = probe["from_freq"]
                     back_voltage = probe["from_volt"]
                     failed_frequency = probe["to_freq"]
+                    # A multi-step climb that misses steps back without raising
+                    # voltage or locking a ceiling. Single steps find the wall.
+                    jumped = bool(probe.get("jumped"))
                     baseline_clock = _as_float(probe.get("actual"))
                     actual_now = _as_float(info.get("actualFrequency"))
                     clock_stuck = (
@@ -3033,6 +3128,7 @@ def monitor_and_adjust(
                     )
                     can_raise_voltage = (
                         kind != "trim"
+                        and not jumped
                         and not clock_stuck
                         and not thermal_hold
                         and not safety_hold
@@ -3109,6 +3205,19 @@ def monitor_and_adjust(
                             f"Restoring {back_voltage} mV.",
                             "info",
                         )
+                    elif jumped:
+                        if glitch_only:
+                            miss = "had no 1-minute rate"
+                        elif under_expected:
+                            miss = short_text
+                        else:
+                            miss = "did not hold good hashrate"
+                        log_callback(
+                            f"{bitaxe_ip} -> {failed_frequency} MHz {miss}. "
+                            f"Stepping back to {back_frequency} MHz and climbing "
+                            "one step at a time.",
+                            "info",
+                        )
                     elif pll_can_retry:
                         log_callback(
                             f"{bitaxe_ip} -> {failed_frequency} MHz did not move the PLL "
@@ -3171,7 +3280,12 @@ def monitor_and_adjust(
                             retreat_reason = "restore voltage"
                         else:
                             probe = None
-                            if pll_can_retry:
+                            if jumped:
+                                single_step_until = failed_frequency
+                                minute_retry_frequency = None
+                                pll_retry_frequency = None
+                                retreat_reason = "retry single steps"
+                            elif pll_can_retry:
                                 pll_retry_frequency = retry_frequency
                                 retreat_reason = "retry frequency"
                             elif first_minute_retry:
@@ -3310,6 +3424,12 @@ def monitor_and_adjust(
                 "hashrate_short": hashrate_short,
                 "blocked_frequency": blocked_frequency,
                 "above_target_high": above_target_high,
+                "max_climb_steps": (
+                    1
+                    if single_step_until is not None
+                    and confirmed[0] < single_step_until
+                    else max_climb_steps
+                ),
             }
 
             reported_frequency_number = _as_float(reported_frequency)
@@ -3323,8 +3443,11 @@ def monitor_and_adjust(
                 else None
             )
             # The PLL judges whether the last step moved. The next request stays
-            # within one frequency step of the last confirmed setpoint, or follows
-            # the miner's own frequency field when that setpoint is stale.
+            # within the climb it chose above the last confirmed setpoint, or
+            # follows the miner's own frequency field when that setpoint is stale.
+            climb_jump = frequency_step
+            if reason == "increase frequency":
+                climb_jump = max(frequency_step, new_frequency - confirmed[0])
             follow_report = (
                 report_frequency is not None
                 and reported_voltage_number is not None
@@ -3334,7 +3457,7 @@ def monitor_and_adjust(
                         new_voltage,
                         report_frequency,
                         int(reported_voltage_number),
-                        frequency_step,
+                        climb_jump,
                         voltage_step,
                     )
                     or (
@@ -3363,6 +3486,7 @@ def monitor_and_adjust(
 
             if reason in ("increase voltage", "trim voltage", "restore voltage"):
                 new_frequency = confirmed[0]
+            climb_jumped = False
             if (
                 pll_retry_frequency is not None
                 and reason == "increase frequency"
@@ -3370,11 +3494,11 @@ def monitor_and_adjust(
                 and new_frequency < pll_retry_frequency
             ):
                 new_frequency = pll_retry_frequency
-            elif (
-                reason == "increase frequency"
-                and new_frequency > confirmed[0] + frequency_step
-            ):
-                new_frequency = confirmed[0] + frequency_step
+            elif reason == "increase frequency":
+                new_frequency = min(
+                    new_frequency, confirmed[0] + frequency_step * max_climb_steps
+                )
+                climb_jumped = new_frequency > confirmed[0] + frequency_step
             if reason == "increase frequency" and new_frequency < confirmed[0]:
                 new_frequency = confirmed[0]
                 new_voltage = confirmed[1]
@@ -3547,6 +3671,7 @@ def monitor_and_adjust(
                     if reason == "increase frequency":
                         probe = {
                             "kind": "frequency",
+                            "jumped": climb_jumped,
                             "from_freq": confirmed[0],
                             "from_volt": confirmed[1],
                             "to_freq": new_frequency,
