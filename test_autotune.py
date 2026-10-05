@@ -1589,6 +1589,37 @@ class DecisionTests(unittest.TestCase):
             autotune.hold_may_reclimb(None, 64, 0, limit, error_percentage=0.5, **args)
         )
 
+    def test_a_cool_hold_or_trim_on_the_frequency_floor_climbs(self):
+        floor = {
+            "frequency": 400,
+            "voltage": 1000,
+            "min_freq": 400,
+            "max_freq": 1100,
+            "max_volt": 1300,
+            "thermal_hold": False,
+            "safety_hold": "",
+            "cooled": True,
+        }
+        self.assertTrue(autotune.floor_hold_should_climb("hold", **floor))
+        self.assertTrue(autotune.floor_hold_should_climb("trim", **floor))
+        self.assertFalse(autotune.floor_hold_should_climb("climb", **floor))
+        # Above the floor, a hold keeps its wall.
+        self.assertFalse(
+            autotune.floor_hold_should_climb("hold", **dict(floor, frequency=405))
+        )
+        # Heat, a safety hold, the voltage cap, or no room above the floor stays.
+        for extra in (
+            {"thermal_hold": True},
+            {"safety_hold": "input"},
+            {"cooled": False},
+            {"voltage": 1300},
+            {"max_freq": 400},
+        ):
+            self.assertFalse(
+                autotune.floor_hold_should_climb("hold", **dict(floor, **extra)),
+                extra,
+            )
+
     def test_error_restart_limit_scales_with_the_budget(self):
         self.assertEqual(autotune.error_restart_limit(2.0), 10.0)
         self.assertEqual(autotune.error_restart_limit(4.0), 20.0)
@@ -3284,6 +3315,60 @@ class SessionTests(unittest.TestCase):
         self.assertIn((495, 1100), state["calls"])
         self.assertIn((490, 1100), state["calls"])
         self.assertTrue(all(volt == 1100 for _freq, volt in state["calls"]))
+
+    def test_errors_on_the_frequency_floor_in_hold_raise_voltage(self):
+        # The same hold retreat, one step above the floor. Holding there with
+        # errors kept a cool chip at its slowest clock for good.
+        state = {"frequency": 500, "voltage": 1100, "error": 0.2, "calls": []}
+        logs = []
+        stop_event = threading.Event()
+
+        def set_settings(ip, volt, freq):
+            freq = int(freq)
+            volt = int(volt)
+            state["calls"].append((freq, volt))
+            state["frequency"] = freq
+            state["voltage"] = volt
+            if volt > 1100:
+                stop_event.set()
+            return (
+                f"{ip} -> Applied settings: Voltage = {volt}mV, Frequency = {freq}MHz"
+            )
+
+        def get_info(ip):
+            return _info(
+                frequency=state["frequency"],
+                voltage=state["voltage"],
+                hashRate=1000,
+                hashRate_1m=1000,
+                errorPercentage=state["error"],
+                actualFrequency=state["frequency"],
+                temp=40,
+                vrTemp=30,
+            )
+
+        def log(message, level="info"):
+            logs.append(message)
+            if "Holding " in message and "MHz" in message:
+                state["error"] = 8
+
+        with patched_io(get_info, set_settings):
+            thread = _start_miner(
+                "miner",
+                stop_event,
+                log,
+                start_freq=500,
+                start_volt=1100,
+                min_freq=495,
+                max_freq=500,
+                min_volt=1100,
+                max_volt=1400,
+            )
+            thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertIn((495, 1100), state["calls"])
+        self.assertEqual(state["calls"][-1], (495, 1110))
+        self.assertTrue(any("495 MHz floor" in message for message in logs))
 
     def test_reject_block_stays_when_the_chip_cools(self):
         state = {

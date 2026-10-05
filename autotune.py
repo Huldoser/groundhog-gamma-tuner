@@ -572,6 +572,35 @@ def hold_may_reclimb(
     return now - wall_since >= RECLIMB_AFTER_SECONDS
 
 
+def floor_hold_should_climb(
+    phase,
+    frequency,
+    voltage,
+    min_freq,
+    max_freq,
+    max_volt,
+    thermal_hold,
+    safety_hold,
+    cooled,
+):
+    """True when a hold or trim on the frequency floor should go back to climbing.
+
+    The floor is where retreats land, not a wall a climb found. A hold answers
+    errors by stepping frequency, which the floor cannot do, and a trim there
+    swings voltage up and down without ever finishing. Either keeps a cool chip
+    at its slowest clock for good. Climbing raises voltage for errors first.
+    A chip still in a heat or safety hold, at its voltage cap, or with no room
+    above the floor stays put.
+    """
+    if phase not in ("hold", "trim"):
+        return False
+    if thermal_hold or safety_hold or not cooled:
+        return False
+    return int(frequency) <= int(min_freq) < int(max_freq) and int(voltage) < int(
+        max_volt
+    )
+
+
 def error_restart_limit(max_error_percentage):
     """Settled error percentage that earns the ASIC a restart."""
     budget = _as_float(max_error_percentage)
@@ -3364,6 +3393,48 @@ def monitor_and_adjust(
                 log_callback(
                     f"{bitaxe_ip} -> Errors and heat have room under the "
                     f"{wall_frequency} MHz wall. Climbing again.",
+                    "info",
+                )
+                hash_ceiling = None
+                blocked_frequency = None
+                blocked_voltage = None
+                blocked_needs_cool = False
+                blocked_for_rejects = False
+                wall_temp = None
+                wall_since = None
+                phase = "climb"
+                hold_since = None
+                ceiling_saved = False
+                trim_good_voltage = None
+                trim_after_retreat = False
+                _publish_status(
+                    bitaxe_ip,
+                    phase=phase,
+                    wall_type=limit_wall,
+                    error_percentage=error_percentage,
+                    reason="climb again",
+                )
+
+            if (
+                probe is None
+                and pending is None
+                and floor_hold_should_climb(
+                    phase,
+                    confirmed[0],
+                    confirmed[1],
+                    limits["min_freq"],
+                    limits["max_freq"],
+                    limits["max_volt"],
+                    thermal_hold,
+                    safety_hold,
+                    cooled,
+                )
+            ):
+                # A wall at the floor leaves nowhere to hold. Drop it and climb,
+                # so errors raise voltage instead of holding the slowest clock.
+                log_callback(
+                    f"{bitaxe_ip} -> Cool at the {limits['min_freq']} MHz floor. "
+                    "Climbing again.",
                     "info",
                 )
                 hash_ceiling = None
