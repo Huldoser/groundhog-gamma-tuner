@@ -104,6 +104,7 @@
             <button type="button" role="radio" data-period="90d">90 days</button>
             <button type="button" role="radio" data-period="all">All</button>
             <button type="button" role="radio" data-period="reset" title="Since the last Reset to Baseline">Since reset</button>
+            <button type="button" role="radio" data-period="repaste" title="Since each miner's repaste date">Since repaste</button>
           </div>
           <div id="history-metric" class="segmented" role="radiogroup" aria-label="Measure">
             <button type="button" role="radio" data-metric="good_hashrate" title="Hashrate less the error share">Good hashrate</button>
@@ -230,6 +231,8 @@
       <h2>Edit Miner</h2>
       <label>Nickname <input id="edit-name" data-autofocus autocomplete="off"></label>
       <label>IP Address <input id="edit-ip" autocomplete="off" spellcheck="false" required></label>
+      <label>Repasted on <input id="edit-repasted" type="date"></label>
+      <p class="hint">The day this miner last got new thermal paste. History marks it and can start there. Leave blank if unknown.</p>
       <p id="edit-error" class="form-error"></p>
       <div class="dialog-actions">
         <button type="button" class="quiet" data-close="edit">Cancel</button>

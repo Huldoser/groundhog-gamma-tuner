@@ -267,6 +267,29 @@ function firmwareTitle(miner) {
   return running ? `${running}\n${available}` : available;
 }
 
+function localDay(moment) {
+  const pad = (value) => String(value).padStart(2, "0");
+  return `${moment.getFullYear()}-${pad(moment.getMonth() + 1)}-${pad(moment.getDate())}`;
+}
+
+// "Repasted Oct 4, 2026 (yesterday)" for a saved YYYY-MM-DD, or "".
+function repasteText(day) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(day || "").trim());
+  if (!match) return "";
+  const then = new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  // Rounding absorbs a daylight-saving hour between the two midnights.
+  const days = Math.round((today - then) / 86400000);
+  const ago = days <= 0 ? "today" : days === 1 ? "yesterday" : `${days} days ago`;
+  const date = then.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
+  return `Repasted ${date} (${ago})`;
+}
+
+function nameTitle(miner) {
+  return [firmwareTitle(miner), repasteText(miner.repasted_on)].filter(Boolean).join("\n");
+}
+
 function levelClass(level, quiet) {
   if (level === "warn" || level === "bad") return level;
   return quiet ? "muted" : "";
@@ -293,7 +316,7 @@ function renderCell(miner, column) {
         addLine(cell, miner.fallback ? `${miner.pool} fallback` : miner.pool, "muted");
       }
     }
-    setTitle(cell, firmwareTitle(miner));
+    setTitle(cell, nameTitle(miner));
     return cell;
   }
   if (column === "freq") {
@@ -688,6 +711,8 @@ function openEdit() {
   editIp = miner.ip;
   $("edit-name").value = miner.name === "-" ? "" : miner.name;
   $("edit-ip").value = miner.ip;
+  $("edit-repasted").value = miner.repasted_on || "";
+  $("edit-repasted").max = localDay(new Date());
   setFormError("edit-error", "");
   $("edit-submit").disabled = false;
   $("edit-submit").textContent = "Save";
@@ -705,7 +730,7 @@ async function submitEdit(event) {
   button.textContent = newIp !== editIp ? "Checking board..." : "Save";
   setFormError("edit-error", "");
   try {
-    const result = await bridge.edit_miner(editIp, $("edit-name").value, newIp);
+    const result = await bridge.edit_miner(editIp, $("edit-name").value, newIp, $("edit-repasted").value);
     if (!result.ok) {
       setFormError("edit-error", result.message);
       return;

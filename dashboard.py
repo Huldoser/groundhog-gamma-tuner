@@ -238,6 +238,33 @@ def learned_setpoint(status, stored):
     return freq_text, volt_text, label
 
 
+def parse_repaste_date(value, today=None):
+    """(`YYYY-MM-DD` or "", error text) for the day a miner got new thermal paste.
+
+    Blank clears the date. A day after today is refused.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return "", ""
+    try:
+        day = datetime.strptime(text, "%Y-%m-%d").date()
+    except ValueError:
+        return "", "Repaste date must look like 2026-10-04."
+    if day > (today or datetime.now().date()):
+        return "", "Repaste date cannot be in the future."
+    return day.isoformat(), ""
+
+
+def repaste_starts(miners):
+    """{ip: unix seconds at local midnight of its repaste day} for miners with one."""
+    starts = {}
+    for miner in miners:
+        start = history.day_start(miner.get("repasted_on"))
+        if miner.get("ip") and start is not None:
+            starts[miner["ip"]] = start
+    return starts
+
+
 def parse_display_number(value):
     if value in (None, "", "-"):
         return None
@@ -893,6 +920,7 @@ def blank_miner_row(nickname, ip):
         "power_fault": False,
         "overheat": False,
         "best_exact": None,
+        "repasted_on": "",
     }
 
 
@@ -1280,7 +1308,11 @@ class TunerDashboard:
     def load_rows(self):
         """Replace the table with the miners saved in config.json."""
         saved = [
-            (miner["ip"], miner.get("nickname") or f"Miner-{miner['ip']}")
+            (
+                miner["ip"],
+                miner.get("nickname") or f"Miner-{miner['ip']}",
+                str(miner.get("repasted_on") or ""),
+            )
             for miner in get_miners()
         ]
         with self._lock:
@@ -1288,12 +1320,13 @@ class TunerDashboard:
             # or an edit does not blank the table until the next refresh.
             current = {row["ip"]: row for row in self._rows}
             rows = []
-            for ip, nickname in saved:
+            for ip, nickname, repasted_on in saved:
                 row = current.get(ip)
                 if row is None:
                     row = blank_miner_row(nickname, ip)
                 else:
                     row["name"] = nickname
+                row["repasted_on"] = repasted_on
                 rows.append(row)
             self._rows = rows
             kept = {row["ip"] for row in rows}
@@ -1901,20 +1934,24 @@ class TunerDashboard:
         period = filters.get("period")
         if period not in history.PERIODS:
             period = "7d"
+        saved = get_miners()
         miners = [
             {
                 "ip": miner["ip"],
                 "name": miner.get("nickname") or miner["ip"],
                 "slot": index % 8,
             }
-            for index, miner in enumerate(get_miners())
+            for index, miner in enumerate(saved)
             if miner.get("ip")
         ]
         ip = str(filters.get("ip") or "").strip()
         if ip not in {miner["ip"] for miner in miners}:
             ip = ""
         try:
-            samples = history.period_samples(period, time.time(), ip or None)
+            repastes = history.repaste_moments(repaste_starts(saved))
+            samples = history.period_samples(
+                period, time.time(), ip or None, repastes=repastes
+            )
             summary = history.summarize(samples, metric, ip or None)
             resets = history.last_events("reset")
         except sqlite3.Error as exc:
@@ -1929,6 +1966,7 @@ class TunerDashboard:
             "weather": current,
             "attribution": weather.ATTRIBUTION,
             "resets": resets,
+            "repastes": repastes,
             "sample_minutes": history.SAMPLE_SECONDS // 60,
             "band_c": history.TEMP_BAND_C,
             **summary,
@@ -2099,15 +2137,23 @@ class TunerDashboard:
         self.log_message("Miner(s) removed successfully.", "success")
         return {"ok": True}
 
-    def edit_miner(self, current_ip, nickname, new_ip):
-        """Save a nickname. A new address is checked and must still be a Gamma 601."""
+    def edit_miner(self, current_ip, nickname, new_ip, repasted_on=None):
+        """Save a nickname and repaste date. A new address must still be a Gamma 601.
+
+        `repasted_on` is `YYYY-MM-DD`, blank to clear it, or None to keep it.
+        """
         current_ip = str(current_ip or "").strip()
         new_ip = str(new_ip or "").strip()
         nickname = str(nickname or "").strip()
         if not new_ip:
             return _fail("IP Address is required.")
+        if repasted_on is not None:
+            repasted_on, error = parse_repaste_date(repasted_on)
+            if error:
+                return _fail(error)
         miners = get_miners()
-        if not any(miner["ip"] == current_ip for miner in miners):
+        previous = next((miner for miner in miners if miner["ip"] == current_ip), None)
+        if previous is None:
             return _fail(f"Miner with IP {current_ip} was not found.")
         if new_ip != current_ip and any(miner["ip"] == new_ip for miner in miners):
             return _fail(f"Miner with IP {new_ip} already exists.")
@@ -2126,11 +2172,26 @@ class TunerDashboard:
             miner_type = miner_type_from_info(info)
             self._signal_miner_stop(current_ip)
 
-        if self._apply_miner_edit(current_ip, nickname, new_ip, miner_type) is False:
+        if (
+            self._apply_miner_edit(
+                current_ip, nickname, new_ip, miner_type, repasted_on
+            )
+            is False
+        ):
             return _fail(CONFIG_CORRUPT_MESSAGE, "Config file damaged", "error")
         self.log_message(
             f"Updated miner settings: {nickname} ({miner_type}) at {new_ip}", "success"
         )
+        if repasted_on is not None and repasted_on != str(
+            previous.get("repasted_on") or ""
+        ):
+            label = nickname or new_ip
+            self.log_message(
+                f"Saved {label}'s repaste date: {repasted_on}."
+                if repasted_on
+                else f"Cleared {label}'s repaste date.",
+                "success",
+            )
         if new_ip != current_ip:
             self._start_miners_if_running([new_ip])
         return {
@@ -2563,13 +2624,17 @@ class TunerDashboard:
         update_miner(ip, {"nickname": hostname})
         row["name"] = hostname
 
-    def _apply_miner_edit(self, current_ip, nickname, new_ip, miner_type):
+    def _apply_miner_edit(
+        self, current_ip, nickname, new_ip, miner_type, repasted_on=None
+    ):
         def mutate(config):
             for miner in config.get("miners", []):
                 if miner["ip"] == current_ip:
                     miner["nickname"] = nickname
                     miner["type"] = miner_type
                     miner["ip"] = new_ip
+                    if repasted_on is not None:
+                        miner["repasted_on"] = repasted_on
                     break
 
         if modify_config(mutate) is False:
@@ -2871,8 +2936,8 @@ class DashboardApi:
     def remove_miner_address(self, ip):
         return self._dashboard.remove_miner_address(ip)
 
-    def edit_miner(self, current_ip, nickname, new_ip):
-        return self._dashboard.edit_miner(current_ip, nickname, new_ip)
+    def edit_miner(self, current_ip, nickname, new_ip, repasted_on=None):
+        return self._dashboard.edit_miner(current_ip, nickname, new_ip, repasted_on)
 
     def restart_miner(self, ip):
         return self._dashboard.restart_miner(ip)

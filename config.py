@@ -362,6 +362,7 @@ def new_miner_record(miner_type, ip, nickname, config=None):
         "wall_type": "",
         "wall_timestamp": "",
         "target_hashrate": "",
+        "repasted_on": "",
     }
     for key in GAMMA601_LIMITS:
         record.setdefault(key, "")

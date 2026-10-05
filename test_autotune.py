@@ -5949,6 +5949,7 @@ class InstallAndConfigTests(unittest.TestCase):
                 "power_fault": False,
                 "overheat": False,
                 "best_exact": None,
+                "repasted_on": "",
             },
         )
         self.assertEqual(row_state_tag("hold", "60", "1.00%", 66, 2), "hold")

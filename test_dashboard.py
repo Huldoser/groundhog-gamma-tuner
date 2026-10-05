@@ -33,6 +33,7 @@ from dashboard import (
     format_version_title,
     learned_setpoint,
     limit_level,
+    parse_repaste_date,
     replace_ips_with_names,
     under_limit,
 )
@@ -428,6 +429,17 @@ class DisplayHelperTests(unittest.TestCase):
             app._refresh_firmware_if_due()
         self.assertEqual(fetch.call_count, 2)
         self.assertEqual(app._latest_firmware, "v2.15.2")
+
+
+class RepasteDateTests(unittest.TestCase):
+    def test_a_repaste_date_is_today_or_earlier(self):
+        today = datetime(2026, 10, 5).date()
+        self.assertEqual(parse_repaste_date("2026-10-04", today), ("2026-10-04", ""))
+        self.assertEqual(parse_repaste_date(" 2026-10-05 ", today), ("2026-10-05", ""))
+        self.assertEqual(parse_repaste_date("", today), ("", ""))
+        self.assertEqual(parse_repaste_date(None, today), ("", ""))
+        self.assertIn("future", parse_repaste_date("2026-10-06", today)[1])
+        self.assertIn("2026-10-04", parse_repaste_date("Oct 4", today)[1])
 
 
 class SnapshotTests(unittest.TestCase):
@@ -1057,6 +1069,27 @@ class SnapshotTests(unittest.TestCase):
             app.threads[0].join(timeout=2)
             self.assertEqual(started, ["10.0.0.9"])
             self.assertEqual(app.threads[0].miner_ip, "10.0.0.9")
+
+    def test_edit_saves_keeps_or_clears_the_repaste_date(self):
+        miner = config.new_miner_record(
+            "BM1370 601", "10.0.0.8", "Alpha", config.get_default_config()
+        )
+        with temp_config([miner]):
+            app = TunerDashboard()
+            saved = app.edit_miner("10.0.0.8", "Alpha", "10.0.0.8", "2026-10-04")
+            self.assertTrue(saved["ok"])
+            self.assertEqual(config.get_miners()[0]["repasted_on"], "2026-10-04")
+            self.assertEqual(
+                app.get_snapshot()["miners"][0]["repasted_on"], "2026-10-04"
+            )
+            # An older caller that sends no date keeps the saved one.
+            self.assertTrue(app.edit_miner("10.0.0.8", "Alpha", "10.0.0.8")["ok"])
+            self.assertEqual(config.get_miners()[0]["repasted_on"], "2026-10-04")
+            future = app.edit_miner("10.0.0.8", "Alpha", "10.0.0.8", "2999-01-01")
+            self.assertFalse(future["ok"])
+            self.assertEqual(config.get_miners()[0]["repasted_on"], "2026-10-04")
+            self.assertTrue(app.edit_miner("10.0.0.8", "Alpha", "10.0.0.8", "")["ok"])
+            self.assertEqual(config.get_miners()[0]["repasted_on"], "")
 
     def test_reversed_limits_are_rejected_and_not_saved(self):
         miner = config.new_miner_record(
@@ -1788,6 +1821,39 @@ class HistoryScreenTests(unittest.TestCase):
             one = app.get_history({"ip": "10.0.0.9", "period": "24h"})
             self.assertEqual(one["best"]["value"], 900.0)
             self.assertEqual(set(one["series"]), {"10.0.0.9"})
+
+    def test_since_repaste_starts_each_miner_at_its_saved_day(self):
+        today = datetime.now().date().isoformat()
+        alpha = _gamma("10.0.0.8", "Alpha")
+        alpha["repasted_on"] = today
+        with temp_config([alpha, _gamma("10.0.0.9", "Beta")]):
+            start = history.day_start(today)
+            now = int(time.time())
+            history.record_samples(
+                [
+                    {
+                        "ts": ts,
+                        "ip": ip,
+                        "good_hashrate": 1000.0,
+                        "hashrate": 1000.0,
+                        "settled": 1,
+                    }
+                    for ts, ip in (
+                        (start - 3600, "10.0.0.8"),
+                        (now, "10.0.0.8"),
+                        (start - 3600, "10.0.0.9"),
+                    )
+                ]
+            )
+            result = TunerDashboard().get_history({"period": "repaste"})
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["filters"]["period"], "repaste")
+            self.assertEqual(result["repastes"], {"10.0.0.8": start})
+            self.assertEqual(
+                [point[0] for point in result["series"]["10.0.0.8"]], [now]
+            )
+            # A miner with no repaste date keeps all of its samples.
+            self.assertEqual(len(result["series"]["10.0.0.9"]), 1)
 
     def test_baseline_resets_are_marked_as_fresh_starts(self):
         miners = [_gamma("10.0.0.8", "Alpha"), _gamma("10.0.0.9", "Beta")]

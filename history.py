@@ -1,9 +1,12 @@
 """Ten-minute history of every miner, with the weather outside, for the History screen.
 
 Samples live in `history.db` next to `config.json`. A baseline reset is kept as
-an event, so the screen can show a miner since its fresh start.
+an event, so the screen can show a miner since its fresh start. A repaste date
+is saved on the miner in `config.json`, and the screen can start there too.
 """
 
+import datetime
+import itertools
 import math
 import os
 import sqlite3
@@ -38,6 +41,7 @@ PERIODS = {
     "90d": 90 * 86400,
     "all": None,
     "reset": None,
+    "repaste": None,
 }
 METRICS = {
     "good_hashrate": {
@@ -660,17 +664,60 @@ def summarize(samples, metric, ip=None):
     }
 
 
-def period_samples(period, now, ip=None, path=None):
-    """Samples for a period key. `reset` starts each miner at its last baseline reset."""
+def day_start(date_text):
+    """Unix seconds at local midnight of a `YYYY-MM-DD` date, or None."""
+    try:
+        day = datetime.date.fromisoformat(str(date_text or "").strip())
+    except ValueError:
+        return None
+    return int(time.mktime(day.timetuple()))
+
+
+def repaste_moments(days, path=None):
+    """{ip: unix seconds} for repaste days, moved to when each miner came back.
+
+    `days` is `{ip: local midnight}`. A repaste powers the miner off, so its
+    samples that day have a gap. The first sample after the longest gap of at
+    least two sample intervals marks the new paste. Without one, midnight stays.
+    """
+    moments = dict(days)
+    path = path or history_path()
+    if not days or not os.path.exists(path):
+        return moments
+    with _db_lock, closing(_connect(path)) as connection:
+        for ip, start in days.items():
+            rows = connection.execute(
+                "SELECT ts FROM samples WHERE ip = ? AND ts >= ? AND ts < ? "
+                "ORDER BY ts",
+                (ip, start - 2 * SAMPLE_SECONDS, start + 86400),
+            ).fetchall()
+            stamps = [int(row["ts"]) for row in rows]
+            longest = 2 * SAMPLE_SECONDS - 1
+            for before, after in itertools.pairwise(stamps):
+                if after >= start and after - before > longest:
+                    longest = after - before
+                    moments[ip] = after
+    return moments
+
+
+def period_samples(period, now, ip=None, path=None, repastes=None):
+    """Samples for a period key.
+
+    `reset` starts each miner at its last baseline reset, and `repaste` at its
+    repaste. `repastes` is `{ip: unix seconds}` from `repaste_moments`.
+    """
     seconds = PERIODS.get(period, PERIODS["7d"])
-    if period == "reset":
-        resets = last_events("reset", path)
+    if period in ("reset", "repaste"):
+        if period == "reset":
+            starts = last_events("reset", path)
+        else:
+            starts = dict(repastes or {})
         if ip:
-            return load_samples(resets.get(ip), path, ip)
-        # A miner that was never reset keeps all of its samples.
+            return load_samples(starts.get(ip), path, ip)
+        # A miner with no start keeps all of its samples.
         samples = load_samples(None, path)
         return [
-            sample for sample in samples if sample["ts"] >= resets.get(sample["ip"], 0)
+            sample for sample in samples if sample["ts"] >= starts.get(sample["ip"], 0)
         ]
     since = None if seconds is None else now - seconds
     return load_samples(since, path, ip)

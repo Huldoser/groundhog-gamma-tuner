@@ -142,6 +142,45 @@ class StoreTests(unittest.TestCase):
         one = history.period_samples("reset", 1000, ip="a", path=self.path)
         self.assertEqual([row["ts"] for row in one], [900])
 
+    def test_since_repaste_starts_each_miner_at_its_repaste_day(self):
+        history.record_samples(
+            [_sample(100), _sample(100, ip="b"), _sample(900), _sample(900, ip="b")],
+            self.path,
+        )
+        repastes = {"b": 500}
+        fleet = history.period_samples(
+            "repaste", 1000, path=self.path, repastes=repastes
+        )
+        self.assertEqual(
+            sorted((row["ip"], row["ts"]) for row in fleet),
+            [("a", 100), ("a", 900), ("b", 900)],
+        )
+        one = history.period_samples(
+            "repaste", 1000, ip="b", path=self.path, repastes=repastes
+        )
+        self.assertEqual([row["ts"] for row in one], [900])
+        never = history.period_samples("repaste", 1000, ip="a", path=self.path)
+        self.assertEqual([row["ts"] for row in never], [100, 900])
+
+    def test_a_repaste_starts_when_the_miner_came_back_that_day(self):
+        start = 10 * 86400
+        stamps = [start - 600, start + 600]
+        # A short gap in the morning, then the long one: off for the repaste.
+        stamps += range(start + 2400, start + 4 * HOUR, 600)
+        stamps += range(start + 6 * HOUR, start + 8 * HOUR, 600)
+        history.record_samples([_sample(ts) for ts in stamps], self.path)
+        history.record_samples([_sample(start + 600, ip="c")], self.path)
+        moments = history.repaste_moments(
+            {"a": start, "b": start, "c": start}, self.path
+        )
+        self.assertEqual(moments, {"a": start + 6 * HOUR, "b": start, "c": start})
+
+    def test_day_start_is_local_midnight(self):
+        start = history.day_start("2026-10-04")
+        self.assertEqual(time.localtime(start)[:6], (2026, 10, 4, 0, 0, 0))
+        self.assertIsNone(history.day_start(""))
+        self.assertIsNone(history.day_start("yesterday"))
+
     def test_missing_weather_is_filled_from_the_nearest_hour(self):
         history.record_samples(
             [

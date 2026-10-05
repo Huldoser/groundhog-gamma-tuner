@@ -329,6 +329,11 @@ function renderWeatherChip(weather) {
   chip.hidden = false;
 }
 
+function repasteKnown(data) {
+  const repastes = data.repastes || {};
+  return data.filters.ip ? finite(repastes[data.filters.ip]) : Object.keys(repastes).length > 0;
+}
+
 function renderNotice(data) {
   const notice = $("history-notice");
   notice.replaceChildren();
@@ -341,6 +346,10 @@ function renderNotice(data) {
     message = `History starts now. A sample is saved for every miner each ${data.sample_minutes} minutes while this window is open, the first one ${data.sample_minutes} minutes after it opens.`;
   } else if (data.filters.period === "reset" && !Object.keys(data.resets || {}).length) {
     message = "No Reset to Baseline is recorded yet, so Since reset shows everything.";
+  } else if (data.filters.period === "repaste" && !repasteKnown(data)) {
+    message = data.filters.ip
+      ? "This miner has no repaste date, so Since repaste shows everything. Add it in Edit Miner Settings."
+      : "No miner has a repaste date yet, so Since repaste shows everything. Add one in Edit Miner Settings.";
   }
   if (!message) {
     notice.hidden = true;
@@ -575,8 +584,9 @@ function drawTrend(data, scale) {
   $("trend-title").textContent = data.filters.ip
     ? `${meta.label} over time`
     : `${meta.label} by miner over time`;
+  const repasted = data.filters.ip ? (data.repastes || {})[data.filters.ip] : null;
   $("trend-sub").textContent = data.filters.ip
-    ? `${scale.unit}${meta.higher_is_better ? "" : ", lower is better"}`
+    ? `${scale.unit}${meta.higher_is_better ? "" : ", lower is better"}${finite(repasted) ? ` · repasted ${formatDate(repasted)}` : ""}`
     : `${scale.unit}${meta.higher_is_better ? "" : ", lower is better"} · click a name to show one miner`;
   if (!series.length || !data.first) {
     chartEmpty(trend, "Nothing recorded for this period yet.");
@@ -613,6 +623,7 @@ function drawTrend(data, scale) {
     chartEmpty(outdoorBox, "");
     return;
   }
+  drawRepasteMarks(main, series, data.repastes || {});
   const outdoorPoints = (data.outdoor || []).filter((point) => finite(point[1]));
   let strip = null;
   if (outdoorPoints.length) {
@@ -645,6 +656,29 @@ function drawTrend(data, scale) {
     chart.overlay.addEventListener("pointermove", (event) => hoverTrend(chart, event));
     chart.overlay.addEventListener("pointerleave", hideTip);
   });
+}
+
+// A dashed line in the miner's color where its paste was replaced, labelled once per day.
+function drawRepasteMarks(chart, series, repastes) {
+  const group = svg("g", { class: "repaste-marks" });
+  const labelled = new Set();
+  series.forEach((item) => {
+    const ts = Number(repastes[item.ip]);
+    if (!finite(repastes[item.ip]) || ts < chart.t0 || ts > chart.t1) return;
+    const at = chart.x(ts);
+    svg("line", { x1: at, x2: at, y1: chart.margin.top, y2: chart.plotBottom, stroke: item.color }, group);
+    if (labelled.has(ts)) return;
+    labelled.add(ts);
+    // Near the right edge the label sits left of its line.
+    const flip = at > chart.plotRight - 60;
+    const label = svg("text", {
+      x: flip ? at - 4 : at + 4,
+      y: chart.margin.top + 10,
+      "text-anchor": flip ? "end" : "start",
+    }, group);
+    label.textContent = "Repaste";
+  });
+  if (group.childNodes.length) chart.root.insertBefore(group, chart.hoverLayer);
 }
 
 function hoverTrend(chart, event) {
