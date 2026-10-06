@@ -3,7 +3,7 @@ const TUNER_FIELDS = [
   "min_freq", "start_freq", "max_freq",
   "min_volt", "start_volt", "max_volt",
   "max_temp", "max_watts", "max_vr_temp", "min_input_voltage", "max_error_percentage",
-  "max_droop_mv",
+  "max_droop_mv", "max_core_amps",
 ];
 const GLOBAL_FIELDS = [
   "voltage_step", "frequency_step", "monitor_interval", "refresh_interval",
@@ -353,6 +353,7 @@ function renderCell(miner, column) {
       if (shown(miner.watts)) addLine(cell, `${miner.watts} W`, miner.watts_alert ? "bad" : "");
       if (shown(miner.vin)) addLine(cell, `${miner.vin} V`, miner.vin_alert ? "bad" : "muted");
     }
+    setTitle(cell, miner.watts_title);
     return cell;
   }
   if (column === "best") {

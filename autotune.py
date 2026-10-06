@@ -5,12 +5,14 @@ import time
 import requests
 
 from config import (
+    DEFAULT_MAX_CORE_AMPS,
     DEFAULT_MAX_DROOP_MV,
     DEFAULT_MAX_ERROR_PERCENTAGE,
     DEFAULT_MIN_INPUT_VOLTAGE,
     FIRMWARE_ASIC_TRIP_C,
     FIRMWARE_TRIP_MARGIN_C,
     FIRMWARE_VR_TRIP_C,
+    HARD_MAX_CORE_AMPS,
     HARD_MAX_FREQ,
     HARD_MAX_VOLT,
     HARD_MIN_FREQ,
@@ -290,6 +292,30 @@ def _record_float(record, key, default):
     return number
 
 
+def core_current_amps(info):
+    """Regulator output current in amps, or None. AxeOS reports milliamps."""
+    if not isinstance(info, dict):
+        return None
+    number = _as_float(info.get("current"))
+    if number is None or number <= 0:
+        return None
+    return number / 1000.0 if number > 200 else number
+
+
+def core_amps_cap(record):
+    """This miner's current cap, never over HARD_MAX_CORE_AMPS."""
+    cap = _record_float(record, "max_core_amps", DEFAULT_MAX_CORE_AMPS)
+    if cap is None or cap <= 0:
+        cap = DEFAULT_MAX_CORE_AMPS
+    return min(float(cap), HARD_MAX_CORE_AMPS)
+
+
+def _over_current(core_current, max_core_amps):
+    current = _as_float(core_current)
+    cap = _as_float(max_core_amps)
+    return current is not None and cap is not None and current > cap
+
+
 def _miner_record(ip):
     for miner in load_config().get("miners", []):
         if miner.get("ip") == ip:
@@ -307,6 +333,8 @@ def wall_type_from_reason(reason):
         return "input"
     if "silicon" in text or "above target" in text:
         return "silicon"
+    if "current limit" in text:
+        return "current"
     if "power limit" in text or "power fault" in text or "droop" in text:
         return "power"
     if "frequency cap" in text:
@@ -351,6 +379,8 @@ def climb_frequency_steps(
     vr_tolerance,
     frequency_step,
     max_steps=MAX_CLIMB_FREQUENCY_STEPS,
+    core_current=None,
+    max_core_amps=None,
 ):
     """How many frequency steps one climb may take on this much headroom.
 
@@ -381,6 +411,11 @@ def climb_frequency_steps(
             return 1
         allowed = min(allowed, int(room // (weight * value * share)))
     allowed = min(allowed, int((max_watts - watts) // (watts * share)))
+    # At a fixed voltage, core current grows in proportion to frequency.
+    current = _as_float(core_current)
+    cap = _as_float(max_core_amps)
+    if current is not None and current > 0 and cap is not None:
+        allowed = min(allowed, int((cap - current) // (current * share)))
     return _clamp(allowed, 1, max_steps)
 
 
@@ -651,6 +686,8 @@ def _needs_immediate_retreat(
     max_droop_mv,
     power_fault,
     overheat_mode,
+    core_current=None,
+    max_core_amps=None,
 ):
     """True when the clocks the miner is running are past a safety limit.
 
@@ -670,6 +707,8 @@ def _needs_immediate_retreat(
     if near_firmware_trip(temp_value, vr_value):
         return True
     if power_value is not None and power_value > max_watts:
+        return True
+    if _over_current(core_current, max_core_amps):
         return True
     if _overheat_mode_set(overheat_mode) or (
         power_value is not None and power_value <= ASIC_OFF_POWER_WATTS
@@ -1092,6 +1131,7 @@ def reject_share(accepted_delta, rejected_delta, stale_delta=0):
 # tolerance field, so a retreat does not climb again until the reading is
 # back inside the cap by this margin. Input releases at its floor.
 POWER_HOLD_MARGIN_WATTS = 1
+CURRENT_HOLD_MARGIN_AMPS = 1
 DROOP_HOLD_MARGIN_MV = 5
 
 
@@ -1118,8 +1158,10 @@ def safety_hold_cleared(
     current_voltage,
     max_droop_mv,
     power_fault,
+    core_current=None,
+    max_core_amps=None,
 ):
-    """True when a power, sag, droop, or fault hold may release.
+    """True when a power, current, sag, droop, or fault hold may release.
 
     Power and droop have to be back inside their caps. Input has to be back
     at its floor. A power fault or a missing power reading keeps the hold.
@@ -1130,6 +1172,9 @@ def safety_hold_cleared(
         return False
     if not _at_or_under(power, max_watts, POWER_HOLD_MARGIN_WATTS):
         return False
+    if _as_float(max_core_amps) is not None and _as_float(core_current) is not None:
+        if not _at_or_under(core_current, max_core_amps, CURRENT_HOLD_MARGIN_AMPS):
+            return False
     if (
         min_input_voltage is not None
         and input_voltage is not None
@@ -1149,7 +1194,7 @@ def safety_hold_cleared(
 def _safety_hold_kind(reason):
     """'power' or 'input' when this retreat should block the next climb."""
     wall = wall_type_from_reason(reason)
-    if wall in ("power", "input"):
+    if wall in ("power", "input", "current"):
         return wall
     return ""
 
@@ -1359,6 +1404,8 @@ def decide_adjustment(
     above_target_high=False,
     droop_voltage=None,
     max_climb_steps=1,
+    core_current=None,
+    max_core_amps=None,
 ):
     """Choose the next frequency and voltage.
 
@@ -1375,6 +1422,8 @@ def decide_adjustment(
     `max_climb_steps` lets a climb take more than one frequency step while
     errors are at most half the budget and `climb_frequency_steps` finds the
     headroom. The climb still stops short of `blocked_frequency`.
+    `core_current` over `max_core_amps` steps down like power. A climb or a
+    voltage raise that would carry the current past the cap does not happen.
     `tier_list`, `expected_hashrate`, and `shares_rejected_delta` stay in the
     signature so older callers keep working.
     """
@@ -1391,6 +1440,9 @@ def decide_adjustment(
     over_temp = temp_value is not None and temp_value > max_temp
     over_power = power_value is not None and power_value > max_watts
     over_vr = vr_value is not None and vr_value > max_vr_temp
+    over_current = _over_current(core_current, max_core_amps)
+    current_value = _as_float(core_current)
+    current_cap = _as_float(max_core_amps)
     error = _as_float(error_percentage)
     error_budget = (
         DEFAULT_MAX_ERROR_PERCENTAGE
@@ -1398,8 +1450,13 @@ def decide_adjustment(
         else float(max_error_percentage)
     )
     near_trip = near_firmware_trip(temp_value, vr_value)
-    if over_temp or over_power or over_vr or near_trip:
-        tag = None if (over_temp or over_vr) else "power limit"
+    if over_temp or over_power or over_vr or near_trip or over_current:
+        if over_temp or over_vr:
+            tag = None
+        elif over_current and not over_power:
+            tag = "current limit"
+        else:
+            tag = "power limit"
         frequency_steps = 1
         voltage_steps = 0
         shed_at_floor = True
@@ -1603,11 +1660,20 @@ def decide_adjustment(
                 max_volt,
                 "restore voltage",
             )
+        # Core current grows about in proportion to voltage at a fixed clock.
+        raise_crosses_current = (
+            current_value is not None
+            and current_value > 0
+            and current_cap is not None
+            and current_value * (current_voltage + voltage_step) / current_voltage
+            > current_cap
+        )
         if (
             phase == "hold"
             or thermal_hold
             or safety_hold
             or current_voltage >= max_volt
+            or raise_crosses_current
         ):
             return _apply_step_down(
                 current_frequency,
@@ -1699,6 +1765,15 @@ def decide_adjustment(
     if vr_value is None:
         return current_frequency, current_voltage, "holding for telemetry"
 
+    # Core current grows in proportion to frequency at a fixed voltage.
+    if (
+        current_value is not None
+        and current_cap is not None
+        and current_value * (current_frequency + frequency_step) / current_frequency
+        > current_cap
+    ):
+        return current_frequency, current_voltage, "holding at current limit"
+
     steps = 1
     if error <= error_budget / 2:
         steps = climb_frequency_steps(
@@ -1713,6 +1788,8 @@ def decide_adjustment(
             vr_tolerance,
             frequency_step,
             max_climb_steps,
+            current_value,
+            current_cap,
         )
     new_frequency = min(max_freq, current_frequency + frequency_step * steps)
     blocked = coerce_limit(blocked_frequency)
@@ -1947,6 +2024,7 @@ RAMP_MAX_SETTLES = 3
 RAMP_HEADROOM_C = 6.0
 RAMP_POWER_HEADROOM_W = 2.0
 RAMP_INPUT_HEADROOM_V = 0.05
+RAMP_CURRENT_HEADROOM_A = 1.5
 RAMP_MAX_JUMP_MHZ = 100
 # One jump covers this share of the estimated distance. The estimate improves
 # with every jump, so the last ones are short.
@@ -2023,6 +2101,7 @@ def ramp_target(
     frequency_step,
     voltage_step,
     min_input_voltage=None,
+    max_core_amps=None,
 ):
     """The next fast-start jump as `(frequency, voltage, aim_frequency, aim_temp)`.
 
@@ -2032,8 +2111,8 @@ def ramp_target(
     share plus a term in f·V², scaled from this reading. Heat follows a line
     fitted through all the readings; with only one, the line runs through
     0 °C, which over-states the rise. The aim is the highest clock whose
-    projection stays RAMP_HEADROOM_C under both temperature caps and under the
-    power cap. One jump covers RAMP_FRACTION of the way, at most
+    projection stays RAMP_HEADROOM_C under both temperature caps, under the
+    power cap, and RAMP_CURRENT_HEADROOM_A under `max_core_amps`. One jump covers RAMP_FRACTION of the way, at most
     RAMP_MAX_JUMP_MHZ.
 
     None when fine tuning should take over: the aim is within RAMP_DONE_MHZ,
@@ -2066,6 +2145,11 @@ def ramp_target(
     temp_cap = limits["max_temp"] - RAMP_HEADROOM_C
     vr_cap = limits["max_vr_temp"] - RAMP_HEADROOM_C
     watts_cap = limits["max_watts"] - RAMP_POWER_HEADROOM_W
+    amps_cap = (
+        None
+        if _as_float(max_core_amps) is None
+        else float(max_core_amps) - RAMP_CURRENT_HEADROOM_A
+    )
     step = max(int(frequency_step), 1)
 
     def clocks_at(clock):
@@ -2079,10 +2163,12 @@ def ramp_target(
         _clock, volts = clocks_at(clock)
         watts = BOARD_POWER_W + scale * clock * (volts / 1000.0) ** 2
         projected = asic[0] + asic[1] * watts
+        amps = (watts - BOARD_POWER_W) / (volts / 1000.0)
         if (
             projected > temp_cap
             or regulator[0] + regulator[1] * watts > vr_cap
             or watts > watts_cap
+            or (amps_cap is not None and amps > amps_cap)
         ):
             break
         aim = clock
@@ -2096,7 +2182,7 @@ def ramp_target(
     return next_frequency, next_voltage, aim, aim_temp
 
 
-def _ramp_breach(info, clocks, limits, min_input_voltage):
+def _ramp_breach(info, clocks, limits, min_input_voltage, max_core_amps=None):
     """Plain text for a limit this reading crosses at the ramp clocks, or ""."""
     temp = _usable_temp(info.get("temp"))
     vr_temp = _usable_temp(info.get("vrTemp"))
@@ -2107,6 +2193,8 @@ def _ramp_breach(info, clocks, limits, min_input_voltage):
         return "power fault"
     if power is not None and power <= ASIC_OFF_POWER_WATTS:
         return "the ASIC is off"
+    if _over_current(core_current_amps(info), max_core_amps):
+        return "the core current limit"
     if _needs_immediate_retreat(
         temp,
         vr_temp,
@@ -2139,6 +2227,7 @@ def _ramp_settle(
     settle_seconds,
     min_input_voltage,
     stop_event,
+    max_core_amps=None,
 ):
     """Hold `clocks` until the chip settles.
 
@@ -2165,7 +2254,7 @@ def _ramp_settle(
             if time.time() - began > settle_seconds * RAMP_MAX_SETTLES:
                 return None, info, "the miner did not take the new clocks"
             continue
-        problem = _ramp_breach(info, clocks, limits, min_input_voltage)
+        problem = _ramp_breach(info, clocks, limits, min_input_voltage, max_core_amps)
         if problem:
             return None, info, problem
         polls.append(
@@ -2230,6 +2319,7 @@ def ramp_session(
     max_error_percentage,
     stop_event,
     log_callback,
+    max_core_amps=None,
 ):
     """Fast start: jump from the start clocks toward the heat caps.
 
@@ -2278,6 +2368,7 @@ def ramp_session(
             settle_seconds,
             min_input_voltage,
             stop_event,
+            max_core_amps,
         )
         if settled is None:
             return None
@@ -2330,6 +2421,7 @@ def ramp_session(
             frequency_step,
             voltage_step,
             min_input_voltage,
+            max_core_amps,
         )
         history.append(sample)
         if target is not None and failed_frequency is not None:
@@ -2374,6 +2466,7 @@ def opening_setpoint(
     min_input_voltage,
     max_error_percentage,
     max_droop_mv,
+    max_core_amps=None,
 ):
     """Clocks for the first write. A live breach lowers them. A cool chip does not climb."""
     if not isinstance(info, dict):
@@ -2407,6 +2500,8 @@ def opening_setpoint(
         phase="climb",
         max_error_percentage=max_error_percentage,
         vr_temp_tolerance=vr_temp_tolerance,
+        core_current=core_current_amps(info),
+        max_core_amps=max_core_amps,
     )
     if (new_frequency < frequency or new_voltage < voltage) and _is_safety_retreat(
         reason
@@ -2514,6 +2609,7 @@ def monitor_and_adjust(
         record, "max_error_percentage", DEFAULT_MAX_ERROR_PERCENTAGE
     )
     max_droop_mv = _record_float(record, "max_droop_mv", DEFAULT_MAX_DROOP_MV)
+    max_core_amps = core_amps_cap(record)
 
     start_frequency = coerce_limit(start_freq)
     start_voltage = coerce_limit(start_volt)
@@ -2565,6 +2661,7 @@ def monitor_and_adjust(
             min_input_voltage,
             max_error_percentage,
             max_droop_mv,
+            max_core_amps,
         )
 
     _apply_fan(bitaxe_ip, dict(MANUAL_FULL_FAN), log_callback)
@@ -2617,6 +2714,7 @@ def monitor_and_adjust(
             max_error_percentage,
             event,
             log_callback,
+            max_core_amps,
         )
         if ramped is None:
             log_callback(f"{bitaxe_ip} -> Autotuning stopped.", "warning")
@@ -2758,6 +2856,7 @@ def monitor_and_adjust(
                 max_droop_mv = _record_float(
                     record, "max_droop_mv", DEFAULT_MAX_DROOP_MV
                 )
+                max_core_amps = core_amps_cap(record)
                 limits = refresh_running_limits(limits, record)
                 last_config_refresh = now
 
@@ -3241,6 +3340,8 @@ def monitor_and_adjust(
                 max_droop_mv,
                 info.get("power_fault"),
                 info.get("overheat_mode"),
+                core_current_amps(info),
+                max_core_amps,
             )
             if retreat_clocks is None:
                 immediate_retreat = False
@@ -3397,6 +3498,8 @@ def monitor_and_adjust(
                 droop_reference if droop_reference is not None else confirmed[1],
                 max_droop_mv,
                 info.get("power_fault"),
+                core_current_amps(info),
+                max_core_amps,
             ):
                 safety_hold = ""
             if frequency_block_cleared(
@@ -3867,6 +3970,8 @@ def monitor_and_adjust(
                 "min_input_voltage": min_input_voltage,
                 "core_voltage_actual": _as_float(info.get("coreVoltageActual")),
                 "max_droop_mv": max_droop_mv,
+                "core_current": core_current_amps(info),
+                "max_core_amps": max_core_amps,
                 "droop_voltage": droop_reference,
                 "power_fault": info.get("power_fault"),
                 "phase": phase,

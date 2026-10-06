@@ -79,6 +79,7 @@ class DisplayHelperTests(unittest.TestCase):
             ("power", "power"),
             ("reject", "rejected shares"),
             ("input", "input sag"),
+            ("current", "core current"),
         ):
             self.assertEqual(live_limit({"wall_type": wall}), label)
         self.assertEqual(live_limit({}), "")
@@ -904,6 +905,24 @@ class SnapshotTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["notice"]["title"], "Restart Failed")
         self.assertNotEqual(result["notice"]["title"], "Restart Triggered")
+
+    def test_core_current_cap_defaults_for_old_miners_and_never_passes_29(self):
+        miner = config.new_miner_record(
+            "BM1370 601", "10.0.0.8", "Alpha", config.get_default_config()
+        )
+        miner.pop("max_core_amps")
+        with temp_config([miner]):
+            app = TunerDashboard()
+            row = app.get_autotuner_settings()["miners"][0]
+            self.assertEqual(row["fields"]["max_core_amps"], "28.0")
+            fields = dict(row["fields"], max_core_amps="35")
+            saved = app.save_autotuner_settings(
+                [{"ip": "10.0.0.8", "enabled": True, "fields": fields}]
+            )
+            self.assertTrue(saved["ok"])
+            stored = config.get_miners()[0]
+            self.assertEqual(stored["max_core_amps"], 29.0)
+            self.assertTrue(stored["enabled"])
 
     def test_fast_start_is_on_by_default_and_saves(self):
         with temp_config():

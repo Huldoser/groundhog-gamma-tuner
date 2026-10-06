@@ -1604,6 +1604,105 @@ class DecisionTests(unittest.TestCase):
         self.assertEqual([level for level, _message in logs], ["warning", "error"])
         self.assertIn("No reply for 60 s", logs[1][1])
 
+    def test_core_current_reads_milliamps_and_the_cap_stays_under_the_fault(self):
+        self.assertEqual(autotune.core_current_amps({"current": 26100}), 26.1)
+        self.assertEqual(autotune.core_current_amps({"current": 26.1}), 26.1)
+        self.assertIsNone(autotune.core_current_amps({"current": 0}))
+        self.assertIsNone(autotune.core_current_amps({}))
+        self.assertEqual(autotune.core_amps_cap({}), 28.0)
+        self.assertEqual(autotune.core_amps_cap({"max_core_amps": ""}), 28.0)
+        self.assertEqual(autotune.core_amps_cap({"max_core_amps": 26}), 26.0)
+        self.assertEqual(autotune.core_amps_cap({"max_core_amps": 35}), 29.0)
+
+    def test_core_current_over_the_cap_steps_down_and_blocks_the_climb(self):
+        base = {
+            "current_frequency": 1000,
+            "current_voltage": 1350,
+            "max_freq": 1100,
+            "max_watts": 50,
+            "max_temp": 68,
+            "max_vr_temp": 88,
+            "power": 40,
+            "max_core_amps": 28,
+        }
+        over = autotune.decide_adjustment(**_limits(**base, core_current=28.4))
+        self.assertEqual(over[0], 995)
+        self.assertIn("current limit", over[2])
+        self.assertEqual(autotune.wall_type_from_reason(over[2]), "current")
+        # 27.9 A now would be 28.04 A one step up. Hold instead of crossing.
+        held = autotune.decide_adjustment(**_limits(**base, core_current=27.9))
+        self.assertEqual(held, (1000, 1350, "holding at current limit"))
+        room = autotune.decide_adjustment(**_limits(**base, core_current=25.0))
+        self.assertEqual(room[2], "increase frequency")
+        # Errors with no current room for a voltage step retreat frequency.
+        errors = autotune.decide_adjustment(
+            **_limits(**base, core_current=27.9, error_percentage=5)
+        )
+        self.assertEqual(errors[:2], (995, 1350))
+        self.assertTrue(
+            autotune._needs_immediate_retreat(
+                **{
+                    **dict(
+                        temp=45,
+                        vr_temp=40,
+                        power=40,
+                        max_temp=68,
+                        max_vr_temp=88,
+                        max_watts=50,
+                        input_voltage=5.1,
+                        min_input_voltage=4.9,
+                        core_voltage_actual=None,
+                        current_voltage=1350,
+                        max_droop_mv=40,
+                        power_fault=None,
+                        overheat_mode=0,
+                    ),
+                    "core_current": 28.4,
+                    "max_core_amps": 28,
+                }
+            )
+        )
+        hold = dict(
+            power=40,
+            max_watts=50,
+            input_voltage=5.1,
+            min_input_voltage=4.9,
+            core_voltage_actual=None,
+            current_voltage=1350,
+            max_droop_mv=40,
+            power_fault=None,
+            max_core_amps=28,
+        )
+        self.assertFalse(autotune.safety_hold_cleared(**hold, core_current=27.5))
+        self.assertTrue(autotune.safety_hold_cleared(**hold, core_current=26.9))
+
+    def test_ramp_target_stays_under_the_current_cap(self):
+        limits = {
+            "max_temp": 68,
+            "max_vr_temp": 88,
+            "max_watts": 60,
+            "max_freq": 1100,
+            "max_volt": 1300,
+        }
+        sample = {
+            "frequency": 525,
+            "voltage": 1150,
+            "power": 20.0,
+            "temp": 30.0,
+            "vr_temp": 35.0,
+            "input_voltage": 5.1,
+        }
+        history = [dict(sample, frequency=500, power=19.0, temp=29.5, vr_temp=34.5)]
+        free = autotune.ramp_target(sample, history, limits, (525, 1150), 5, 10)
+        capped = autotune.ramp_target(
+            sample, history, limits, (525, 1150), 5, 10, max_core_amps=20
+        )
+        self.assertLess(capped[2], free[2])
+        aim_volts = autotune.ramp_voltage(capped[2], 525, 1150, 1150, 1300, 10)
+        scale = (20.0 - autotune.BOARD_POWER_W) / (525 * 1.15**2)
+        amps = scale * capped[2] * (aim_volts / 1000) ** 2 / (aim_volts / 1000)
+        self.assertLessEqual(amps, 20 - autotune.RAMP_CURRENT_HEADROOM_A)
+
     def test_ramp_voltage_follows_its_line_inside_the_bounds(self):
         args = {"start_frequency": 525, "start_voltage": 1150, "voltage_step": 10}
         self.assertEqual(
@@ -5734,6 +5833,7 @@ class InstallAndConfigTests(unittest.TestCase):
                 "vr_level": "",
                 "error_alert": False,
                 "watts_alert": False,
+                "watts_title": "",
                 "vin_alert": False,
                 "floor_alert": False,
                 "name_title": "",

@@ -32,6 +32,12 @@ HARD_MAX_VOLT = 1400
 DEFAULT_MIN_INPUT_VOLTAGE = 4.9
 DEFAULT_MAX_ERROR_PERCENTAGE = 2.0
 DEFAULT_MAX_DROOP_MV = 40
+# Regulator output current. AxeOS sets the Gamma's TPS546 to warn at 25 A and
+# shut down with no retry at 30 A. The tuner stays at or under this cap, and a
+# saved cap is never above HARD_MAX_CORE_AMPS. At 1.4 V, 28 A is also about
+# 44 W at the 5 V plug.
+DEFAULT_MAX_CORE_AMPS = 28.0
+HARD_MAX_CORE_AMPS = 29.0
 # Settings and learned values an older version saved. Each session now starts
 # fresh, so they are dropped on load and save.
 RETIRED_GLOBAL_KEYS = (
@@ -79,6 +85,7 @@ GAMMA601_LIMITS = {
     "min_input_voltage": DEFAULT_MIN_INPUT_VOLTAGE,
     "max_error_percentage": DEFAULT_MAX_ERROR_PERCENTAGE,
     "max_droop_mv": DEFAULT_MAX_DROOP_MV,
+    "max_core_amps": DEFAULT_MAX_CORE_AMPS,
 }
 
 

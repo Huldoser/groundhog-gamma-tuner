@@ -33,6 +33,8 @@ from autotune import (
     _publish_status,
     coerce_limit,
     coerce_real_limit,
+    core_amps_cap,
+    core_current_amps,
     fast_start_enabled,
     get_miner_status,
     get_system_info,
@@ -47,8 +49,10 @@ from autotune import (
 )
 from config import (
     CONFIG_CORRUPT_MESSAGE,
+    DEFAULT_MAX_CORE_AMPS,
     DEFAULT_MAX_DROOP_MV,
     GAMMA601_LIMITS,
+    HARD_MAX_CORE_AMPS,
     HARD_MAX_FREQ,
     HARD_MAX_VOLT,
     HARD_MIN_FREQ,
@@ -97,7 +101,11 @@ LIMIT_FIELDS = (
     ("min_input_voltage", "Input voltage (V)"),
     ("max_error_percentage", "Error %"),
     ("max_droop_mv", "Droop (mV)"),
+    ("max_core_amps", "Core current (A)"),
 )
+# Limits added after miners were already saved. A miner without one shows the
+# default instead of a blank, which Save would read as "turn this miner off".
+NEW_LIMIT_DEFAULTS = {"max_core_amps": DEFAULT_MAX_CORE_AMPS}
 ALL_AUTOTUNE_FIELDS = tuple(
     field for field, _label in (*FREQ_FIELDS, *VOLT_FIELDS, *LIMIT_FIELDS)
 )
@@ -176,6 +184,9 @@ def parse_autotuner_value(field, raw):
         "max_vr_temp",
     ):
         return value
+    if field == "max_core_amps":
+        # The regulator shuts down with no retry at 30 A.
+        return max(1.0, min(HARD_MAX_CORE_AMPS, value))
     number = int(value)
     if field in ("min_freq", "max_freq", "start_freq"):
         return max(HARD_MIN_FREQ, min(HARD_MAX_FREQ, number))
@@ -218,6 +229,7 @@ _LIMIT_LABELS = {
     "power": "power",
     "reject": "rejected shares",
     "input": "input sag",
+    "current": "core current",
 }
 
 
@@ -892,6 +904,7 @@ def blank_miner_row(nickname, ip):
         "vr_level": "",
         "error_alert": False,
         "watts_alert": False,
+        "watts_title": "",
         "vin_alert": False,
         "floor_alert": False,
         "name_title": "",
@@ -2303,7 +2316,7 @@ class TunerDashboard:
         for miner in miners:
             fields = {}
             for field in ALL_AUTOTUNE_FIELDS:
-                display = miner.get(field, "")
+                display = miner.get(field, NEW_LIMIT_DEFAULTS.get(field, ""))
                 fields[field] = "" if display is None else str(display)
             nickname = miner.get("nickname") or miner["ip"]
             rows.append(
@@ -2535,8 +2548,13 @@ class TunerDashboard:
             _configured_tolerance(settings, "vr_temp_tolerance"),
         )
         row["error_alert"] = over_limit(error, stored.get("max_error_percentage"))
+        amps = core_current_amps(miner_data)
+        amps_cap = core_amps_cap(stored)
         row["watts_alert"] = over_limit(
             miner_data.get("power"), stored.get("max_watts")
+        ) or (amps is not None and amps > amps_cap)
+        row["watts_title"] = (
+            "" if amps is None else f"Core current {amps:.1f} A of {amps_cap:g} A"
         )
         row["vin_alert"] = under_limit(
             normalize_input_voltage(miner_data.get("voltage")),
