@@ -32,7 +32,20 @@ HARD_MAX_VOLT = 1400
 DEFAULT_MIN_INPUT_VOLTAGE = 4.9
 DEFAULT_MAX_ERROR_PERCENTAGE = 2.0
 DEFAULT_MAX_DROOP_MV = 40
-DEFAULT_CEILING_SOAK_SECONDS = 30 * 60
+# Settings and learned values an older version saved. Each session now starts
+# fresh, so they are dropped on load and save.
+RETIRED_GLOBAL_KEYS = (
+    "daily_reset_enabled",
+    "daily_reset_time",
+    "ceiling_soak_seconds",
+)
+RETIRED_MINER_KEYS = (
+    "last_good_freq",
+    "last_good_volt",
+    "wall_type",
+    "wall_timestamp",
+    "target_hashrate",
+)
 
 # AxeOS v2.15.1 cuts ASIC power above 75°C on the ASIC or 105°C on the regulator.
 # After it cools, it saves clocks 100 MHz and 100 mV lower, with no floor.
@@ -275,7 +288,7 @@ def load_config():
             _config_corrupt = False
             return default
 
-        _drop_daily_reset(loaded)
+        _drop_retired_keys(loaded)
         _last_good_config = copy.deepcopy(loaded)
         _config_corrupt = False
         return loaded
@@ -291,7 +304,7 @@ def save_config(config):
     with _config_lock:
         if _config_corrupt and _last_good_config is None:
             return False
-        _drop_daily_reset(config)
+        _drop_retired_keys(config)
         _write_config(config)
         _last_good_config = copy.deepcopy(config)
         _config_corrupt = False
@@ -316,11 +329,16 @@ def modify_config(mutator):
         return config
 
 
-def _drop_daily_reset(config):
-    """Daily reset is no longer a setting. Drop leftover keys on load and save."""
-    if isinstance(config, dict):
-        config.pop("daily_reset_enabled", None)
-        config.pop("daily_reset_time", None)
+def _drop_retired_keys(config):
+    """Drop settings and learned setpoints an older version saved."""
+    if not isinstance(config, dict):
+        return
+    for key in RETIRED_GLOBAL_KEYS:
+        config.pop(key, None)
+    for miner in config.get("miners") or []:
+        if isinstance(miner, dict):
+            for key in RETIRED_MINER_KEYS:
+                miner.pop(key, None)
 
 
 def _write_config(config):
@@ -351,17 +369,12 @@ def gamma_601_limits(config=None):
 
 
 def new_miner_record(miner_type, ip, nickname, config=None):
-    """A miner row with empty learned fields. Limits are filled by gamma_601_limits."""
+    """A new miner row. Limits are filled by gamma_601_limits."""
     record = {
         "nickname": nickname,
         "type": miner_type,
         "ip": ip,
         "enabled": True,
-        "last_good_freq": "",
-        "last_good_volt": "",
-        "wall_type": "",
-        "wall_timestamp": "",
-        "target_hashrate": "",
         "repasted_on": "",
     }
     for key in GAMMA601_LIMITS:
@@ -380,7 +393,7 @@ def get_default_config():
         "temp_tolerance": 3,
         "vr_temp_tolerance": 3,
         "refresh_interval": 180,
-        "ceiling_soak_seconds": DEFAULT_CEILING_SOAK_SECONDS,
+        "fast_start": True,
         "flatline_detection_enabled": False,
         "flatline_hashrate_repeat_count": 5,
         "miners": [],

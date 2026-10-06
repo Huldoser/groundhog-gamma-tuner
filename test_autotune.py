@@ -20,6 +20,7 @@ FAST_CONFIG = {
     "flatline_detection_enabled": False,
     "flatline_hashrate_repeat_count": 5,
     "max_climb_steps": 1,
+    "fast_start": False,
 }
 
 
@@ -1303,35 +1304,6 @@ class DecisionTests(unittest.TestCase):
             )
         )
 
-    def test_stop_remembers_the_probe_it_left_not_the_unconfirmed_climb(self):
-        self.assertEqual(
-            autotune.setpoint_to_remember(
-                (405, 1100), {"from_freq": 400, "from_volt": 1100}, (405, 1100)
-            ),
-            (400, 1100),
-        )
-        self.assertEqual(
-            autotune.setpoint_to_remember((500, 1100), None, (495, 1100)),
-            (495, 1100),
-        )
-        self.assertEqual(
-            autotune.setpoint_to_remember((400, 1100), None, None), (400, 1100)
-        )
-        self.assertEqual(
-            autotune.setpoint_to_remember(
-                (400, 1090),
-                {
-                    "from_freq": 400,
-                    "from_volt": 1100,
-                    "to_freq": 400,
-                    "to_volt": 1090,
-                    "restore": True,
-                },
-                (400, 1100),
-            ),
-            (400, 1100),
-        )
-
     def test_running_session_picks_up_a_lower_temperature_cap(self):
         limits = {
             "min_freq": 400,
@@ -1587,6 +1559,116 @@ class DecisionTests(unittest.TestCase):
         )
         self.assertFalse(
             autotune.hold_may_reclimb(None, 64, 0, limit, error_percentage=0.5, **args)
+        )
+
+    def test_reply_problem_names_the_failure_plainly(self):
+        prefix = "Error fetching system info from 10.0.0.8: "
+        cases = {
+            "HTTPConnectionPool(host='10.0.0.8', port=80): Read timed out.": "timed out",
+            "[Errno 111] Connection refused": "connection refused",
+            "[Errno 113] No route to host": "unreachable",
+            "('Connection aborted.', ConnectionResetError(104))": "connection dropped",
+            "Expecting value: line 1 column 1 (char 0)": "bad reply",
+            "something else": "connection error",
+        }
+        for text, plain in cases.items():
+            self.assertEqual(autotune.reply_problem(prefix + text), plain, text)
+
+    def test_reply_watch_logs_a_gap_once_and_its_end(self):
+        clock = {"now": 0.0}
+        logs = []
+        watch = autotune.ReplyWatch(
+            "10.0.0.8",
+            lambda message, level="info": logs.append((level, message)),
+            clock=lambda: clock["now"],
+        )
+        watch.answered()
+        self.assertEqual(logs, [])
+        for second in (0, 5, 10):
+            clock["now"] = second
+            watch.failed("Read timed out")
+        clock["now"] = 15
+        watch.answered()
+        self.assertEqual(
+            logs,
+            [
+                ("warning", "10.0.0.8 -> No reply (timed out). Retrying."),
+                ("info", "10.0.0.8 -> Answering again after 15 s (3 missed reads)."),
+            ],
+        )
+        # A long gap gets one error, not one per poll.
+        logs.clear()
+        for second in range(100, 200, 5):
+            clock["now"] = second
+            watch.failed("Connection refused")
+        self.assertEqual([level for level, _message in logs], ["warning", "error"])
+        self.assertIn("No reply for 60 s", logs[1][1])
+
+    def test_ramp_voltage_follows_its_line_inside_the_bounds(self):
+        args = {"start_frequency": 525, "start_voltage": 1150, "voltage_step": 10}
+        self.assertEqual(
+            autotune.ramp_voltage(625, floor_voltage=1150, max_volt=1300, **args), 1180
+        )
+        # Errors already asked for more. The ramp keeps it.
+        self.assertEqual(
+            autotune.ramp_voltage(625, floor_voltage=1200, max_volt=1300, **args), 1200
+        )
+        self.assertEqual(
+            autotune.ramp_voltage(1100, floor_voltage=1150, max_volt=1300, **args), 1300
+        )
+
+    def test_thermal_fit_needs_spread_and_keeps_a_sane_slope(self):
+        ambient, slope = autotune.thermal_fit([(16, 34), (20, 38), (24, 42)])
+        self.assertAlmostEqual(slope, 1.0)
+        self.assertAlmostEqual(ambient, 18.0)
+        self.assertIsNone(autotune.thermal_fit([(16, 34)]))
+        self.assertIsNone(autotune.thermal_fit([(16, 34), (16.5, 36)]))
+        # A cooler reading at more power is noise, not a chip that cools as it works.
+        _ambient, slope = autotune.thermal_fit([(16, 40), (20, 38)])
+        self.assertEqual(slope, autotune.RAMP_MIN_C_PER_W)
+
+    def test_ramp_target_jumps_toward_the_projected_heat_cap(self):
+        limits = {
+            "max_temp": 68,
+            "max_vr_temp": 88,
+            "max_watts": 50,
+            "max_freq": 1100,
+            "max_volt": 1300,
+        }
+        sample = {
+            "frequency": 525,
+            "voltage": 1150,
+            "power": 20.0,
+            "temp": 45.0,
+            "vr_temp": 50.0,
+            "input_voltage": 5.1,
+        }
+        # One reading: heat is projected through 0 °C, and a jump is capped.
+        frequency, voltage, aim, aim_temp = autotune.ramp_target(
+            sample, [], limits, (525, 1150), 5, 10, 4.9
+        )
+        self.assertEqual((frequency, voltage), (625, 1180))
+        self.assertLessEqual(aim_temp, 68 - autotune.RAMP_HEADROOM_C)
+        self.assertGreater(aim, 625)
+        # With a fitted line the aim moves out, but never past the caps.
+        hotter = dict(sample, frequency=625, voltage=1180, power=24.0, temp=49.0)
+        frequency, _voltage, aim, aim_temp = autotune.ramp_target(
+            hotter, [sample], limits, (525, 1150), 5, 10, 4.9
+        )
+        self.assertGreater(frequency, 625)
+        self.assertLessEqual(aim_temp, 62)
+        # Near the cap, short of input headroom, or missing a reading: fine tuning.
+        near = dict(hotter, temp=61.0)
+        self.assertIsNone(
+            autotune.ramp_target(near, [], limits, (525, 1150), 5, 10, 4.9)
+        )
+        sagging = dict(sample, input_voltage=4.93)
+        self.assertIsNone(
+            autotune.ramp_target(sagging, [], limits, (525, 1150), 5, 10, 4.9)
+        )
+        blind = dict(sample, vr_temp=None)
+        self.assertIsNone(
+            autotune.ramp_target(blind, [], limits, (525, 1150), 5, 10, 4.9)
         )
 
     def test_a_cool_hold_or_trim_on_the_frequency_floor_climbs(self):
@@ -2081,49 +2163,6 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(calls, [])
         self.assertTrue(any("errorPercentage" in message for message in logs))
 
-    def test_stopped_tuner_saves_the_confirmed_clocks(self):
-        runtime = dict(FAST_CONFIG)
-        runtime["miners"] = [{"ip": "miner", "wall_type": "thermal"}]
-        runtime["refresh_interval"] = 30
-        updates = []
-        stop_event = threading.Event()
-
-        def log(message, level="info"):
-            if "Confirmed" in message:
-                stop_event.set()
-
-        def update(ip, settings):
-            updates.append((ip, dict(settings)))
-
-        with (
-            patched_io(
-                lambda ip: _info(frequency=400, voltage=1100, temp=40, vrTemp=30),
-                lambda ip, volt, freq: (
-                    f"{ip} -> Applied settings: Voltage = {volt}mV, Frequency = {freq}MHz"
-                ),
-                runtime_config=runtime,
-            ),
-            mock.patch.object(autotune, "update_miner", update),
-        ):
-            thread = _start_miner(
-                "miner",
-                stop_event,
-                log,
-                max_freq=400,
-                start_freq=400,
-                start_volt=1100,
-            )
-            thread.join(2)
-
-        self.assertFalse(thread.is_alive())
-        self.assertTrue(updates)
-        ip, saved = updates[-1]
-        self.assertEqual(ip, "miner")
-        self.assertEqual(saved["last_good_freq"], 400)
-        self.assertEqual(saved["last_good_volt"], 1100)
-        self.assertEqual(saved["wall_type"], "thermal")
-        self.assertTrue(saved["wall_timestamp"])
-
     def test_stop_before_confirm_does_not_save_clocks(self):
         runtime = dict(FAST_CONFIG)
         runtime["miners"] = [{"ip": "miner", "wall_type": "thermal"}]
@@ -2148,31 +2187,6 @@ class SessionTests(unittest.TestCase):
 
         self.assertFalse(thread.is_alive())
         self.assertEqual(updates, [])
-
-    def test_resume_uses_saved_setpoint(self):
-        calls = []
-        stop_event = threading.Event()
-
-        def set_settings(ip, volt, freq):
-            calls.append((int(freq), int(volt)))
-            stop_event.set()
-            return (
-                f"{ip} -> Applied settings: Voltage = {volt}mV, Frequency = {freq}MHz"
-            )
-
-        runtime = dict(FAST_CONFIG)
-        runtime["miners"] = [
-            {
-                "ip": "miner",
-                "last_good_freq": 640,
-                "last_good_volt": 1200,
-                "wall_type": "silicon",
-            }
-        ]
-        with patched_io(lambda ip: _info(), set_settings, runtime_config=runtime):
-            thread = _start_miner("miner", stop_event, lambda *args: None)
-            thread.join(2)
-        self.assertEqual(calls[0], (640, 1200))
 
     def test_hot_chip_drops_once_then_waits_for_the_heatsink(self):
         state = {"frequency": 500, "voltage": 1100}
@@ -3098,59 +3112,6 @@ class SessionTests(unittest.TestCase):
         self.assertIn((400, 1100), state["calls"])
         self.assertFalse(any(volt < 1090 for _freq, volt in state["calls"]))
 
-    def test_stop_during_voltage_restore_keeps_the_restored_voltage(self):
-        state = {"frequency": 400, "voltage": 1100, "calls": []}
-        updates = []
-        stop_event = threading.Event()
-        runtime = dict(FAST_CONFIG)
-        runtime["miners"] = [{"ip": "miner", "wall_type": ""}]
-
-        def set_settings(ip, volt, freq):
-            freq = int(freq)
-            volt = int(volt)
-            state["calls"].append((freq, volt))
-            restoring = (
-                any(seen_volt < 1100 for _seen_freq, seen_volt in state["calls"][:-1])
-                and volt == 1100
-            )
-            if not restoring:
-                state["frequency"] = freq
-                state["voltage"] = volt
-            else:
-                stop_event.set()
-            return (
-                f"{ip} -> Applied settings: Voltage = {volt}mV, Frequency = {freq}MHz"
-            )
-
-        def get_info(ip):
-            rate = 1000 if state["voltage"] >= 1100 else 900
-            return _info(
-                frequency=state["frequency"],
-                voltage=state["voltage"],
-                hashRate=rate,
-                hashRate_1m=rate,
-                errorPercentage=0.2,
-                actualFrequency=state["frequency"],
-                temp=40,
-                vrTemp=30,
-                expectedHashrate=1000,
-            )
-
-        def update(ip, settings):
-            updates.append(dict(settings))
-
-        with (
-            patched_io(get_info, set_settings, runtime_config=runtime),
-            mock.patch.object(autotune, "update_miner", update),
-        ):
-            thread = _start_miner("miner", stop_event, lambda *args: None, max_freq=400)
-            thread.join(3)
-        self.assertFalse(thread.is_alive())
-        self.assertIn((400, 1090), state["calls"])
-        self.assertTrue(updates)
-        self.assertEqual(updates[-1]["last_good_freq"], 400)
-        self.assertEqual(updates[-1]["last_good_volt"], 1100)
-
     def test_error_retreat_does_not_climb_straight_back(self):
         state = {"frequency": 500, "voltage": 1400, "calls": [], "polls_after_drop": 0}
         stop_event = threading.Event()
@@ -3200,9 +3161,8 @@ class SessionTests(unittest.TestCase):
             any(freq >= 500 and volt == 1400 for freq, volt in state["calls"][2:])
         )
 
-    def test_silicon_retreat_trims_voltage_and_saves_the_lower_clock(self):
+    def test_silicon_retreat_at_max_voltage_trims_voltage(self):
         state = {"frequency": 500, "voltage": 1400, "calls": []}
-        updates = []
         logs = []
         stop_event = threading.Event()
         runtime = dict(FAST_CONFIG)
@@ -3233,16 +3193,10 @@ class SessionTests(unittest.TestCase):
                 vrTemp=30,
             )
 
-        def update(ip, settings):
-            updates.append((ip, dict(settings)))
-
         def log(message, level="info"):
             logs.append(message)
 
-        with (
-            patched_io(get_info, set_settings, runtime_config=runtime),
-            mock.patch.object(autotune, "update_miner", update),
-        ):
+        with patched_io(get_info, set_settings, runtime_config=runtime):
             thread = _start_miner(
                 "miner",
                 stop_event,
@@ -3260,12 +3214,57 @@ class SessionTests(unittest.TestCase):
         self.assertTrue(
             any("Frequency retreat. Trimming voltage." in message for message in logs)
         )
-        self.assertTrue(
-            any(
-                item.get("last_good_freq") == 495 and item.get("last_good_volt") == 1400
-                for _ip, item in updates
+
+    def test_a_session_starts_fresh_and_saves_nothing(self):
+        # Clocks an older version learned are ignored. Each session starts
+        # from the start clocks and writes nothing back to config.json.
+        state = {"frequency": 900, "voltage": 1300, "calls": []}
+        updates = []
+        stop_event = threading.Event()
+        runtime = dict(FAST_CONFIG)
+        runtime["miners"] = [
+            {
+                "ip": "miner",
+                "last_good_freq": 900,
+                "last_good_volt": 1300,
+                "wall_type": "thermal",
+            }
+        ]
+
+        def set_settings(ip, volt, freq):
+            state["calls"].append((int(freq), int(volt)))
+            state["frequency"] = int(freq)
+            state["voltage"] = int(volt)
+            if len(state["calls"]) >= 3:
+                stop_event.set()
+            return (
+                f"{ip} -> Applied settings: Voltage = {volt}mV, Frequency = {freq}MHz"
             )
-        )
+
+        def get_info(ip):
+            rate = state["frequency"] * 2.04
+            return _info(
+                frequency=state["frequency"],
+                voltage=state["voltage"],
+                hashRate=rate,
+                hashRate_1m=rate,
+                expectedHashrate=rate,
+                actualFrequency=state["frequency"],
+            )
+
+        with (
+            patched_io(get_info, set_settings, runtime_config=runtime),
+            mock.patch.object(
+                autotune,
+                "update_miner",
+                lambda ip, settings: updates.append(dict(settings)),
+            ),
+        ):
+            thread = _start_miner("miner", stop_event, lambda *args: None)
+            thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(state["calls"][0], (400, 1100))
+        self.assertEqual(updates, [])
 
     def test_hold_retreat_below_max_voltage_does_not_raise_voltage(self):
         state = {"frequency": 500, "voltage": 1100, "error": 0.2, "calls": []}
@@ -3315,6 +3314,104 @@ class SessionTests(unittest.TestCase):
         self.assertIn((495, 1100), state["calls"])
         self.assertIn((490, 1100), state["calls"])
         self.assertTrue(all(volt == 1100 for _freq, volt in state["calls"]))
+
+    def _fast_start_session(self, need_voltage=None, hot_above=None, **limits):
+        """Run a fast start on a miner whose heat follows its power.
+
+        Power is 5 W plus 0.022 W per MHz·V², the ASIC runs 25 °C plus 1 °C
+        per W, and the regulator 30 °C plus 1 °C per W. `need_voltage(f)` is
+        the voltage under which errors are 5%. Above `hot_above` MHz the ASIC
+        reads 75 °C. Stops at the first write after the ramp ends.
+        """
+        state = {"frequency": 400, "voltage": 1100, "calls": [], "done": False}
+        logs = []
+        stop_event = threading.Event()
+        runtime = dict(FAST_CONFIG, fast_start=True)
+
+        def set_settings(ip, volt, freq):
+            if state["done"]:
+                stop_event.set()
+            state["calls"].append((int(freq), int(volt)))
+            state["frequency"] = int(freq)
+            state["voltage"] = int(volt)
+            return (
+                f"{ip} -> Applied settings: Voltage = {volt}mV, Frequency = {freq}MHz"
+            )
+
+        def get_info(ip):
+            frequency = state["frequency"]
+            volts = state["voltage"] / 1000
+            power = 5 + 0.022 * frequency * volts * volts
+            temp = 25 + power
+            if hot_above is not None and frequency > hot_above:
+                temp = 75
+            short = need_voltage is not None and state["voltage"] < need_voltage(
+                frequency
+            )
+            rate = frequency * 2.04
+            return _info(
+                frequency=frequency,
+                voltage=state["voltage"],
+                temp=temp,
+                vrTemp=30 + power,
+                power=power,
+                hashRate=rate,
+                hashRate_1m=rate,
+                hashRate_10m=rate,
+                expectedHashrate=rate,
+                actualFrequency=frequency,
+                errorPercentage=5 if short else 0.2,
+            )
+
+        def log(message, level="info"):
+            logs.append(message)
+            if "Fast start" in message and "Fine tuning from" in message:
+                state["done"] = True
+
+        caps = {
+            "start_freq": 525,
+            "start_volt": 1150,
+            "max_freq": 1100,
+            "max_volt": 1300,
+            "max_temp": 68,
+            "max_watts": 50,
+            "max_vr_temp": 88,
+        }
+        caps.update(limits)
+        with patched_io(get_info, set_settings, runtime_config=runtime):
+            thread = _start_miner("miner", stop_event, log, **caps)
+            thread.join(5)
+        self.assertFalse(thread.is_alive())
+        return state["calls"], logs
+
+    def test_fast_start_jumps_toward_the_heat_cap_then_fine_tunes(self):
+        calls, logs = self._fast_start_session()
+        self.assertEqual(calls[0], (525, 1150))
+        self.assertGreaterEqual(calls[1][0] - calls[0][0], 50)
+        self.assertGreater(calls[1][1], calls[0][1])
+        # Fine tuning opens on the clocks the ramp ended on.
+        self.assertEqual(calls[-1], calls[-2])
+        frequency, voltage = calls[-1]
+        power = 5 + 0.022 * frequency * (voltage / 1000) ** 2
+        self.assertLessEqual(25 + power, 68 - autotune.RAMP_HEADROOM_C + 1)
+        self.assertGreater(frequency, 800)
+        self.assertTrue(any("Fast start done" in message for message in logs))
+
+    def test_fast_start_steps_back_when_a_limit_is_crossed(self):
+        calls, logs = self._fast_start_session(hot_above=700)
+        self.assertTrue(any(frequency > 700 for frequency, _volt in calls))
+        self.assertLessEqual(calls[-1][0], 700)
+        self.assertTrue(any("stepped back" in message for message in logs))
+
+    def test_fast_start_raises_voltage_for_errors_and_splits_a_failed_jump(self):
+        calls, logs = self._fast_start_session(
+            need_voltage=lambda frequency: 1150 + 0.5 * (frequency - 525)
+        )
+        self.assertTrue(any("Raising voltage" in message for message in logs))
+        self.assertTrue(any("Trying" in message for message in logs))
+        frequency, voltage = calls[-1]
+        self.assertGreaterEqual(voltage, 1150 + 0.5 * (frequency - 525))
+        self.assertLessEqual(voltage, 1300)
 
     def test_errors_on_the_frequency_floor_in_hold_raise_voltage(self):
         # The same hold retreat, one step above the floor. Holding there with
@@ -3508,127 +3605,6 @@ class SessionTests(unittest.TestCase):
             any(freq < peak for freq, _volt in state["calls"][peak_at + 1 :])
         )
 
-    def test_thermal_step_down_is_saved_before_stop(self):
-        saves = []
-        stop_event = threading.Event()
-        runtime = dict(FAST_CONFIG)
-        runtime["miners"] = [{"ip": "miner", "wall_type": ""}]
-        runtime["refresh_interval"] = 30
-
-        def update(ip, settings):
-            saves.append((dict(settings), stop_event.is_set()))
-            freq = settings.get("last_good_freq")
-            if freq not in ("", None) and int(freq) < 500:
-                stop_event.set()
-
-        with (
-            patched_io(
-                lambda ip: _info(
-                    frequency=500, voltage=1100, temp=80, vrTemp=40, power=12
-                ),
-                lambda ip, volt, freq: (
-                    f"{ip} -> Applied settings: Voltage = {volt}mV, Frequency = {freq}MHz"
-                ),
-                runtime_config=runtime,
-            ),
-            mock.patch.object(autotune, "update_miner", update),
-        ):
-            thread = _start_miner(
-                "miner",
-                stop_event,
-                lambda *args: None,
-                start_freq=500,
-                start_volt=1100,
-                max_temp=60,
-            )
-            thread.join(3)
-            if not stop_event.is_set():
-                stop_event.set()
-                thread.join(2)
-        self.assertFalse(thread.is_alive())
-        self.assertTrue(
-            any(
-                int(item["last_good_freq"]) < 500
-                and item.get("wall_type") == "thermal"
-                and not stopped
-                for item, stopped in saves
-            )
-        )
-
-    def test_reject_step_down_is_saved_before_stop(self):
-        state = {
-            "accepted": 0,
-            "rejected": 0,
-            "frequency": 500,
-            "voltage": 1100,
-            "drop": None,
-        }
-        saved_before_stop = []
-        stop_event = threading.Event()
-        runtime = dict(FAST_CONFIG)
-        runtime["miners"] = [{"ip": "miner", "wall_type": ""}]
-
-        def get_info(ip):
-            state["accepted"] += 8
-            state["rejected"] += 2
-            return _info(
-                frequency=state["frequency"],
-                voltage=state["voltage"],
-                temp=40,
-                vrTemp=30,
-                hashRate=1000,
-                hashRate_1m=1000,
-                errorPercentage=0.2,
-                sharesAccepted=state["accepted"],
-                sharesRejected=state["rejected"],
-                sharesRejectedReasons=[
-                    {"message": "Invalid", "count": state["rejected"]}
-                ],
-            )
-
-        def set_settings(ip, volt, freq):
-            freq = int(freq)
-            volt = int(volt)
-            if freq < state["frequency"] and state["drop"] is None:
-                state["stepped_from"] = state["frequency"]
-                state["drop"] = freq
-            state["frequency"] = freq
-            state["voltage"] = volt
-            return (
-                f"{ip} -> Applied settings: Voltage = {volt}mV, Frequency = {freq}MHz"
-            )
-
-        def update(ip, settings):
-            freq = settings.get("last_good_freq")
-            if (
-                state["drop"] is not None
-                and freq == state["drop"]
-                and not stop_event.is_set()
-            ):
-                saved_before_stop.append(dict(settings))
-                stop_event.set()
-
-        with (
-            patched_io(get_info, set_settings, runtime_config=runtime),
-            mock.patch.object(autotune, "update_miner", update),
-        ):
-            thread = _start_miner(
-                "miner",
-                stop_event,
-                lambda *args: None,
-                start_freq=500,
-                start_volt=1100,
-            )
-            thread.join(3)
-            if not stop_event.is_set():
-                stop_event.set()
-                thread.join(2)
-        self.assertFalse(thread.is_alive())
-        self.assertTrue(saved_before_stop)
-        self.assertEqual(saved_before_stop[0]["wall_type"], "reject")
-        self.assertEqual(saved_before_stop[0]["last_good_freq"], state["drop"])
-        self.assertLess(state["drop"], state["stepped_from"])
-
     def test_low_ten_minute_hashrate_is_a_silicon_wall(self):
         calls = []
         stop_event = threading.Event()
@@ -3733,14 +3709,9 @@ class SessionTests(unittest.TestCase):
         )
         self.assertFalse(any(call.get("autofanspeed") == 1 for call in fan_calls))
 
-    def test_reset_writes_stock_clocks_and_clears_learned_setpoint(self):
+    def test_reset_writes_stock_clocks_and_makes_them_the_start_clocks(self):
         miner = {
             "ip": "miner",
-            "last_good_freq": 640,
-            "last_good_volt": 1200,
-            "wall_type": "silicon",
-            "wall_timestamp": "2026-01-01T00:00:00Z",
-            "target_hashrate": 1500,
             "start_freq": 700,
             "start_volt": 1250,
             "min_freq": 400,
@@ -3763,13 +3734,7 @@ class SessionTests(unittest.TestCase):
         def log(message, level="info"):
             logs.append((level, message))
 
-        autotune._publish_status(
-            "miner",
-            wall_type="silicon",
-            last_good_freq=640,
-            last_good_volt=1200,
-            phase="hold",
-        )
+        autotune._publish_status("miner", wall_type="silicon", phase="hold")
         try:
             with (
                 mock.patch.object(autotune, "set_system_settings", set_settings),
@@ -3791,88 +3756,20 @@ class SessionTests(unittest.TestCase):
                 )
             ],
         )
-        ip, cleared = updates[0]
-        self.assertEqual(ip, "miner")
-        self.assertEqual(cleared["last_good_freq"], "")
-        self.assertEqual(cleared["last_good_volt"], "")
-        self.assertEqual(cleared["wall_type"], "")
-        self.assertEqual(cleared["wall_timestamp"], "")
-        self.assertEqual(cleared["target_hashrate"], "")
-        self.assertEqual(cleared["start_freq"], 525)
-        self.assertEqual(cleared["start_volt"], 1150)
-        self.assertNotIn("min_freq", cleared)
-        self.assertNotIn("max_temp", cleared)
+        self.assertEqual(updates, [("miner", {"start_freq": 525, "start_volt": 1150})])
         self.assertEqual(miner["min_freq"], 400)
         self.assertEqual(miner["max_temp"], 66)
-
-    def test_start_after_reset_uses_stock_instead_of_saved_setpoint(self):
-        runtime = dict(FAST_CONFIG)
-        runtime["miners"] = [
-            {
-                "ip": "miner",
-                "last_good_freq": 640,
-                "last_good_volt": 1200,
-                "wall_type": "silicon",
-                "start_freq": 700,
-                "start_volt": 1250,
-            }
-        ]
-        calls = []
-        stop_event = threading.Event()
-
-        def set_settings(ip, volt, freq):
-            calls.append((int(freq), int(volt)))
-            if len(calls) > 1:
-                stop_event.set()
-            return (
-                f"{ip} -> Applied settings: Voltage = {volt}mV, Frequency = {freq}MHz"
-            )
-
-        def update(ip, settings):
-            for miner in runtime["miners"]:
-                if miner.get("ip") == ip:
-                    miner.update(settings)
-
-        with (
-            patched_io(lambda ip: _info(), set_settings, runtime_config=runtime),
-            mock.patch.object(autotune, "update_miner", update),
-        ):
-            autotune.reset_miners_to_baseline(
-                runtime["miners"], lambda *args: None, stagger_seconds=0
-            )
-            miner = runtime["miners"][0]
-            thread = _start_miner(
-                "miner",
-                stop_event,
-                lambda *args: None,
-                start_freq=miner["start_freq"],
-                start_volt=miner["start_volt"],
-            )
-            thread.join(2)
-
-        self.assertFalse(thread.is_alive())
-        self.assertEqual(calls, [(525, 1150), (525, 1150)])
-        self.assertEqual(runtime["miners"][0]["last_good_freq"], "")
-        self.assertEqual(runtime["miners"][0]["last_good_volt"], "")
-        self.assertEqual(runtime["miners"][0]["start_freq"], 525)
-        self.assertEqual(runtime["miners"][0]["start_volt"], 1150)
 
     def test_failed_baseline_write_still_clears_every_miner(self):
         miners = [
             {
                 "ip": "bad",
-                "last_good_freq": 640,
-                "last_good_volt": 1200,
-                "wall_type": "silicon",
                 "start_freq": 700,
                 "start_volt": 1250,
                 "min_freq": 450,
             },
             {
                 "ip": "good",
-                "last_good_freq": 800,
-                "last_good_volt": 1300,
-                "wall_type": "thermal",
                 "start_freq": 600,
                 "start_volt": 1200,
                 "max_watts": 36,
@@ -3906,11 +3803,6 @@ class SessionTests(unittest.TestCase):
         self.assertEqual([ip for ip, _settings in cleared], ["bad", "good"])
         self.assertEqual([level for level, _message in logs], ["error", "success"])
         for _ip, settings in cleared:
-            self.assertEqual(settings["last_good_freq"], "")
-            self.assertEqual(settings["last_good_volt"], "")
-            self.assertEqual(settings["wall_type"], "")
-            self.assertEqual(settings["wall_timestamp"], "")
-            self.assertEqual(settings["target_hashrate"], "")
             self.assertEqual(settings["start_freq"], 525)
             self.assertEqual(settings["start_volt"], 1150)
             self.assertNotIn("min_freq", settings)
@@ -3920,13 +3812,11 @@ class SessionTests(unittest.TestCase):
         miners = [
             {
                 "ip": "10.0.0.1",
-                "last_good_freq": 640,
                 "start_freq": 700,
                 "start_volt": 1250,
             },
             {
                 "ip": "10.0.0.2",
-                "last_good_freq": 800,
                 "start_freq": 600,
                 "start_volt": 1200,
             },
@@ -4660,32 +4550,6 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(calls[0], (350, 1100))
         self.assertFalse(any("reversed" in message for message in logs))
 
-    def test_saved_setpoint_above_the_cap_is_clamped(self):
-        calls = []
-        stop_event = threading.Event()
-
-        def set_settings(ip, volt, freq):
-            calls.append((int(freq), int(volt)))
-            stop_event.set()
-            return (
-                f"{ip} -> Applied settings: Voltage = {volt}mV, Frequency = {freq}MHz"
-            )
-
-        runtime = dict(FAST_CONFIG)
-        runtime["miners"] = [
-            {"ip": "miner", "last_good_freq": 1000, "last_good_volt": 1400}
-        ]
-        with patched_io(lambda ip: _info(), set_settings, runtime_config=runtime):
-            thread = _start_miner(
-                "miner",
-                stop_event,
-                lambda *args: None,
-                max_freq=800,
-                max_volt=1200,
-            )
-            thread.join(2)
-        self.assertEqual(calls[0], (800, 1200))
-
     def test_missing_regulator_temperature_does_not_climb(self):
         calls = []
         stop_event = threading.Event()
@@ -5014,55 +4878,6 @@ class SessionTests(unittest.TestCase):
             any(freq >= state["stepped_from"] for freq, _volt in state["calls"][1:])
         )
 
-    def test_stop_during_a_probe_saves_the_previous_clocks(self):
-        runtime = dict(FAST_CONFIG)
-        runtime["miners"] = [{"ip": "miner", "wall_type": ""}]
-        runtime["refresh_interval"] = 0.05
-        state = {"frequency": 400, "voltage": 1100}
-        updates = []
-        stop_event = threading.Event()
-
-        def log(message, level="info"):
-            if "Confirmed 405" in message:
-                stop_event.set()
-
-        def update(ip, settings):
-            updates.append((ip, dict(settings)))
-
-        def set_settings(ip, volt, freq):
-            state["frequency"] = int(freq)
-            state["voltage"] = int(volt)
-            return (
-                f"{ip} -> Applied settings: Voltage = {volt}mV, Frequency = {freq}MHz"
-            )
-
-        def get_info(ip):
-            return _info(
-                frequency=state["frequency"],
-                voltage=state["voltage"],
-                temp=40,
-                vrTemp=30,
-                power=12,
-                hashRate=1000,
-                hashRate_1m=1000,
-                errorPercentage=0.2,
-                actualFrequency=state["frequency"],
-            )
-
-        with (
-            patched_io(get_info, set_settings, runtime_config=runtime),
-            mock.patch.object(autotune, "update_miner", update),
-        ):
-            thread = _start_miner(
-                "miner", stop_event, log, start_freq=400, start_volt=1100
-            )
-            thread.join(3)
-        self.assertFalse(thread.is_alive())
-        self.assertTrue(updates)
-        self.assertEqual(updates[-1][1]["last_good_freq"], 400)
-        self.assertEqual(updates[-1][1]["last_good_volt"], 1100)
-        self.assertEqual(state["frequency"], 405)
-
     def test_lowered_temperature_cap_steps_down_without_a_restart(self):
         calls = []
         stop_event = threading.Event()
@@ -5114,7 +4929,6 @@ class SessionTests(unittest.TestCase):
         state = {"frequency": 400, "voltage": 1100, "polls_after_write": 0}
         calls = []
         logs = []
-        saved = []
         stop_event = threading.Event()
 
         def set_settings(ip, volt, freq):
@@ -5136,13 +4950,7 @@ class SessionTests(unittest.TestCase):
                     state["voltage"] = state["voltage"] - 100
             return _info(frequency=state["frequency"], voltage=state["voltage"])
 
-        def remember(ip, frequency, voltage, wall_type):
-            saved.append((int(frequency), int(voltage), wall_type))
-
-        with (
-            patched_io(get_info, set_settings),
-            mock.patch.object(autotune, "remember_setpoint", remember),
-        ):
+        with patched_io(get_info, set_settings):
             thread = _start_miner(
                 "miner",
                 stop_event,
@@ -5155,8 +4963,6 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(calls[0], (450, 1050))
         self.assertIn((400, 1000), calls)
         self.assertTrue(any("overheat protection" in message for message in logs))
-        self.assertIn((440, 1050, "thermal"), saved)
-        self.assertFalse(any(frequency < 400 for frequency, _volt, _wall in saved))
         self.assertEqual(autotune.get_miner_status("miner").get("wall_type"), "thermal")
 
     def test_latched_overheat_writes_the_floor_clears_the_flag_and_restarts_once(self):
@@ -5687,12 +5493,8 @@ class InstallAndConfigTests(unittest.TestCase):
                 self.assertEqual(miners[0]["max_error_percentage"], 2.0)
                 self.assertEqual(miners[0]["nickname"], "gamma-1")
                 self.assertTrue(miners[0]["enabled"])
-                autotune.remember_setpoint("10.0.0.6", 800, 1250, "silicon")
-                stored = config.get_miners()[0]
-                self.assertEqual(stored["last_good_freq"], 800)
-                self.assertEqual(stored["last_good_volt"], 1250)
-                self.assertEqual(stored["wall_type"], "silicon")
-                self.assertTrue(stored["wall_timestamp"])
+                for key in config.RETIRED_MINER_KEYS:
+                    self.assertNotIn(key, miners[0])
             finally:
                 config.CONFIG_FILE = old_path
                 config._last_good_config = old_last
@@ -5924,9 +5726,7 @@ class InstallAndConfigTests(unittest.TestCase):
                 "up": "-",
                 "phase": "-",
                 "error": "-",
-                "setpoint_freq": "-",
-                "setpoint_volt": "-",
-                "setpoint_limit": "",
+                "limit": "",
                 "tag": "idle",
                 "up_seconds": None,
                 "mv_alert": False,
@@ -6013,7 +5813,7 @@ class InstallAndConfigTests(unittest.TestCase):
         self.assertNotIn("open_miner_page", script)
         self.assertNotIn("refresh_miner", script)
         self.assertIn('data-sort="best"', html)
-        self.assertEqual(html.count("data-sort="), 10)
+        self.assertEqual(html.count("data-sort="), 9)
         for label in (
             "Name",
             "Clock",
@@ -6024,13 +5824,9 @@ class InstallAndConfigTests(unittest.TestCase):
             "Shares",
             "Up",
             "Phase",
-            "Setpoint",
         ):
             self.assertIn(f">{label}</button>", html)
-        self.assertIn(
-            'title="Last saved frequency and voltage, and the limit that stopped the climb"',
-            html,
-        )
+        self.assertNotIn('data-sort="setpoint"', html)
         for column in (
             "name",
             "freq",
@@ -6041,7 +5837,6 @@ class InstallAndConfigTests(unittest.TestCase):
             "shares",
             "up",
             "phase",
-            "setpoint",
         ):
             self.assertIn(f'data-sort="{column}"', html)
         for column in ("ip", "mv", "vin", "vr", "jth", "session", "error"):
@@ -6100,7 +5895,7 @@ class InstallAndConfigTests(unittest.TestCase):
         self.assertNotIn("1 in ", script)
         self.assertIn("max_droop_mv", html)
         self.assertIn("vr_temp_tolerance", html)
-        self.assertIn("ceiling_soak_seconds", html)
+        self.assertNotIn("ceiling_soak_seconds", html)
         self.assertNotIn('id="row-actions"', html)
         self.assertIn('classList.toggle("fullscreen"', script)
         self.assertIn("body.fullscreen .toolbar", styles)

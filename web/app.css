@@ -498,8 +498,8 @@ td.phase {
   margin-inline: auto;
   padding: 0 6px;
   border-radius: 6px;
-  background: rgba(240, 160, 160, 0.22);
-  color: var(--bad);
+  background: rgba(230, 180, 90, 0.18);
+  color: var(--warn);
 }
 
 .empty {

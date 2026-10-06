@@ -31,8 +31,8 @@ from dashboard import (
     format_shares,
     format_uptime,
     format_version_title,
-    learned_setpoint,
     limit_level,
+    live_limit,
     parse_repaste_date,
     replace_ips_with_names,
     under_limit,
@@ -68,60 +68,21 @@ class DisplayHelperTests(unittest.TestCase):
         self.assertFalse(dashboard.over_limit("n/a", 2))
         self.assertFalse(dashboard.over_limit(None, 2))
 
-    def test_format_number_and_learned_wall(self):
+    def test_format_number_and_live_limit(self):
         self.assertEqual(format_number(None, 0), "-")
         self.assertEqual(format_number("12.3%", 1), "12.3")
         self.assertEqual(format_number(12.3, 2), "12.30")
-        self.assertEqual(
-            learned_setpoint(
-                {"wall_type": "silicon", "last_good_freq": 640, "last_good_volt": 1200},
-                {},
-            ),
-            ("640", "1200", "chip errors"),
-        )
-        self.assertEqual(
-            learned_setpoint(
-                {"wall_type": "hash", "last_good_freq": 850, "last_good_volt": 1180},
-                {},
-            ),
-            ("850", "1180", "low hashrate"),
-        )
-        self.assertEqual(
-            learned_setpoint(
-                {"wall_type": "thermal", "last_good_freq": 700, "last_good_volt": 1150},
-                {},
-            ),
-            ("700", "1150", "temperature"),
-        )
-        self.assertEqual(
-            learned_setpoint(
-                {"wall_type": "power", "last_good_freq": 600, "last_good_volt": 1100},
-                {},
-            ),
-            ("600", "1100", "power"),
-        )
-        self.assertEqual(
-            learned_setpoint(
-                {"wall_type": "reject", "last_good_freq": 550, "last_good_volt": 1120},
-                {},
-            ),
-            ("550", "1120", "rejected shares"),
-        )
-        self.assertEqual(
-            learned_setpoint(
-                {"wall_type": "input", "last_good_freq": 500, "last_good_volt": 1100},
-                {},
-            ),
-            ("500", "1100", "input sag"),
-        )
-        self.assertEqual(
-            learned_setpoint(
-                {},
-                {"last_good_freq": 1040, "last_good_volt": 1290},
-            ),
-            ("1040", "1290", ""),
-        )
-        self.assertEqual(learned_setpoint({}, {}), ("", "", ""))
+        for wall, label in (
+            ("silicon", "chip errors"),
+            ("hash", "low hashrate"),
+            ("thermal", "temperature"),
+            ("power", "power"),
+            ("reject", "rejected shares"),
+            ("input", "input sag"),
+        ):
+            self.assertEqual(live_limit({"wall_type": wall}), label)
+        self.assertEqual(live_limit({}), "")
+        self.assertEqual(live_limit(None), "")
         self.assertEqual(format_difficulty(49224525), "49.22M")
         self.assertEqual(format_difficulty(2038368), "2.04M")
         self.assertEqual(format_difficulty(999), "999")
@@ -496,8 +457,6 @@ class SnapshotTests(unittest.TestCase):
         status = {
             "phase": "hold",
             "wall_type": "silicon",
-            "last_good_freq": 640,
-            "last_good_volt": 1200,
             "reason": "holding",
         }
         stored = {
@@ -505,9 +464,6 @@ class SnapshotTests(unittest.TestCase):
             "max_temp": 68,
             "max_error_percentage": 2.0,
             "max_droop_mv": 40,
-            "last_good_freq": 640,
-            "last_good_volt": 1200,
-            "wall_type": "silicon",
         }
         settings = {"temp_tolerance": 3, "vr_temp_tolerance": 3}
         with (
@@ -517,6 +473,10 @@ class SnapshotTests(unittest.TestCase):
             mock.patch("dashboard.load_config", return_value=settings),
         ):
             app.refresh_once()
+            # One read 56 mV under the setting is a lagging rail, not droop yet.
+            self.assertFalse(app.get_snapshot(0)["miners"][0]["mv_alert"])
+            for _ in range(dashboard.DROOP_ALERT_READS - 1):
+                app.refresh_once()
         row = app.get_snapshot(0)["miners"][0]
         self.assertEqual(row["tag"], "hold")
         self.assertEqual(row["asic_level"], "")
@@ -543,9 +503,7 @@ class SnapshotTests(unittest.TestCase):
             row["shares_title"], "Stale 13\nPool difficulty 1000\nFallback pool"
         )
         self.assertEqual(row["error"], "0.50%")
-        self.assertEqual(row["setpoint_freq"], "640")
-        self.assertEqual(row["setpoint_volt"], "1200")
-        self.assertEqual(row["setpoint_limit"], "chip errors")
+        self.assertEqual(row["limit"], "chip errors")
         self.assertEqual(row["reason"], "holding")
         self.assertEqual(row["pool"], "solo.ckpool.org")
         self.assertTrue(row["fallback"])
@@ -580,6 +538,12 @@ class SnapshotTests(unittest.TestCase):
             return_value="Error fetching system info from 10.0.0.8: timed out",
         ):
             app.refresh_once()
+            blip = app.get_snapshot(0)["miners"][0]
+            self.assertEqual(blip["phase"], "climb")
+            self.assertEqual(blip["reason"], "no reply")
+            self.assertEqual(blip["freq"], "500")
+            for _ in range(dashboard.OFFLINE_AFTER_MISSES - 1):
+                app.refresh_once()
         offline = app.get_snapshot(0)["miners"][0]
         self.assertEqual(offline["phase"], "offline")
         self.assertEqual(offline["tag"], "alert")
@@ -798,17 +762,9 @@ class SnapshotTests(unittest.TestCase):
             gate.wait()
 
         try:
-            autotune._publish_status(
-                held_ip,
-                phase="hold",
-                last_good_freq=640,
-                last_good_volt=1200,
-                wall_type="silicon",
-            )
-            autotune._publish_status(skipped_ip, phase="skipped", last_good_freq=525)
-            autotune._publish_status(
-                live_ip, phase="climb", last_good_freq=600, last_good_volt=1150
-            )
+            autotune._publish_status(held_ip, phase="hold", wall_type="silicon")
+            autotune._publish_status(skipped_ip, phase="skipped")
+            autotune._publish_status(live_ip, phase="climb")
             app = TunerDashboard()
             held = threading.Thread(target=lambda: None)
             held.miner_ip = held_ip
@@ -850,8 +806,6 @@ class SnapshotTests(unittest.TestCase):
             app._finish_stop()
             held_status = autotune.get_miner_status(held_ip)
             self.assertEqual(held_status["phase"], "stopped")
-            self.assertEqual(held_status["last_good_freq"], 640)
-            self.assertEqual(held_status["last_good_volt"], 1200)
             self.assertEqual(held_status["wall_type"], "silicon")
             self.assertEqual(autotune.get_miner_status(skipped_ip)["phase"], "skipped")
             self.assertEqual(autotune.get_miner_status(live_ip)["phase"], "climb")
@@ -951,19 +905,32 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(result["notice"]["title"], "Restart Failed")
         self.assertNotEqual(result["notice"]["title"], "Restart Triggered")
 
-    def test_global_settings_save_vr_tolerance_and_ceiling_soak(self):
+    def test_fast_start_is_on_by_default_and_saves(self):
+        with temp_config():
+            app = TunerDashboard()
+            settings = app.get_global_settings()["settings"]
+            self.assertTrue(settings["fast_start"])
+            settings["fast_start"] = False
+            self.assertTrue(app.save_global_settings(settings)["ok"])
+            self.assertFalse(config.load_config()["fast_start"])
+            self.assertFalse(app.get_global_settings()["settings"]["fast_start"])
+            # A page that does not send the switch leaves it on.
+            settings.pop("fast_start")
+            self.assertTrue(app.save_global_settings(settings)["ok"])
+            self.assertTrue(config.load_config()["fast_start"])
+
+    def test_global_settings_save_vr_tolerance(self):
         with temp_config():
             app = TunerDashboard()
             settings = app.get_global_settings()["settings"]
             self.assertEqual(settings["vr_temp_tolerance"], 3)
-            self.assertEqual(settings["ceiling_soak_seconds"], 1800)
+            self.assertNotIn("ceiling_soak_seconds", settings)
             settings["vr_temp_tolerance"] = 4
-            settings["ceiling_soak_seconds"] = 900
             saved = app.save_global_settings(settings)
             self.assertTrue(saved["ok"])
             stored = config.load_config()
             self.assertEqual(stored["vr_temp_tolerance"], 4)
-            self.assertEqual(stored["ceiling_soak_seconds"], 900)
+            self.assertNotIn("ceiling_soak_seconds", stored)
             settings["monitor_interval"] = 0
             rejected = app.save_global_settings(settings)
             self.assertFalse(rejected["ok"])
@@ -1243,12 +1210,10 @@ class SnapshotTests(unittest.TestCase):
             with open(path, encoding="utf-8") as handle:
                 self.assertTrue(handle.read().startswith("{broken"))
 
-    def test_settings_save_keeps_a_setpoint_learned_while_it_waits(self):
+    def test_settings_save_keeps_a_change_made_while_it_waits(self):
         miner = config.new_miner_record(
             "BM1370 601", "10.0.0.8", "Alpha", config.get_default_config()
         )
-        miner["last_good_freq"] = 400
-        miner["last_good_volt"] = 1100
         entered = threading.Event()
         release = threading.Event()
         started = threading.Event()
@@ -1261,9 +1226,7 @@ class SnapshotTests(unittest.TestCase):
 
         def learn():
             started.set()
-            config.update_miner(
-                "10.0.0.8", {"last_good_freq": 640, "last_good_volt": 1200}
-            )
+            config.update_miner("10.0.0.8", {"start_freq": 600, "start_volt": 1200})
 
         with temp_config([miner]):
             app = TunerDashboard()
@@ -1290,8 +1253,8 @@ class SnapshotTests(unittest.TestCase):
             self.assertFalse(learning.is_alive())
             stored = config.get_miners()[0]
             self.assertEqual(stored["max_temp"], 55)
-            self.assertEqual(stored["last_good_freq"], 640)
-            self.assertEqual(stored["last_good_volt"], 1200)
+            self.assertEqual(stored["start_freq"], 600)
+            self.assertEqual(stored["start_volt"], 1200)
 
     def test_skipped_session_returns_to_idle(self):
         miner = config.new_miner_record(
@@ -1520,6 +1483,14 @@ class SnapshotTests(unittest.TestCase):
         app._rows = [blank_miner_row("Alpha", "10.0.0.8")]
         app._focused = False
         stored = {"nickname": "Alpha"}
+        # A reboot or Wi-Fi blip misses a read or two. That is not offline yet.
+        with (
+            mock.patch("dashboard.show_windows_toast") as toast,
+            mock.patch("dashboard.get_system_info", return_value="timed out"),
+        ):
+            for _ in range(dashboard.OFFLINE_AFTER_MISSES - 1):
+                app.refresh_once()
+        toast.assert_not_called()
         with (
             mock.patch("dashboard.show_windows_toast") as toast,
             mock.patch("dashboard.get_system_info", return_value="timed out"),
@@ -1575,7 +1546,8 @@ class SnapshotTests(unittest.TestCase):
             mock.patch("dashboard.show_windows_toast") as toast,
             mock.patch("dashboard.get_system_info", return_value="timed out"),
         ):
-            app.refresh_once()
+            for _ in range(dashboard.OFFLINE_AFTER_MISSES):
+                app.refresh_once()
         toast.assert_not_called()
         self.assertEqual(
             app.get_snapshot(0, focused=False)["miners"][0]["phase"], "offline"

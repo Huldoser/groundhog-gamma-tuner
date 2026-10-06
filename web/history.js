@@ -419,7 +419,7 @@ function renderKpis(data, scale) {
   if (data.best) {
     addKpi(row, bestLabel(data), scaled(data.best.value, scale), scale.unit, conditionsText(data.best), "good");
   } else {
-    addKpi(row, bestLabel(data), "No result yet", "", "Needs a sample whose setpoint held for 10 minutes.", "quiet");
+    addKpi(row, bestLabel(data), "No result yet", "", "Needs a sample whose clocks held for 10 minutes.", "quiet");
   }
   if (finite(data.typical)) {
     addKpi(

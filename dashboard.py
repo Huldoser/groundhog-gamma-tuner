@@ -33,6 +33,7 @@ from autotune import (
     _publish_status,
     coerce_limit,
     coerce_real_limit,
+    fast_start_enabled,
     get_miner_status,
     get_system_info,
     monitor_and_adjust,
@@ -66,6 +67,12 @@ from config import (
 )
 
 STATUS_REFRESH_SECONDS = 5
+# Reads a miner may miss in a row before it shows as offline. A reboot or a
+# Wi-Fi blip misses one or two.
+OFFLINE_AFTER_MISSES = 3
+# Reads in a row with core voltage this far under its setting before the table
+# marks droop. The rail can lag a moment after a voltage change.
+DROOP_ALERT_READS = 3
 LOG_LIMIT = 500
 WEAK_WIFI_DBM = -70
 NETWORK_REFRESH_SECONDS = 60
@@ -102,7 +109,6 @@ GLOBAL_INT_FIELDS = (
     "default_target_temp",
     "temp_tolerance",
     "vr_temp_tolerance",
-    "ceiling_soak_seconds",
 )
 # A /22. A home network is a /24 (254 addresses).
 MAX_SCAN_ADDRESSES = 1024
@@ -205,7 +211,7 @@ def limit_order_error(fields, label):
     )
 
 
-_SETPOINT_LIMITS = {
+_LIMIT_LABELS = {
     "silicon": "chip errors",
     "hash": "low hashrate",
     "thermal": "temperature",
@@ -215,27 +221,10 @@ _SETPOINT_LIMITS = {
 }
 
 
-def learned_setpoint(status, stored):
-    """Saved frequency, voltage, and the plain limit that stopped the climb.
-
-    Frequency and voltage are display strings. The limit is empty when none
-    was saved. All three are empty when nothing is saved.
-    """
-    status = status or {}
-    stored = stored or {}
-    wall = status.get("wall_type") or stored.get("wall_type") or ""
-    freq = status.get("last_good_freq")
-    volt = status.get("last_good_volt")
-    if freq in ("", None):
-        freq = stored.get("last_good_freq") or ""
-    if volt in ("", None):
-        volt = stored.get("last_good_volt") or ""
-    freq_text = format_number(freq, 0)
-    volt_text = format_number(volt, 0)
-    if freq_text == "-" or volt_text == "-":
-        return "", "", ""
-    label = _SETPOINT_LIMITS.get(str(wall).strip().lower(), "")
-    return freq_text, volt_text, label
+def live_limit(status):
+    """The plain limit that stopped this session's climb, or ""."""
+    wall = str((status or {}).get("wall_type") or "").strip().lower()
+    return _LIMIT_LABELS.get(wall, "")
 
 
 def parse_repaste_date(value, today=None):
@@ -867,7 +856,7 @@ def row_state_tag(phase, asic_text, error_text, max_temp, max_error):
         return "alert"
     if phase_name == "hold":
         return "hold"
-    if phase_name == "climb":
+    if phase_name in ("climb", "ramp"):
         return "climb"
     if phase_name == "trim":
         return "trim"
@@ -895,9 +884,7 @@ def blank_miner_row(nickname, ip):
         "up": "-",
         "phase": "-",
         "error": "-",
-        "setpoint_freq": "-",
-        "setpoint_volt": "-",
-        "setpoint_limit": "",
+        "limit": "",
         "tag": "idle",
         "up_seconds": None,
         "mv_alert": False,
@@ -926,14 +913,14 @@ def blank_miner_row(nickname, ip):
 
 BASELINE_PROMPT = (
     f"Set every miner to the Gamma 601 stock clocks ({STOCK_FREQ} MHz / {STOCK_VOLT} mV) "
-    "and forget the saved setpoint?\n\n"
-    "The next Start Autotuner will climb or step down from there."
+    "and make those its start clocks?\n\n"
+    "Start Autotuner always tunes fresh from each miner's start clocks."
 )
 # {miner} is replaced on the page with the selected miner's name and address.
 MINER_BASELINE_PROMPT = (
     f"Set {{miner}} to the Gamma 601 stock clocks ({STOCK_FREQ} MHz / {STOCK_VOLT} mV) "
-    "and forget its saved setpoint?\n\n"
-    "The next Start Autotuner tunes it fresh, as after a repaste or a new heatsink."
+    "and make those its start clocks?\n\n"
+    "History marks the reset, so Since reset can start there."
 )
 
 
@@ -1232,6 +1219,8 @@ class TunerDashboard:
         self._latest_firmware = ""
         self._firmware_checked = None
         self._alerts = {}
+        self._misses = {}
+        self._droop_reads = {}
         self._overheat_clear_failed = set()
         self._focused = True
         start_ip, end_ip = subnet_range_for(local_ipv4())
@@ -1796,8 +1785,8 @@ class TunerDashboard:
             "notice": _notice(
                 "info",
                 "Baseline Reset Started",
-                f"Setting {len(miners)} miner(s) to {STOCK_FREQ} MHz / {STOCK_VOLT} mV "
-                "and forgetting their saved setpoints. The log shows when it finishes.",
+                f"Setting {len(miners)} miner(s) to {STOCK_FREQ} MHz / {STOCK_VOLT} mV. "
+                "The log shows when it finishes.",
             ),
         }
 
@@ -1868,13 +1857,13 @@ class TunerDashboard:
         if failed:
             message = (
                 f"{name} did not accept {STOCK_FREQ} MHz / {STOCK_VOLT} mV. "
-                "Its saved setpoint was still cleared."
+                "Its start clocks were still set to them."
             )
             self.log_message(message, "error")
             return _fail(message, "Reset Failed")
         message = (
-            f"{name} is at {STOCK_FREQ} MHz / {STOCK_VOLT} mV with no saved setpoint. "
-            "The next Start Autotuner tunes it fresh."
+            f"{name} is at {STOCK_FREQ} MHz / {STOCK_VOLT} mV, "
+            "and Start Autotuner tunes it from there."
         )
         self.log_message(message, "success")
         return {"ok": True, "message": message}
@@ -2257,9 +2246,10 @@ class TunerDashboard:
         }
 
     def get_global_settings(self):
-        """Global steps, temperatures, and flatline detection."""
+        """Global steps, temperatures, fast start, and flatline detection."""
         config = load_config()
         settings = {key: config.get(key, "") for key in GLOBAL_INT_FIELDS}
+        settings["fast_start"] = fast_start_enabled(config)
         settings["flatline_detection_enabled"] = bool(
             config.get("flatline_detection_enabled", False)
         )
@@ -2274,6 +2264,8 @@ class TunerDashboard:
             return _fail("Please enter valid integer values.")
         try:
             new_settings = {key: int(settings[key]) for key in GLOBAL_INT_FIELDS}
+            # A page that does not know the switch leaves it on.
+            new_settings["fast_start"] = _as_bool(settings.get("fast_start", True))
             new_settings["flatline_detection_enabled"] = _as_bool(
                 settings.get("flatline_detection_enabled")
             )
@@ -2458,6 +2450,12 @@ class TunerDashboard:
 
     def _apply_one_locked(self, row, ip, miner_data):
         if isinstance(miner_data, str) or not isinstance(miner_data, dict):
+            misses = self._misses.get(ip, 0) + 1
+            self._misses[ip] = misses
+            if misses < OFFLINE_AFTER_MISSES:
+                # Keep the last reading. One missed read is not an outage.
+                row["reason"] = "no reply"
+                return
             row["phase"] = "offline"
             row["tag"] = "alert"
             row["reason"] = ""
@@ -2465,6 +2463,7 @@ class TunerDashboard:
             row["overheat"] = False
             row["floor_alert"] = False
             return
+        self._misses.pop(ip, None)
         self._maybe_adopt_hostname(ip, miner_data, row)
         stored = get_miner_defaults(ip)
         minute_hash = (
@@ -2475,9 +2474,12 @@ class TunerDashboard:
         row["mv_title"] = format_core_voltage_title(
             miner_data.get("coreVoltage"), miner_data.get("coreVoltageActual")
         )
-        row["mv_alert"] = droop_alert(
+        drooping = droop_alert(
             miner_data.get("coreVoltage"), miner_data.get("coreVoltageActual"), stored
         )
+        reads = self._droop_reads.get(ip, 0) + 1 if drooping else 0
+        self._droop_reads[ip] = reads
+        row["mv_alert"] = reads >= DROOP_ALERT_READS
         row["floor_alert"] = below_floor(
             miner_data.get("frequency"), miner_data.get("coreVoltage"), stored
         )
@@ -2504,10 +2506,7 @@ class TunerDashboard:
         row["phase"] = status.get("phase") or "-"
         error = miner_data.get("errorPercentage", status.get("error_percentage"))
         row["error"] = "-" if error in (None, "") else f"{format_number(error, 2)}%"
-        freq, volt, limit = learned_setpoint(status, stored)
-        row["setpoint_freq"] = freq or "-"
-        row["setpoint_volt"] = volt or "-"
-        row["setpoint_limit"] = limit
+        row["limit"] = live_limit(status)
         row["reason"] = str(status.get("reason") or "").strip()
         row["power_fault"] = _power_fault_set(miner_data.get("power_fault"))
         row["overheat"] = _overheat_mode_set(miner_data.get("overheat_mode"))
@@ -2555,6 +2554,8 @@ class TunerDashboard:
 
     def _drop_miner_runtime_locked(self, ip):
         self._alerts.pop(ip, None)
+        self._misses.pop(ip, None)
+        self._droop_reads.pop(ip, None)
         self._overheat_clear_failed.discard(ip)
 
     def _clear_cooled_overheat(self, results):
@@ -2835,7 +2836,7 @@ class TunerDashboard:
         }
 
     def _publish_stopped_phases(self, threads):
-        """Leave a finished tuner on Stopped. Keep the saved setpoint fields."""
+        """Leave a finished tuner on Stopped. Keep the limit it stopped at."""
         stopped_ips = []
         with self._lock:
             running_ips = {

@@ -18,7 +18,8 @@ This is an unofficial tool. It is not affiliated with Hurllz or the Bitaxe proje
 
 ## What it does
 
-1. Confirms the board is a Gamma 601, enables overclocking, and applies the last good frequency and voltage for that chip, or the starting setpoint.
+1. Confirms the board is a Gamma 601, enables overclocking, and starts fresh from the miner's start clocks (525 MHz / 1150 mV unless you change them). Nothing learned in an earlier session carries over: weather, paste, and voltage change too much between runs.
+   With **Fast start** on (Global Settings, on by default), it then jumps frequency and voltage toward a point 6°C under the ASIC and regulator caps. It holds each jump about a minute, longer while the chip is still warming, and fits a line through the watts and temperatures it saw to aim the next one. Voltage rises 0.3 mV per MHz on the way up, and 20 mV more when errors go over the budget. A jump with errors even at max voltage is split in half. Any limit crossed on the way sends it back to the last clocks that held. A cool chip reaches its sweet spot in minutes instead of hours, and the fine tuning below takes over from there.
 2. Polls AxeOS and waits until the miner reports the new setpoint before the next step.
 3. Lowers frequency if ASIC temperature, regulator temperature, power, input voltage, or core-voltage droop crosses the limit.
    Temperature caps stay at least 4°C under the AxeOS overheat trip (75°C ASIC, 105°C regulator). Inside that margin the tuner sheds 20 MHz and 10 mV at a time, every 30 seconds, so AxeOS does not cut power and drop the clocks by 100 MHz and 100 mV on its own.
@@ -26,7 +27,7 @@ This is an unofficial tool. It is not affiliated with Hurllz or the Bitaxe proje
    A heat retreat also drops one voltage step while errors are at most half the budget, so voltage raised for a higher clock does not keep heating a lower one. At the frequency floor, voltage only drops for heat while errors still fit the budget, and never for errors.
 4. Raises voltage only when the ASIC error percentage is above the budget, then raises frequency while errors stay inside that budget.
    A cool chip climbs up to 4 frequency steps (20 MHz) per settle. The jump is sized so that even if power and heat rose in full proportion to frequency, the chip and regulator would still be a tolerance band under their caps and power would stay under its cap. Within two tolerance bands of a cap, or with errors over half the budget, it climbs one step. A jump that loses hashrate steps back without raising voltage. The next climbs up to that clock go one step at a time. Set `"max_climb_steps": 1` in `config.json` to always climb one step.
-5. Trims voltage down at the ceiling, then holds. The last good setpoint is saved so the next start does not begin from stock. The fan stays at full speed for the whole session, so a warmer room is what moves the clocks.
+5. Trims voltage down at the ceiling, then holds. The Phase column shows what is holding it (temperature, chip errors, power, input sag, and so on). The fan stays at full speed for the whole session, so a warmer room is what moves the clocks.
    A hold under a hashrate or silicon wall climbs again once the chip is 3°C cooler than when it hit that wall, or after 6 hours, as long as errors are at most half the budget.
 6. Restarts a miner once when its settled errors stay far over the budget (10%, or 5× a larger budget). That is not a silicon wall, and AxeOS can leave the ASIC like that after an overheat recovery. If a soft restart does not clear it, unplug the miner for 30 seconds.
 
@@ -64,7 +65,9 @@ The **History** tab next to the status pill shows how each miner ran and what th
 
 ### Fresh start
 
-After a repaste, a new heatsink, or any change that makes a miner run differently, double-click it (or right-click and choose **Reset to Baseline**). That writes the stock 525 MHz / 1150 mV and forgets the miner's saved setpoint and wall, so the next Start Autotuner tunes it from scratch. **Settings > Reset All to Baseline** does the same for every miner. Both stop at a confirmation first. A reset is also marked in the history, so **Since reset** shows only what the miner did after it.
+Double-click a miner (or right-click and choose **Reset to Baseline**) to write the stock 525 MHz / 1150 mV and make those its start clocks. **Settings > Reset All to Baseline** does the same for every miner. Both stop at a confirmation first. A reset is also marked in the history, so **Since reset** shows only what the miner did after it. Every Start Autotuner tunes from the start clocks anyway, so a repaste needs no reset; set the date under **Edit Miner** instead.
+
+A miner shows as offline only after three missed reads in a row (about 15 seconds). One missed read shows "no reply" under its phase and keeps the last values; a reboot or a Wi-Fi blip looks like that. The log says once when a miner stops answering and why (timed out, refused, unreachable), and once when it is back. A core voltage more than the droop limit under its setting is marked in amber after three reads in a row; one read right after a voltage change is the rail catching up.
 
 ## Requirements
 

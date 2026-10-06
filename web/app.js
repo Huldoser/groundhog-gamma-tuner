@@ -1,4 +1,4 @@
-const COLUMNS = ["name", "freq", "asic", "hash", "watts", "best", "shares", "up", "phase", "setpoint"];
+const COLUMNS = ["name", "freq", "asic", "hash", "watts", "best", "shares", "up", "phase"];
 const TUNER_FIELDS = [
   "min_freq", "start_freq", "max_freq",
   "min_volt", "start_volt", "max_volt",
@@ -7,11 +7,11 @@ const TUNER_FIELDS = [
 ];
 const GLOBAL_FIELDS = [
   "voltage_step", "frequency_step", "monitor_interval", "refresh_interval",
-  "default_target_temp", "temp_tolerance", "vr_temp_tolerance", "ceiling_soak_seconds",
+  "default_target_temp", "temp_tolerance", "vr_temp_tolerance",
   "flatline_hashrate_repeat_count",
 ];
-const FALLBACK_PROMPT = "Set every miner to the Gamma 601 stock clocks (525 MHz / 1150 mV) and forget the saved setpoint?\n\nThe next Start Autotuner will climb or step down from there.";
-const FALLBACK_MINER_PROMPT = "Set {miner} to the Gamma 601 stock clocks (525 MHz / 1150 mV) and forget its saved setpoint?\n\nThe next Start Autotuner tunes it fresh, as after a repaste or a new heatsink.";
+const FALLBACK_PROMPT = "Set every miner to the Gamma 601 stock clocks (525 MHz / 1150 mV) and make those its start clocks?\n\nStart Autotuner always tunes fresh from each miner's start clocks.";
+const FALLBACK_MINER_PROMPT = "Set {miner} to the Gamma 601 stock clocks (525 MHz / 1150 mV) and make those its start clocks?\n\nHistory marks the reset, so Since reset can start there.";
 
 const $ = (id) => document.getElementById(id);
 
@@ -176,7 +176,7 @@ let tableKey = "";
 let sortColumn = "best";
 let sortDirection = "desc";
 
-const NUMERIC_COLUMNS = new Set(["freq", "asic", "hash", "watts", "best", "shares", "up", "setpoint"]);
+const NUMERIC_COLUMNS = new Set(["freq", "asic", "hash", "watts", "best", "shares", "up"]);
 const DIFFICULTY_SUFFIX = { k: 1e3, M: 1e6, G: 1e9, T: 1e12, P: 1e15 };
 
 function plainNumber(text) {
@@ -205,7 +205,6 @@ function sortValue(miner, column) {
   if (column === "best" || column === "session") return difficultyNumber(miner, column);
   if (column === "shares") return shareNumber(miner.shares);
   if (column === "up") return plainNumber(miner.up_seconds);
-  if (column === "setpoint") return plainNumber(miner.setpoint_freq);
   if (NUMERIC_COLUMNS.has(column)) return plainNumber(miner[column]);
   const text = String(miner[column] ?? "").trim();
   if (!text || text === "-") return null;
@@ -390,19 +389,7 @@ function renderCell(miner, column) {
     pill.textContent = value;
     cell.appendChild(pill);
     if (shown(miner.reason)) addLine(cell, miner.reason, "muted reason");
-    return cell;
-  }
-  if (column === "setpoint") {
-    cell.className = "left";
-    if (!shown(miner.setpoint_freq) && !shown(miner.setpoint_volt)) {
-      cell.textContent = "-";
-      return cell;
-    }
-    if (shown(miner.setpoint_freq)) addLine(cell, `${miner.setpoint_freq} MHz`);
-    if (shown(miner.setpoint_volt)) {
-      const limit = shown(miner.setpoint_limit) ? ` \u00b7 ${miner.setpoint_limit}` : "";
-      addLine(cell, `${miner.setpoint_volt} mV${limit}`, "muted");
-    }
+    if (shown(miner.limit)) addLine(cell, `held by ${miner.limit}`, "muted reason");
     return cell;
   }
   if (column === "up") cell.className = "quiet";
@@ -792,6 +779,7 @@ async function openGlobal() {
     $(key).value = settings[key] == null ? "" : settings[key];
   });
   $("flatline_detection_enabled").checked = Boolean(settings.flatline_detection_enabled);
+  $("fast_start").checked = settings.fast_start !== false;
   openModal("global");
   $("voltage_step").focus();
 }
@@ -805,6 +793,7 @@ async function submitGlobal(event) {
     settings[key] = $(key).value.trim();
   });
   settings.flatline_detection_enabled = $("flatline_detection_enabled").checked;
+  settings.fast_start = $("fast_start").checked;
   const result = await bridge.save_global_settings(settings);
   if (!result.ok) {
     setFormError("global-error", result.message);

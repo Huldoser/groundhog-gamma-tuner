@@ -8,7 +8,7 @@ alwaysApply: false
 
 Writes go through `save_config` / `_write_config`: hold `_config_lock`, write a temp file in the same directory, then `os.replace` onto `config.json`.
 
-A `JSONDecodeError` keeps `_last_good_config`. `_drop_daily_reset` removes `daily_reset_enabled` and `daily_reset_time` on load and save.
+A `JSONDecodeError` keeps `_last_good_config`. `_drop_retired_keys` removes `RETIRED_GLOBAL_KEYS` and each miner's `RETIRED_MINER_KEYS` (learned setpoints from older versions) on load and save. Each tuning session starts fresh from the miner's start clocks; nothing learned is saved.
 
 `detect_miners` checks `is_gamma_601` before `new_miner_record`. `add_miner` does not perform that check. `config.json` stays gitignored.
 

@@ -70,7 +70,6 @@
                   <th aria-sort="none" title="Accepted and rejected shares, then error"><button type="button" class="sort" data-sort="shares">Shares</button></th>
                   <th aria-sort="none" title="Uptime"><button type="button" class="sort" data-sort="up">Up</button></th>
                   <th aria-sort="none"><button type="button" class="sort" data-sort="phase">Phase</button></th>
-                  <th class="left" aria-sort="none" title="Last saved frequency and voltage, and the limit that stopped the climb"><button type="button" class="sort" data-sort="setpoint">Setpoint</button></th>
                 </tr>
               </thead>
               <tbody id="miner-body"></tbody>
@@ -247,12 +246,16 @@
       <h2>Global Settings</h2>
       <fieldset>
         <legend>Steps</legend>
-        <p class="hint">How far each step moves, how often the tuner checks, and how long it holds at the ceiling before saving the setpoint. Monitor interval is at least 1 second. Tune interval is at least 60 seconds.</p>
+        <p class="hint">How far each step moves and how often the tuner checks. Monitor interval is at least 1 second. Tune interval is at least 60 seconds.</p>
         <label>Voltage step (mV) <input id="voltage_step" inputmode="numeric"></label>
         <label>Frequency step (MHz) <input id="frequency_step" inputmode="numeric"></label>
         <label>Monitor interval (sec) <input id="monitor_interval" inputmode="numeric"></label>
         <label>Tune interval (sec) <input id="refresh_interval" inputmode="numeric"></label>
-        <label>Ceiling soak (sec) <input id="ceiling_soak_seconds" inputmode="numeric"></label>
+      </fieldset>
+      <fieldset>
+        <legend>Start</legend>
+        <p class="hint">Every start is fresh from each miner's start clocks. With fast start, the tuner jumps frequency and voltage toward a point 6 °C under the heat caps, judging the heat from each jump, then fine-tunes in small steps. Without it, the whole climb is in small steps.</p>
+        <label class="check"><input id="fast_start" type="checkbox"> Fast start</label>
       </fieldset>
       <fieldset>
         <legend>Temperature</legend>
