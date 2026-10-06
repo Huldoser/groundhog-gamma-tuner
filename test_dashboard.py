@@ -177,6 +177,33 @@ class DisplayHelperTests(unittest.TestCase):
             ],
         )
 
+    def test_block_odds_scale_with_hashrate(self):
+        odds = dashboard.block_odds("7200.00", 132757073449487.5)
+        self.assertAlmostEqual(odds["mean_seconds"] / (365 * 86400), 2511, delta=1)
+        self.assertAlmostEqual(odds["year"], 1 / 2511.6, delta=1e-6)
+        self.assertLess(odds["day"], odds["month"])
+        self.assertLess(odds["month"], odds["year"])
+        doubled = dashboard.block_odds(14400, 132757073449487.5)
+        self.assertAlmostEqual(doubled["mean_seconds"] * 2, odds["mean_seconds"])
+        self.assertIsNone(dashboard.block_odds("-", 132757073449487.5))
+        self.assertIsNone(dashboard.block_odds(0, 132757073449487.5))
+        self.assertIsNone(dashboard.block_odds(7200, None))
+
+    def test_format_block_odds(self):
+        stat, title = dashboard.format_block_odds(
+            dashboard.block_odds(7200, 132757073449487.5)
+        )
+        self.assertEqual(stat, "1 in 2.51k")
+        self.assertEqual(
+            title,
+            "Chance to find a block solo\n"
+            "Day 1 in 916.58k\n"
+            "Month 1 in 30.55k\n"
+            "Year 1 in 2.51k (0.040%)\n"
+            "Average wait about 2,511 years",
+        )
+        self.assertEqual(dashboard.format_block_odds(None), ("-", ""))
+
     def test_failed_difficulty_fetch_keeps_the_last_value(self):
         app = TunerDashboard()
         with mock.patch(
@@ -1495,7 +1522,17 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(snapshot["fleet"]["online"], 1)
         self.assertEqual(snapshot["fleet"]["hash"], "1.00 TH/s")
         self.assertEqual(snapshot["fleet"]["hold"], 1)
+        self.assertEqual(snapshot["fleet"]["odds"], "-")
+        self.assertEqual(snapshot["fleet"]["odds_title"], "")
         self.assertIn("start", snapshot["scan_range"])
+        with mock.patch(
+            "dashboard.read_network_status",
+            return_value={"difficulty": 132757073449487.5, "pools": []},
+        ):
+            app._refresh_network()
+        fleet = app.get_snapshot(0)["fleet"]
+        self.assertEqual(fleet["odds"], "1 in 18.08k")
+        self.assertIn("Average wait about 18,081 years", fleet["odds_title"])
 
     def test_background_notice_for_offline_power_fault_and_overheat(self):
         app = TunerDashboard()

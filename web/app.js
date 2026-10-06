@@ -520,6 +520,7 @@ function renderFleet(fleet, miners) {
   if (shown(fleet.hash)) addStat(fleetEl, "Hash", fleet.hash);
   if (shown(fleet.watts)) addStat(fleetEl, "Power", `${fleet.watts} W`);
   if (shown(fleet.jth)) addStat(fleetEl, "", fleet.jth, "", "", "J/TH");
+  if (shown(fleet.odds)) addStat(fleetEl, "Odds/yr", fleet.odds, "", fleet.odds_title);
   if (fleet.hold) addStat(fleetEl, "Holding", String(fleet.hold), "hold");
   if (fleet.trim) addStat(fleetEl, "Trimming", String(fleet.trim), "trim");
   fleetEl.hidden = false;

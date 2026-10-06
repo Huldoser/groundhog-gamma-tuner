@@ -628,6 +628,55 @@ def fleet_summary(rows):
     }
 
 
+SECONDS_PER_DAY = 86400
+# Each hash beats difficulty D with chance 1 / (D * 2^32).
+HASHES_PER_DIFFICULTY = 2**32
+ODDS_WINDOWS = (("day", 1), ("month", 30), ("year", 365))
+
+
+def block_odds(hash_ghs, difficulty):
+    """Mean seconds to a solo block, and the chance of one per day, month, and year.
+
+    None when the hashrate (GH/s) or the network difficulty is missing or not positive.
+    """
+    rate = _plain_number(hash_ghs)
+    diff = _plain_number(difficulty)
+    if rate is None or diff is None or rate <= 0 or diff <= 0:
+        return None
+    mean_seconds = diff * HASHES_PER_DIFFICULTY / (rate * 1e9)
+    odds = {"mean_seconds": mean_seconds}
+    for name, days in ODDS_WINDOWS:
+        odds[name] = -math.expm1(-days * SECONDS_PER_DAY / mean_seconds)
+    return odds
+
+
+def _one_in(chance):
+    if chance >= 0.5:
+        return f"{chance * 100:.0f}%"
+    return f"1 in {format_difficulty(1.0 / chance)}"
+
+
+def _wait_text(seconds):
+    days = seconds / SECONDS_PER_DAY
+    if days >= 365:
+        return f"{days / 365:,.0f} years"
+    if days >= 1:
+        return f"{days:,.0f} days"
+    return f"{seconds / 3600:,.1f} hours"
+
+
+def format_block_odds(odds):
+    """Stat text for the yearly chance, and a tooltip with day, month, year, and mean wait."""
+    if not odds:
+        return "-", ""
+    lines = ["Chance to find a block solo"]
+    for name, _days in ODDS_WINDOWS:
+        lines.append(f"{name.capitalize()} {_one_in(odds[name])}")
+    lines[-1] += f" ({odds['year'] * 100:.3f}%)"
+    lines.append(f"Average wait about {_wait_text(odds['mean_seconds'])}")
+    return _one_in(odds["year"]), "\n".join(lines)
+
+
 def alert_kind(row):
     """The background notice for one row. Offline wins over a fault still on the last sample."""
     phase = str((row or {}).get("phase") or "").strip().lower()
@@ -1227,6 +1276,7 @@ class TunerDashboard:
         self._network = {
             "difficulty": "-",
             "difficulty_title": "",
+            "difficulty_value": None,
             "pools": [{"name": host, "online": None} for host, _port in POOLS],
         }
         self._latest_firmware = ""
@@ -1370,6 +1420,9 @@ class TunerDashboard:
                 self._focused = _as_bool(focused)
             self._reap_threads_locked()
             summary = fleet_summary(self._rows)
+            odds, odds_title = format_block_odds(
+                block_odds(summary["hash"], self._network["difficulty_value"])
+            )
             latest = self._latest_firmware
             miners = []
             for row in self._rows:
@@ -1399,6 +1452,8 @@ class TunerDashboard:
                     "hash": format_hashrate(summary["hash"]),
                     "watts": summary["watts"],
                     "jth": summary["jth"],
+                    "odds": odds,
+                    "odds_title": odds_title,
                 },
                 "scan_range": dict(self._scan_range),
                 "config_error": config_problem(),
@@ -1418,6 +1473,7 @@ class TunerDashboard:
             if number is not None:
                 self._network["difficulty"] = format_difficulty(number)
                 self._network["difficulty_title"] = difficulty_title(number)
+                self._network["difficulty_value"] = number
             self._network["pools"] = status["pools"]
 
     def _refresh_firmware(self, now=None):
