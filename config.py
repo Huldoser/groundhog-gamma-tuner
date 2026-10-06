@@ -28,7 +28,7 @@ _config_corrupt = False
 HARD_MIN_FREQ = 350
 HARD_MAX_FREQ = 1100
 HARD_MIN_VOLT = 1000
-HARD_MAX_VOLT = 1400
+HARD_MAX_VOLT = 1500
 DEFAULT_MIN_INPUT_VOLTAGE = 4.9
 DEFAULT_MAX_ERROR_PERCENTAGE = 2.0
 DEFAULT_MAX_DROOP_MV = 40
@@ -67,9 +67,10 @@ FIRMWARE_TRIP_MARGIN_C = 4.0
 STOCK_FREQ = 525
 STOCK_VOLT = 1150
 
-# Per-miner caps for a custom-cooled Gamma 601. Still editable per chip.
-# The tuner climbs while the ASIC is at or under 68°C and the regulator at or
-# under 88°C, and steps down above them. After a heat retreat it waits until
+# Per-miner caps for a repasted, custom-cooled Gamma 601. Still editable per chip.
+# The tuner climbs while the ASIC is at or under 70°C and the regulator at or
+# under 95°C, and steps down above them. 70°C stays 1°C under the trip guard
+# and 5°C under the AxeOS cutoff; the regulator chip itself is rated far hotter. After a heat retreat it waits until
 # both are a tolerance band under their caps before climbing again. max_watts is a runaway guard, not the performance limit.
 # max_freq is the hard cap so a strong chip is not stopped early.
 GAMMA601_LIMITS = {
@@ -77,11 +78,11 @@ GAMMA601_LIMITS = {
     "max_freq": HARD_MAX_FREQ,
     "start_freq": STOCK_FREQ,
     "min_volt": HARD_MIN_VOLT,
-    "max_volt": 1300,
+    "max_volt": 1500,
     "start_volt": STOCK_VOLT,
-    "max_temp": 68,
+    "max_temp": 70,
     "max_watts": 50,
-    "max_vr_temp": 88,
+    "max_vr_temp": 95,
     "min_input_voltage": DEFAULT_MIN_INPUT_VOLTAGE,
     "max_error_percentage": DEFAULT_MAX_ERROR_PERCENTAGE,
     "max_droop_mv": DEFAULT_MAX_DROOP_MV,
@@ -296,6 +297,8 @@ def load_config():
             return default
 
         _drop_retired_keys(loaded)
+        if _raise_limits(loaded):
+            _write_config(loaded)
         _last_good_config = copy.deepcopy(loaded)
         _config_corrupt = False
         return loaded
@@ -334,6 +337,47 @@ def modify_config(mutator):
         if save_config(config) is False:
             return False
         return config
+
+
+# Bumped when the default caps rise and saved miners should follow once.
+LIMITS_VERSION = 2
+# Caps raised for every saved miner on the first load after the fleet was
+# repasted. A saved value that is already higher stays.
+RAISED_LIMITS = {"max_temp": 70, "max_vr_temp": 95, "max_volt": 1500}
+
+
+def _raise_limits(config):
+    """Raise saved miners to RAISED_LIMITS once. True when the config changed.
+
+    `limits_version` records that it ran, so a cap lowered later is not
+    raised again on the next load.
+    """
+    if not isinstance(config, dict):
+        return False
+    try:
+        version = int(config.get("limits_version", 1))
+    except (TypeError, ValueError):
+        version = 1
+    if version >= LIMITS_VERSION:
+        return False
+    try:
+        default_temp = float(config.get("default_target_temp"))
+    except (TypeError, ValueError):
+        default_temp = None
+    if default_temp is not None and default_temp < RAISED_LIMITS["max_temp"]:
+        config["default_target_temp"] = RAISED_LIMITS["max_temp"]
+    for miner in config.get("miners") or []:
+        if not isinstance(miner, dict):
+            continue
+        for key, value in RAISED_LIMITS.items():
+            try:
+                saved = float(miner.get(key))
+            except (TypeError, ValueError):
+                saved = None
+            if saved is None or saved < value:
+                miner[key] = value
+    config["limits_version"] = LIMITS_VERSION
+    return True
 
 
 def _drop_retired_keys(config):
@@ -396,11 +440,12 @@ def get_default_config():
         "voltage_step": 10,
         "frequency_step": 5,
         "monitor_interval": 5,
-        "default_target_temp": 68,
+        "default_target_temp": 70,
         "temp_tolerance": 3,
         "vr_temp_tolerance": 3,
         "refresh_interval": 180,
         "fast_start": True,
+        "limits_version": LIMITS_VERSION,
         "flatline_detection_enabled": False,
         "flatline_hashrate_repeat_count": 5,
         "miners": [],
