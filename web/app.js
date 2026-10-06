@@ -10,7 +10,7 @@ const GLOBAL_FIELDS = [
   "default_target_temp", "temp_tolerance", "vr_temp_tolerance",
   "flatline_hashrate_repeat_count",
 ];
-const FALLBACK_PROMPT = "Set every miner to the Gamma 601 stock clocks (525 MHz / 1150 mV) and make those its start clocks?\n\nStart Autotuner always tunes fresh from each miner's start clocks.";
+const FALLBACK_PROMPT = "Set every miner to the Gamma 601 stock clocks (525 MHz / 1150 mV) and make those its start clocks?\n\nThe next Start Autotuner tunes every miner up from there.";
 const FALLBACK_MINER_PROMPT = "Set {miner} to the Gamma 601 stock clocks (525 MHz / 1150 mV) and make those its start clocks?\n\nHistory marks the reset, so Since reset can start there.";
 
 const $ = (id) => document.getElementById(id);
@@ -782,6 +782,7 @@ async function openGlobal() {
   });
   $("flatline_detection_enabled").checked = Boolean(settings.flatline_detection_enabled);
   $("fast_start").checked = settings.fast_start !== false;
+  $("continue_from_live").checked = settings.continue_from_live !== false;
   openModal("global");
   $("voltage_step").focus();
 }
@@ -796,6 +797,7 @@ async function submitGlobal(event) {
   });
   settings.flatline_detection_enabled = $("flatline_detection_enabled").checked;
   settings.fast_start = $("fast_start").checked;
+  settings.continue_from_live = $("continue_from_live").checked;
   const result = await bridge.save_global_settings(settings);
   if (!result.ok) {
     setFormError("global-error", result.message);

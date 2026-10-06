@@ -2051,6 +2051,45 @@ def fast_start_enabled(runtime):
     return bool(value)
 
 
+def continue_from_live_enabled(runtime):
+    """True unless Global Settings turned off continuing from live clocks."""
+    value = (runtime or {}).get("continue_from_live", True)
+    if isinstance(value, str):
+        return value.strip().lower() not in ("0", "false", "no", "off", "")
+    return bool(value)
+
+
+def live_start_clocks(info, limits):
+    """The clocks a healthy miner is running now, as `(frequency, voltage)`, or None.
+
+    A restarted session continues from these instead of the start clocks.
+    They come from the miner, not from anything saved. None when a clock is
+    missing or outside this miner's limits (AxeOS saves clocks under the floor
+    after a trip), or the miner is in overheat mode, has a power fault, has
+    its ASIC off, or has stopped hashing with the pool still up.
+    """
+    if not isinstance(info, dict):
+        return None
+    frequency = coerce_limit(info.get("frequency"))
+    voltage = coerce_limit(info.get("coreVoltage"))
+    if frequency is None or voltage is None:
+        return None
+    if not limits["min_freq"] <= frequency <= limits["max_freq"]:
+        return None
+    if not limits["min_volt"] <= voltage <= limits["max_volt"]:
+        return None
+    if _overheat_mode_set(info.get("overheat_mode")) or _power_fault_set(
+        info.get("power_fault")
+    ):
+        return None
+    power = _as_float(info.get("power"))
+    if power is not None and power <= ASIC_OFF_POWER_WATTS:
+        return None
+    if board_hashrate_is_dead(info) and not pool_is_down(info):
+        return None
+    return frequency, voltage
+
+
 def ramp_voltage(
     frequency, start_frequency, start_voltage, floor_voltage, max_volt, voltage_step
 ):
@@ -2617,12 +2656,20 @@ def monitor_and_adjust(
         start_frequency = limits["min_freq"]
     if start_voltage is None:
         start_voltage = limits["min_volt"]
-    # Every session starts fresh from the start clocks. Nothing learned in an
-    # earlier session carries over: weather, paste, and voltage all change.
+    # Nothing learned in an earlier session carries over: weather, paste, and
+    # voltage all change. A healthy miner continues from the clocks it is
+    # running now; anything else starts from the start clocks.
     start_frequency = _clamp(start_frequency, limits["min_freq"], limits["max_freq"])
     start_voltage = _clamp(start_voltage, limits["min_volt"], limits["max_volt"])
 
     runtime = load_config()
+    live = live_start_clocks(info, limits)
+    if live is not None and continue_from_live_enabled(runtime):
+        start_frequency, start_voltage = live
+        log_callback(
+            f"{bitaxe_ip} -> Continuing from the miner's {live[0]} MHz / {live[1]} mV.",
+            "info",
+        )
     interval = _non_negative_float(runtime.get("monitor_interval", interval), 5)
     frequency_step = _positive_int(runtime.get("frequency_step"), 5)
     voltage_step = _positive_int(runtime.get("voltage_step"), 10)

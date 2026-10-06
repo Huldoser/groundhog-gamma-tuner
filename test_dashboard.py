@@ -960,10 +960,16 @@ class SnapshotTests(unittest.TestCase):
             self.assertTrue(app.save_global_settings(settings)["ok"])
             self.assertFalse(config.load_config()["fast_start"])
             self.assertFalse(app.get_global_settings()["settings"]["fast_start"])
-            # A page that does not send the switch leaves it on.
+            self.assertTrue(settings["continue_from_live"])
+            settings["continue_from_live"] = False
+            self.assertTrue(app.save_global_settings(settings)["ok"])
+            self.assertFalse(config.load_config()["continue_from_live"])
+            # A page that does not send a switch leaves it on.
+            settings.pop("continue_from_live")
             settings.pop("fast_start")
             self.assertTrue(app.save_global_settings(settings)["ok"])
             self.assertTrue(config.load_config()["fast_start"])
+            self.assertTrue(config.load_config()["continue_from_live"])
 
     def test_global_settings_save_vr_tolerance(self):
         with temp_config():

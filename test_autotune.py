@@ -21,6 +21,7 @@ FAST_CONFIG = {
     "flatline_hashrate_repeat_count": 5,
     "max_climb_steps": 1,
     "fast_start": False,
+    "continue_from_live": False,
 }
 
 
@@ -1702,6 +1703,32 @@ class DecisionTests(unittest.TestCase):
         scale = (20.0 - autotune.BOARD_POWER_W) / (525 * 1.15**2)
         amps = scale * capped[2] * (aim_volts / 1000) ** 2 / (aim_volts / 1000)
         self.assertLessEqual(amps, 20 - autotune.RAMP_CURRENT_HEADROOM_A)
+
+    def test_live_start_clocks_only_for_a_healthy_miner_inside_its_limits(self):
+        limits = {"min_freq": 400, "max_freq": 800, "min_volt": 1000, "max_volt": 1400}
+        healthy = _info(frequency=700, voltage=1250, power=20, hashRate_1m=1400)
+        self.assertEqual(autotune.live_start_clocks(healthy, limits), (700, 1250))
+        for change in (
+            {"frequency": 350},
+            {"frequency": 850},
+            {"coreVoltage": 950},
+            {"coreVoltage": 1450},
+            {"frequency": None},
+            {"overheat_mode": 1},
+            {"power_fault": "VIN_UV"},
+            {"power": 5.0},
+            {"hashRate": 0, "hashRate_1m": 0},
+        ):
+            self.assertIsNone(
+                autotune.live_start_clocks(dict(healthy, **change), limits), change
+            )
+        # No hashing because the pool is down is not the miner's fault.
+        stalled = dict(healthy, hashRate=0, hashRate_1m=0, poolDifficulty=0)
+        self.assertEqual(autotune.live_start_clocks(stalled, limits), (700, 1250))
+        self.assertFalse(
+            autotune.continue_from_live_enabled({"continue_from_live": False})
+        )
+        self.assertTrue(autotune.continue_from_live_enabled({}))
 
     def test_ramp_voltage_follows_its_line_inside_the_bounds(self):
         args = {"start_frequency": 525, "start_voltage": 1150, "voltage_step": 10}
@@ -3413,6 +3440,44 @@ class SessionTests(unittest.TestCase):
         self.assertIn((495, 1100), state["calls"])
         self.assertIn((490, 1100), state["calls"])
         self.assertTrue(all(volt == 1100 for _freq, volt in state["calls"]))
+
+    def _first_write_from(self, **reading):
+        """First clocks written for a miner reporting `reading`, with continue on."""
+        calls = []
+        logs = []
+        stop_event = threading.Event()
+        runtime = dict(FAST_CONFIG, continue_from_live=True)
+
+        def set_settings(ip, volt, freq):
+            calls.append((int(freq), int(volt)))
+            stop_event.set()
+            return (
+                f"{ip} -> Applied settings: Voltage = {volt}mV, Frequency = {freq}MHz"
+            )
+
+        with patched_io(
+            lambda ip: _info(**reading), set_settings, runtime_config=runtime
+        ):
+            thread = _start_miner(
+                "miner", stop_event, lambda message, level="info": logs.append(message)
+            )
+            thread.join(3)
+        self.assertFalse(thread.is_alive())
+        return calls[0], logs
+
+    def test_a_restart_continues_from_the_live_clocks(self):
+        first, logs = self._first_write_from(
+            frequency=700, voltage=1250, hashRate=1400, hashRate_1m=1400
+        )
+        self.assertEqual(first, (700, 1250))
+        self.assertTrue(any("Continuing from the miner's 700 MHz" in m for m in logs))
+
+    def test_a_miner_in_overheat_mode_starts_from_the_start_clocks(self):
+        first, logs = self._first_write_from(
+            frequency=700, voltage=1250, overheat_mode=1, temp=40, vrTemp=30
+        )
+        self.assertEqual(first, (400, 1100))
+        self.assertFalse(any("Continuing" in m for m in logs))
 
     def _fast_start_session(self, need_voltage=None, hot_above=None, **limits):
         """Run a fast start on a miner whose heat follows its power.

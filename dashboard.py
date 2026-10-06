@@ -33,6 +33,7 @@ from autotune import (
     _publish_status,
     coerce_limit,
     coerce_real_limit,
+    continue_from_live_enabled,
     core_amps_cap,
     core_current_amps,
     fast_start_enabled,
@@ -976,7 +977,7 @@ def blank_miner_row(nickname, ip):
 BASELINE_PROMPT = (
     f"Set every miner to the Gamma 601 stock clocks ({STOCK_FREQ} MHz / {STOCK_VOLT} mV) "
     "and make those its start clocks?\n\n"
-    "Start Autotuner always tunes fresh from each miner's start clocks."
+    "The next Start Autotuner tunes every miner up from there."
 )
 # {miner} is replaced on the page with the selected miner's name and address.
 MINER_BASELINE_PROMPT = (
@@ -2319,6 +2320,7 @@ class TunerDashboard:
         config = load_config()
         settings = {key: config.get(key, "") for key in GLOBAL_INT_FIELDS}
         settings["fast_start"] = fast_start_enabled(config)
+        settings["continue_from_live"] = continue_from_live_enabled(config)
         settings["flatline_detection_enabled"] = bool(
             config.get("flatline_detection_enabled", False)
         )
@@ -2335,6 +2337,9 @@ class TunerDashboard:
             new_settings = {key: int(settings[key]) for key in GLOBAL_INT_FIELDS}
             # A page that does not know the switch leaves it on.
             new_settings["fast_start"] = _as_bool(settings.get("fast_start", True))
+            new_settings["continue_from_live"] = _as_bool(
+                settings.get("continue_from_live", True)
+            )
             new_settings["flatline_detection_enabled"] = _as_bool(
                 settings.get("flatline_detection_enabled")
             )

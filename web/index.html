@@ -254,7 +254,8 @@
       </fieldset>
       <fieldset>
         <legend>Start</legend>
-        <p class="hint">Every start is fresh from each miner's start clocks. With fast start, the tuner jumps frequency and voltage toward a point 6 °C under the heat caps, judging the heat from each jump, then fine-tunes in small steps. Without it, the whole climb is in small steps.</p>
+        <p class="hint">Nothing learned is saved between runs. With continue on, a miner that is hashing inside its limits picks up from the clocks it is running now; otherwise it starts from its start clocks. Reset to Baseline puts a miner back on stock. With fast start, the tuner jumps frequency and voltage toward a point 6 °C under the heat caps, judging the heat from each jump, then fine-tunes in small steps.</p>
+        <label class="check"><input id="continue_from_live" type="checkbox"> Continue from current clocks</label>
         <label class="check"><input id="fast_start" type="checkbox"> Fast start</label>
       </fieldset>
       <fieldset>

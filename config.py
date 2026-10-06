@@ -445,6 +445,7 @@ def get_default_config():
         "vr_temp_tolerance": 3,
         "refresh_interval": 180,
         "fast_start": True,
+        "continue_from_live": True,
         "limits_version": LIMITS_VERSION,
         "flatline_detection_enabled": False,
         "flatline_hashrate_repeat_count": 5,
