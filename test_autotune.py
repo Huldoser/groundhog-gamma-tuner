@@ -1610,8 +1610,8 @@ class DecisionTests(unittest.TestCase):
         self.assertEqual(autotune.core_current_amps({"current": 26.1}), 26.1)
         self.assertIsNone(autotune.core_current_amps({"current": 0}))
         self.assertIsNone(autotune.core_current_amps({}))
-        self.assertEqual(autotune.core_amps_cap({}), 28.0)
-        self.assertEqual(autotune.core_amps_cap({"max_core_amps": ""}), 28.0)
+        self.assertEqual(autotune.core_amps_cap({}), 29.0)
+        self.assertEqual(autotune.core_amps_cap({"max_core_amps": ""}), 29.0)
         self.assertEqual(autotune.core_amps_cap({"max_core_amps": 26}), 26.0)
         self.assertEqual(autotune.core_amps_cap({"max_core_amps": 35}), 29.0)
 
@@ -6137,6 +6137,41 @@ class InstallAndConfigTests(unittest.TestCase):
                     config.get_default_config()["limits_version"],
                     config.LIMITS_VERSION,
                 )
+            finally:
+                config.CONFIG_FILE = old_path
+                config._last_good_config = old_last
+
+    def test_a_new_limit_step_leaves_earlier_steps_alone(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "config.json")
+            old_path = config.CONFIG_FILE
+            old_last = config._last_good_config
+            try:
+                config.CONFIG_FILE = path
+                config._last_good_config = None
+                # Already raised once; the user then lowered a cap.
+                saved = {
+                    "limits_version": 2,
+                    "default_target_temp": 66,
+                    "miners": [
+                        {
+                            "ip": "a",
+                            "max_temp": 66,
+                            "max_volt": 1400,
+                            "max_core_amps": 28,
+                        },
+                        {"ip": "b", "max_temp": 70},
+                    ],
+                }
+                with open(path, "w", encoding="utf-8") as handle:
+                    json.dump(saved, handle)
+                loaded = config.load_config()
+                first, second = loaded["miners"]
+                self.assertEqual(first["max_core_amps"], 29.0)
+                self.assertEqual(second["max_core_amps"], 29.0)
+                self.assertEqual((first["max_temp"], first["max_volt"]), (66, 1400))
+                self.assertEqual(loaded["default_target_temp"], 66)
+                self.assertEqual(loaded["limits_version"], 3)
             finally:
                 config.CONFIG_FILE = old_path
                 config._last_good_config = old_last

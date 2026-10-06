@@ -941,7 +941,7 @@ class SnapshotTests(unittest.TestCase):
         with temp_config([miner]):
             app = TunerDashboard()
             row = app.get_autotuner_settings()["miners"][0]
-            self.assertEqual(row["fields"]["max_core_amps"], "28.0")
+            self.assertEqual(row["fields"]["max_core_amps"], "29.0")
             fields = dict(row["fields"], max_core_amps="35")
             saved = app.save_autotuner_settings(
                 [{"ip": "10.0.0.8", "enabled": True, "fields": fields}]

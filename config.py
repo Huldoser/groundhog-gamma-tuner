@@ -34,9 +34,10 @@ DEFAULT_MAX_ERROR_PERCENTAGE = 2.0
 DEFAULT_MAX_DROOP_MV = 40
 # Regulator output current. AxeOS sets the Gamma's TPS546 to warn at 25 A and
 # shut down with no retry at 30 A. The tuner stays at or under this cap, and a
-# saved cap is never above HARD_MAX_CORE_AMPS. At 1.4 V, 28 A is also about
-# 44 W at the 5 V plug.
-DEFAULT_MAX_CORE_AMPS = 28.0
+# saved cap is never above HARD_MAX_CORE_AMPS. 29 A leaves about 1 A for an
+# overshoot between polls; a trip stops mining until the tuner restarts it.
+# At 1.4 V, 29 A is also about 46 W at the 5 V plug.
+DEFAULT_MAX_CORE_AMPS = 29.0
 HARD_MAX_CORE_AMPS = 29.0
 # Settings and learned values an older version saved. Each session now starts
 # fresh, so they are dropped on load and save.
@@ -354,17 +355,22 @@ def modify_config(mutator):
 
 
 # Bumped when the default caps rise and saved miners should follow once.
-LIMITS_VERSION = 2
-# Caps raised for every saved miner on the first load after the fleet was
-# repasted. A saved value that is already higher stays.
-RAISED_LIMITS = {"max_temp": 70, "max_vr_temp": 95, "max_volt": 1500}
+LIMITS_VERSION = 3
+# Caps each version raises on saved miners. A config at an older version gets
+# every later step once; a saved value that is already higher stays.
+RAISED_LIMITS = {
+    # The fleet was repasted.
+    2: {"max_temp": 70, "max_vr_temp": 95, "max_volt": 1500},
+    # The user asked for 29 A.
+    3: {"max_core_amps": DEFAULT_MAX_CORE_AMPS},
+}
 
 
 def _raise_limits(config):
-    """Raise saved miners to RAISED_LIMITS once. True when the config changed.
+    """Apply each RAISED_LIMITS step newer than the saved `limits_version`.
 
-    `limits_version` records that it ran, so a cap lowered later is not
-    raised again on the next load.
+    True when the config changed. `limits_version` records what ran, so a cap
+    lowered later is not raised again, and a new step leaves older ones alone.
     """
     if not isinstance(config, dict):
         return False
@@ -374,16 +380,21 @@ def _raise_limits(config):
         version = 1
     if version >= LIMITS_VERSION:
         return False
-    try:
-        default_temp = float(config.get("default_target_temp"))
-    except (TypeError, ValueError):
-        default_temp = None
-    if default_temp is not None and default_temp < RAISED_LIMITS["max_temp"]:
-        config["default_target_temp"] = RAISED_LIMITS["max_temp"]
+    raises = {}
+    for step in sorted(RAISED_LIMITS):
+        if step > version:
+            raises.update(RAISED_LIMITS[step])
+    if "max_temp" in raises:
+        try:
+            default_temp = float(config.get("default_target_temp"))
+        except (TypeError, ValueError):
+            default_temp = None
+        if default_temp is not None and default_temp < raises["max_temp"]:
+            config["default_target_temp"] = raises["max_temp"]
     for miner in config.get("miners") or []:
         if not isinstance(miner, dict):
             continue
-        for key, value in RAISED_LIMITS.items():
+        for key, value in raises.items():
             try:
                 saved = float(miner.get(key))
             except (TypeError, ValueError):
