@@ -5899,6 +5899,8 @@ class InstallAndConfigTests(unittest.TestCase):
                 "error_alert": False,
                 "watts_alert": False,
                 "watts_title": "",
+                "amps": "-",
+                "amps_level": "",
                 "vin_alert": False,
                 "floor_alert": False,
                 "name_title": "",

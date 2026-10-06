@@ -19,6 +19,7 @@
         <nav class="view-tabs" role="tablist" aria-label="Screens">
           <button type="button" role="tab" id="tab-miners" class="view-tab" data-view="miners" aria-selected="true" aria-controls="miners-view">Miners</button>
           <button type="button" role="tab" id="tab-history" class="view-tab" data-view="history" aria-selected="false" aria-controls="history-view">History</button>
+          <button type="button" role="tab" id="tab-limits" class="view-tab" data-view="limits" aria-selected="false" aria-controls="limits-view">Limits</button>
         </nav>
       </div>
       <div class="commands">
@@ -65,7 +66,7 @@
                   <th aria-sort="none" title="Frequency and core voltage"><button type="button" class="sort" data-sort="freq">Clock</button></th>
                   <th aria-sort="none" title="ASIC and VR temperature"><button type="button" class="sort" data-sort="asic">Temp</button></th>
                   <th aria-sort="none" title="1-minute hashrate. Efficiency underneath, lower is better"><button type="button" class="sort" data-sort="hash">Hash</button></th>
-                  <th aria-sort="none" title="Power and input voltage"><button type="button" class="sort" data-sort="watts">Power</button></th>
+                  <th aria-sort="none" title="Power, core current, and input voltage"><button type="button" class="sort" data-sort="watts">Power</button></th>
                   <th aria-sort="descending" title="All-time best difficulty, then this session"><button type="button" class="sort" data-sort="best">Best</button></th>
                   <th aria-sort="none" title="Accepted and rejected shares, then error"><button type="button" class="sort" data-sort="shares">Shares</button></th>
                   <th aria-sort="none" title="Uptime"><button type="button" class="sort" data-sort="up">Up</button></th>
@@ -177,6 +178,10 @@
         <p id="history-attribution" class="attribution"></p>
       </div>
       <div id="chart-tip" class="chart-tip" role="status" hidden></div>
+    </main>
+
+    <main id="limits-view" class="workspace limits-view" role="tabpanel" aria-labelledby="tab-limits" hidden>
+      <div id="limits-body" class="limits-grid"></div>
     </main>
 
     <footer class="statusbar">

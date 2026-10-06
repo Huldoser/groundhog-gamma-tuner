@@ -24,10 +24,17 @@ import requests
 import history
 import weather
 from autotune import (
+    BM1370_HASHRATE_PER_MHZ,
+    BOARD_POWER_W,
     HASHRATE_1M_SETTLE_SECONDS,
+    RAMP_CURRENT_HEADROOM_A,
+    RAMP_HEADROOM_C,
     STARTUP_STAGGER_SECONDS,
     STOCK_FREQ,
     STOCK_VOLT,
+    TRIP_GUARD_FREQUENCY_STEPS,
+    TRIP_SAFE_MAX_TEMP,
+    TRIP_SAFE_MAX_VR_TEMP,
     _overheat_mode_set,
     _power_fault_set,
     _publish_status,
@@ -49,15 +56,30 @@ from autotune import (
     restart_was_accepted,
 )
 from config import (
+    AXEOS_LOW_INPUT_V,
     CONFIG_CORRUPT_MESSAGE,
     DEFAULT_MAX_CORE_AMPS,
     DEFAULT_MAX_DROOP_MV,
+    DEFAULT_MAX_ERROR_PERCENTAGE,
+    DEFAULT_MIN_INPUT_VOLTAGE,
+    FIRMWARE_ASIC_TRIP_C,
+    FIRMWARE_TRIP_MARGIN_C,
+    FIRMWARE_VR_TRIP_C,
     GAMMA601_LIMITS,
     HARD_MAX_CORE_AMPS,
     HARD_MAX_FREQ,
     HARD_MAX_VOLT,
     HARD_MIN_FREQ,
     HARD_MIN_VOLT,
+    TPS546_IOUT_FAULT_A,
+    TPS546_IOUT_WARN_A,
+    TPS546_OT_FAULT_C,
+    TPS546_OT_WARN_C,
+    TPS546_VIN_OFF_V,
+    TPS546_VIN_ON_V,
+    TPS546_VIN_OV_FAULT_V,
+    TPS546_VOUT_MAX_V,
+    TPS546_VOUT_MIN_V,
     adopted_hostname,
     config_problem,
     detect_miners,
@@ -75,6 +97,8 @@ STATUS_REFRESH_SECONDS = 5
 # Reads a miner may miss in a row before it shows as offline. A reboot or a
 # Wi-Fi blip misses one or two.
 OFFLINE_AFTER_MISSES = 3
+# Core current this close to a miner's cap shows amber in the table.
+CORE_AMPS_WARN_BAND = 1.0
 # Reads in a row with core voltage this far under its setting before the table
 # marks droop. The rail can lag a moment after a voltage change.
 DROOP_ALERT_READS = 3
@@ -232,6 +256,178 @@ _LIMIT_LABELS = {
     "input": "input sag",
     "current": "core current",
 }
+
+
+def hardware_limits():
+    """Sections for the Limits screen: what the chip, regulator, firmware,
+    and tuner allow. Tuner numbers come from the code, so the page cannot drift.
+
+    Each section is `{"title", "intro", "rows"}`; each row is `[name, value, note]`.
+    """
+    defaults = GAMMA601_LIMITS
+    full_push_watts = BOARD_POWER_W + HARD_MAX_CORE_AMPS * HARD_MAX_VOLT / 1000
+    return [
+        {
+            "title": "AxeOS firmware",
+            "intro": "Built into AxeOS v2.15.3. The tuner cannot change these; it stays under them.",
+            "rows": [
+                [
+                    "ASIC overheat cutoff",
+                    f"{FIRMWARE_ASIC_TRIP_C:g} °C",
+                    "Stops mining, cools, then restarts 100 MHz and 100 mV lower.",
+                ],
+                [
+                    "Regulator overheat cutoff",
+                    f"{FIRMWARE_VR_TRIP_C:g} °C",
+                    "Same as the ASIC cutoff, on the regulator sensor.",
+                ],
+                [
+                    "Low input warning",
+                    f"under {AXEOS_LOW_INPUT_V:g} V",
+                    "Shown as Danger: Low Voltage on the AxeOS page.",
+                ],
+                [
+                    "Board share of power",
+                    f"{BOARD_POWER_W:g} W",
+                    "AxeOS adds this to the regulator's output in the power reading.",
+                ],
+            ],
+        },
+        {
+            "title": "Voltage regulator (TPS546)",
+            "intro": "How AxeOS programs the Gamma's core regulator.",
+            "rows": [
+                [
+                    "Input on / off",
+                    f"{TPS546_VIN_ON_V:g} V / {TPS546_VIN_OFF_V:g} V",
+                    "Under the off voltage the core loses power and the ASIC stops.",
+                ],
+                [
+                    "Input over-voltage fault",
+                    f"{TPS546_VIN_OV_FAULT_V:g} V",
+                    "Highest supply voltage the board accepts.",
+                ],
+                [
+                    "Core voltage range",
+                    f"{TPS546_VOUT_MIN_V:.1f}–{TPS546_VOUT_MAX_V:.1f} V",
+                    "Anything outside is refused.",
+                ],
+                [
+                    "Core current warning",
+                    f"{TPS546_IOUT_WARN_A:g} A",
+                    "Flag only. Mining continues.",
+                ],
+                [
+                    "Core current shutdown",
+                    f"{TPS546_IOUT_FAULT_A:g} A",
+                    "Shuts down with no retry. Needs a restart.",
+                ],
+                [
+                    "Temperature warning / shutdown",
+                    f"{TPS546_OT_WARN_C} °C / {TPS546_OT_FAULT_C} °C",
+                    "Restarts by itself once it cools under the warning.",
+                ],
+            ],
+        },
+        {
+            "title": "BM1370 on the Gamma 601",
+            "intro": "",
+            "rows": [
+                [
+                    "Stock clocks",
+                    f"{STOCK_FREQ} MHz / {STOCK_VOLT} mV",
+                    "How the Gamma 601 ships.",
+                ],
+                [
+                    "Lowest presets",
+                    f"{HARD_MIN_FREQ} MHz / {HARD_MIN_VOLT} mV",
+                    "Lowest BM1370 clock and voltage in the AxeOS preset lists.",
+                ],
+                [
+                    "Hashrate per MHz",
+                    f"{BM1370_HASHRATE_PER_MHZ:g} GH/s",
+                    "2,040 small cores. 1,000 MHz is about 2 TH/s.",
+                ],
+            ],
+        },
+        {
+            "title": "Tuner hard limits",
+            "intro": "No setting goes past these.",
+            "rows": [
+                ["Frequency", f"{HARD_MIN_FREQ}–{HARD_MAX_FREQ} MHz", ""],
+                ["Core voltage", f"{HARD_MIN_VOLT}–{HARD_MAX_VOLT} mV", ""],
+                [
+                    "ASIC cap",
+                    f"up to {TRIP_SAFE_MAX_TEMP:g} °C",
+                    f"{FIRMWARE_TRIP_MARGIN_C:g} °C under the AxeOS cutoff. At it, the "
+                    f"tuner sheds {TRIP_GUARD_FREQUENCY_STEPS * 5} MHz and 10 mV at once.",
+                ],
+                [
+                    "Regulator cap",
+                    f"up to {TRIP_SAFE_MAX_VR_TEMP:g} °C",
+                    f"{FIRMWARE_TRIP_MARGIN_C:g} °C under the AxeOS cutoff.",
+                ],
+                [
+                    "Core current cap",
+                    f"up to {HARD_MAX_CORE_AMPS:g} A",
+                    f"Under the regulator's {TPS546_IOUT_FAULT_A:g} A shutdown.",
+                ],
+            ],
+        },
+        {
+            "title": "Defaults for a new miner",
+            "intro": "Per miner in AutoTuner Settings.",
+            "rows": [
+                [
+                    "Start clocks",
+                    f"{defaults['start_freq']} MHz / {defaults['start_volt']} mV",
+                    "Used when a miner is not already hashing inside its limits.",
+                ],
+                ["Max voltage", f"{defaults['max_volt']} mV", ""],
+                ["ASIC temperature", f"{defaults['max_temp']} °C", ""],
+                ["Regulator temperature", f"{defaults['max_vr_temp']} °C", ""],
+                [
+                    "Core current",
+                    f"{defaults['max_core_amps']:g} A",
+                    f"Fast start aims {RAMP_CURRENT_HEADROOM_A:g} A under it.",
+                ],
+                ["Power", f"{defaults['max_watts']} W", "A runaway guard."],
+                [
+                    "Input voltage floor",
+                    f"{DEFAULT_MIN_INPUT_VOLTAGE:g} V",
+                    "Steps down when the 5 V input sags under it.",
+                ],
+                ["Error budget", f"{DEFAULT_MAX_ERROR_PERCENTAGE:g}%", ""],
+                [
+                    "Fast start headroom",
+                    f"{RAMP_HEADROOM_C:g} °C",
+                    "Jumps aim this far under both temperature caps.",
+                ],
+            ],
+        },
+        {
+            "title": "5 V supply and wiring",
+            "intro": "Where heat collects outside the board.",
+            "rows": [
+                [
+                    "Board at full push",
+                    f"about {full_push_watts:.0f} W",
+                    f"{HARD_MAX_CORE_AMPS:g} A at {HARD_MAX_VOLT} mV, plus the board. "
+                    f"About {full_push_watts / 5:.0f} A through the 5 V plug.",
+                ],
+                [
+                    "5.5 × 2.1 mm barrel plug",
+                    "often rated 5 A",
+                    "The hottest point at full push. Too hot to hold means lower that miner's Watts.",
+                ],
+                [
+                    "Wire",
+                    "18 AWG or thicker",
+                    "Short runs, one cable per miner, tight terminals.",
+                ],
+            ],
+        },
+    ]
 
 
 def live_limit(status):
@@ -955,6 +1151,8 @@ def blank_miner_row(nickname, ip):
         "error_alert": False,
         "watts_alert": False,
         "watts_title": "",
+        "amps": "-",
+        "amps_level": "",
         "vin_alert": False,
         "floor_alert": False,
         "name_title": "",
@@ -1984,6 +2182,10 @@ class TunerDashboard:
         ).start()
         return {"ok": True, "location": place}
 
+    def get_hardware_limits(self):
+        """Chip, regulator, firmware, and tuner limits for the Limits screen."""
+        return {"ok": True, "sections": hardware_limits()}
+
     def get_history(self, filters=None):
         """Saved samples, summarized for the History screen."""
         filters = filters if isinstance(filters, dict) else {}
@@ -2613,7 +2815,9 @@ class TunerDashboard:
         amps_cap = core_amps_cap(stored)
         row["watts_alert"] = over_limit(
             miner_data.get("power"), stored.get("max_watts")
-        ) or (amps is not None and amps > amps_cap)
+        )
+        row["amps"] = "-" if amps is None else format_number(amps, 1)
+        row["amps_level"] = limit_level(amps, amps_cap, CORE_AMPS_WARN_BAND)
         row["watts_title"] = (
             "" if amps is None else f"Core current {amps:.1f} A of {amps_cap:g} A"
         )
@@ -2991,6 +3195,9 @@ class DashboardApi:
 
     def reset_miner_baseline(self, ip):
         return self._dashboard.reset_miner_baseline(ip)
+
+    def get_hardware_limits(self):
+        return self._dashboard.get_hardware_limits()
 
     def get_history(self, filters=None):
         return self._dashboard.get_history(filters)

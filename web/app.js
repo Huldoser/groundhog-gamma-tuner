@@ -351,6 +351,7 @@ function renderCell(miner, column) {
     if (!shown(miner.watts) && !shown(miner.vin)) cell.textContent = "-";
     else {
       if (shown(miner.watts)) addLine(cell, `${miner.watts} W`, miner.watts_alert ? "bad" : "");
+      if (shown(miner.amps)) addLine(cell, `${miner.amps} A`, levelClass(miner.amps_level, true));
       if (shown(miner.vin)) addLine(cell, `${miner.vin} V`, miner.vin_alert ? "bad" : "muted");
     }
     setTitle(cell, miner.watts_title);
@@ -692,6 +693,58 @@ async function removeSelected() {
   if (result && !result.ok && result.notice) showNotice(result.notice);
   if (result && result.ok) selectedIp = "";
   poll();
+}
+
+/* Limits screen: chip, regulator, firmware, and tuner limits */
+
+let limitsLoaded = false;
+
+function renderLimits(sections) {
+  const body = $("limits-body");
+  body.replaceChildren();
+  sections.forEach((section) => {
+    const card = document.createElement("section");
+    card.className = "card limits-card";
+    const title = document.createElement("h2");
+    title.textContent = section.title;
+    card.appendChild(title);
+    if (section.intro) {
+      const intro = document.createElement("p");
+      intro.className = "card-sub";
+      intro.textContent = section.intro;
+      card.appendChild(intro);
+    }
+    const table = document.createElement("table");
+    table.className = "limits-table";
+    const tbody = document.createElement("tbody");
+    section.rows.forEach(([name, value, note]) => {
+      const row = document.createElement("tr");
+      const label = document.createElement("th");
+      label.scope = "row";
+      label.textContent = name;
+      const figure = document.createElement("td");
+      figure.className = "limits-value";
+      figure.textContent = value;
+      const detail = document.createElement("td");
+      detail.className = "limits-note";
+      detail.textContent = note || "";
+      row.append(label, figure, detail);
+      tbody.appendChild(row);
+    });
+    table.appendChild(tbody);
+    card.appendChild(table);
+    body.appendChild(card);
+  });
+}
+
+async function loadLimits() {
+  const bridge = api();
+  if (!bridge || limitsLoaded) return;
+  const result = await bridge.get_hardware_limits();
+  if (result && result.ok) {
+    renderLimits(result.sections || []);
+    limitsLoaded = true;
+  }
 }
 
 function openEdit() {

@@ -951,6 +951,54 @@ class SnapshotTests(unittest.TestCase):
             self.assertEqual(stored["max_core_amps"], 29.0)
             self.assertTrue(stored["enabled"])
 
+    def test_core_current_shows_in_the_table_with_its_level(self):
+        app = TunerDashboard()
+        app._rows = [blank_miner_row("Alpha", "10.0.0.8")]
+        stored = {"nickname": "Alpha", "max_core_amps": 28}
+        for milliamps, text, level in (
+            (20000, "20.0", ""),
+            (27500, "27.5", "warn"),
+            (28400, "28.4", "bad"),
+        ):
+            info = {"frequency": 900, "coreVoltage": 1300, "current": milliamps}
+            with (
+                mock.patch("dashboard.get_system_info", return_value=info),
+                mock.patch("dashboard.get_miner_status", return_value={}),
+                mock.patch("dashboard.get_miner_defaults", return_value=stored),
+                mock.patch("dashboard.load_config", return_value={}),
+            ):
+                app.refresh_once()
+            row = app.get_snapshot(0)["miners"][0]
+            self.assertEqual((row["amps"], row["amps_level"]), (text, level))
+            self.assertIn(f"{text} A of 28 A", row["watts_title"])
+
+    def test_limits_screen_follows_the_code(self):
+        result = DashboardApi(TunerDashboard()).get_hardware_limits()
+        self.assertTrue(result["ok"])
+        rows = {
+            row[0]: row[1] for section in result["sections"] for row in section["rows"]
+        }
+        for section in result["sections"]:
+            self.assertTrue(section["title"])
+            for row in section["rows"]:
+                self.assertEqual(len(row), 3)
+                self.assertTrue(all(isinstance(cell, str) for cell in row))
+        self.assertEqual(rows["Core current shutdown"], "30 A")
+        self.assertEqual(rows["ASIC overheat cutoff"], "75 °C")
+        self.assertEqual(
+            rows["Core voltage"],
+            f"{config.HARD_MIN_VOLT}–{config.HARD_MAX_VOLT} mV",
+        )
+        self.assertEqual(
+            rows["ASIC temperature"], f"{config.GAMMA601_LIMITS['max_temp']} °C"
+        )
+        self.assertEqual(rows["Core current cap"], "up to 29 A")
+        page = os.path.join(os.path.dirname(dashboard.__file__), "web", "index.html")
+        with open(page, encoding="utf-8") as handle:
+            html = handle.read()
+        self.assertIn('data-view="limits"', html)
+        self.assertIn('id="limits-view"', html)
+
     def test_fast_start_is_on_by_default_and_saves(self):
         with temp_config():
             app = TunerDashboard()

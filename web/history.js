@@ -953,6 +953,7 @@ function setView(view) {
   historyState.view = view;
   $("miners-view").hidden = view !== "miners";
   $("history-view").hidden = view !== "history";
+  $("limits-view").hidden = view !== "limits";
   document.querySelectorAll(".view-tab").forEach((tab) => {
     tab.setAttribute("aria-selected", tab.dataset.view === view ? "true" : "false");
   });
@@ -961,6 +962,7 @@ function setView(view) {
   hideTip();
   clearInterval(historyState.timer);
   historyState.timer = null;
+  if (view === "limits") loadLimits();
   if (view === "history") {
     if (historyState.data) renderHistory(historyState.data);
     loadHistory();

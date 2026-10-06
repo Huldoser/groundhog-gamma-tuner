@@ -62,6 +62,20 @@ RETIRED_MINER_KEYS = (
 FIRMWARE_ASIC_TRIP_C = 75.0
 FIRMWARE_VR_TRIP_C = 105.0
 FIRMWARE_TRIP_MARGIN_C = 4.0
+# AxeOS v2.15.3 marks the input "Danger: Low Voltage" under 94.9% of 5 V.
+AXEOS_LOW_INPUT_V = 4.745
+
+# The Gamma's TPS546 regulator as AxeOS v2.15.3 sets it up
+# (main/power/TPS546.c, TPS546_CONFIG_DEFAULT). Shown on the Limits screen.
+TPS546_VIN_ON_V = 4.8
+TPS546_VIN_OFF_V = 4.5
+TPS546_VIN_OV_FAULT_V = 6.5
+TPS546_VOUT_MIN_V = 1.0
+TPS546_VOUT_MAX_V = 2.0
+TPS546_IOUT_WARN_A = 25.0
+TPS546_IOUT_FAULT_A = 30.0
+TPS546_OT_WARN_C = 105
+TPS546_OT_FAULT_C = 145
 
 # Gamma 601 clocks as they ship from the factory.
 STOCK_FREQ = 525
