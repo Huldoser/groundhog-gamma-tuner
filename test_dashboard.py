@@ -2094,21 +2094,35 @@ class WeatherLocationTests(unittest.TestCase):
             self.assertEqual(snapshot["weather"]["sky"], "snow")
             self.assertEqual(snapshot["weather"]["place"], MOOSE_JAW["name"])
 
-    def test_no_saved_place_tries_the_device_once(self):
+    def test_no_saved_place_reads_nothing_and_never_asks_the_device(self):
         with temp_config():
             config.modify_config(lambda saved: saved.update(weather_enabled=True))
             app = TunerDashboard()
-            with mock.patch(
-                "dashboard.weather.detect_device_location",
-                return_value=(None, "Device location needs Windows."),
-            ) as detect:
+            with (
+                mock.patch("dashboard.weather.detect_device_location") as detect,
+                mock.patch("dashboard.weather.read_current_weather") as read,
+            ):
                 app._refresh_weather_if_due(now=1_800_000_000)
                 app._refresh_weather_if_due(now=1_800_000_000, force=True)
-            detect.assert_called_once()
+            detect.assert_not_called()
+            read.assert_not_called()
             self.assertIsNone(app.get_snapshot()["weather"])
-            self.assertTrue(
-                any("Weather Location" in line["text"] for line in app._log)
+
+    def test_forgotten_location_stops_the_weather(self):
+        with temp_config():
+            config.modify_config(
+                lambda saved: saved.update(location=MOOSE_JAW, weather_enabled=True)
             )
+            app = TunerDashboard()
+            app._weather_now = {"outdoor_temp": -30.0, "weather_code": 71}
+            result = DashboardApi(app).clear_location()
+            self.assertEqual(result, {"ok": True, "location": None})
+            self.assertNotIn("location", config.load_config())
+            self.assertIsNone(app.get_location()["location"])
+            self.assertIsNone(app.get_snapshot()["weather"])
+            with mock.patch("dashboard.weather.read_current_weather") as read:
+                app._refresh_weather_if_due(now=1_800_000_000, force=True)
+            read.assert_not_called()
 
 
 class SetupAndPoolTests(unittest.TestCase):
@@ -2141,6 +2155,78 @@ class SetupAndPoolTests(unittest.TestCase):
             read.call_args.kwargs["pools"],
             [("solo.ckpool.org", 3333), ("public-pool.io", 21496)],
         )
+
+    def test_a_new_config_reads_nothing_from_the_internet(self):
+        with temp_config():
+            saved = config.load_config()
+            self.assertFalse(saved["weather_enabled"])
+            for key in config.INTERNET_SWITCHES:
+                self.assertFalse(saved[key], key)
+            app = TunerDashboard()
+            app._pool_targets = {"10.0.0.8": [("solo.ckpool.org", 3333)]}
+            app._closed = mock.Mock()
+            app._closed.is_set.side_effect = [False, True]
+            with (
+                mock.patch("dashboard.requests.get") as get,
+                mock.patch("dashboard.socket.create_connection") as connect,
+                mock.patch("dashboard.weather.read_current_weather") as weather_read,
+                mock.patch("dashboard.weather.detect_device_location") as detect,
+            ):
+                app._network_loop()
+            get.assert_not_called()
+            connect.assert_not_called()
+            weather_read.assert_not_called()
+            detect.assert_not_called()
+            network = app.get_snapshot(0)["network"]
+            self.assertFalse(network["difficulty_enabled"])
+            self.assertEqual(network["pools"], [])
+
+    def test_each_switch_turns_on_only_its_own_read(self):
+        with temp_config():
+            config.modify_config(
+                lambda saved: saved.update(
+                    network_stats_enabled=False,
+                    pool_check_enabled=True,
+                    firmware_check_enabled=False,
+                )
+            )
+            app = TunerDashboard()
+            app._pool_targets = {"10.0.0.8": [("solo.ckpool.org", 3333)]}
+            app._latest_firmware = "v2.15.3"
+            app._closed = mock.Mock()
+            app._closed.is_set.side_effect = [False, True]
+            with (
+                mock.patch(
+                    "dashboard.read_network_status",
+                    return_value={"difficulty": None, "pools": []},
+                ) as read,
+                mock.patch("dashboard.read_latest_stable_firmware") as firmware,
+            ):
+                app._network_loop()
+            read.assert_called_once_with(
+                pools=[("solo.ckpool.org", 3333)], difficulty=False
+            )
+            firmware.assert_not_called()
+            self.assertEqual(app._latest_firmware, "")
+
+    def test_difficulty_switched_off_never_asks_mempool(self):
+        get = mock.Mock()
+        status = dashboard.read_network_status(get=get, pools=(), difficulty=False)
+        get.assert_not_called()
+        self.assertEqual(status, {"difficulty": None, "pools": []})
+
+    def test_internet_switches_round_trip_through_global_settings(self):
+        with temp_config():
+            app = TunerDashboard()
+            settings = app.get_global_settings()["settings"]
+            for key in config.INTERNET_SWITCHES:
+                self.assertFalse(settings[key], key)
+            settings.update(network_stats_enabled=True, firmware_check_enabled=True)
+            self.assertTrue(app.save_global_settings(settings)["ok"])
+            saved = config.load_config()
+            self.assertTrue(saved["network_stats_enabled"])
+            self.assertFalse(saved["pool_check_enabled"])
+            self.assertTrue(saved["firmware_check_enabled"])
 
     def test_weather_stays_off_until_turned_on(self):
         with temp_config():
@@ -2180,6 +2266,7 @@ class SetupAndPoolTests(unittest.TestCase):
                     "goal": "efficiency",
                     "supply_watts": "30",
                     "weather": True,
+                    "pool_check": True,
                 }
             )
             self.assertEqual(
@@ -2188,6 +2275,10 @@ class SetupAndPoolTests(unittest.TestCase):
             saved = config.load_config()
             self.assertTrue(saved["setup_done"])
             self.assertTrue(saved["weather_enabled"])
+            # A box left clear keeps its read off.
+            self.assertTrue(saved["pool_check_enabled"])
+            self.assertFalse(saved["network_stats_enabled"])
+            self.assertFalse(saved["firmware_check_enabled"])
             self.assertEqual(saved["default_mode"], "efficiency")
             self.assertTrue(app.get_setup_state()["setup_done"])
             new = config.new_miner_record("x", "1.2.3.4", "n", saved)

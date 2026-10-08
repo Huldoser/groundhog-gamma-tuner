@@ -10,6 +10,10 @@ const GLOBAL_FIELDS = [
   "default_target_temp", "temp_tolerance", "vr_temp_tolerance",
   "flatline_hashrate_repeat_count",
 ];
+// Global Settings switches for each read that leaves the local network.
+const INTERNET_SWITCHES = [
+  "weather_enabled", "network_stats_enabled", "pool_check_enabled", "firmware_check_enabled",
+];
 const FALLBACK_PROMPT = "Set every miner to the Gamma 601 stock clocks (525 MHz / 1150 mV) and make those its start clocks?\n\nThe next Start Autotuner tunes every miner up from there.";
 const FALLBACK_MINER_PROMPT = "Set {miner} to the {board} stock clocks ({stock}) and make those its start clocks?\n\nHistory marks the reset, so Since reset can start there.";
 
@@ -473,6 +477,7 @@ function renderNetwork(network) {
   const diff = $("network-diff");
   diff.textContent = network.difficulty || "--";
   const label = diff.parentElement;
+  label.hidden = network.difficulty_enabled === false;
   const exact = network.difficulty_title || "";
   label.title = exact
     ? `Difficulty a share must beat to find a block\n${exact}`
@@ -847,7 +852,9 @@ async function openGlobal() {
   $("fast_start").checked = settings.fast_start !== false;
   $("continue_from_live").checked = settings.continue_from_live !== false;
   fillSelect($("default_mode"), settings.modes || [], settings.default_mode);
-  $("weather_enabled").checked = settings.weather_enabled !== false;
+  INTERNET_SWITCHES.forEach((key) => {
+    $(key).checked = settings[key] !== false;
+  });
   openModal("global");
   $("voltage_step").focus();
 }
@@ -864,7 +871,9 @@ async function submitGlobal(event) {
   settings.fast_start = $("fast_start").checked;
   settings.continue_from_live = $("continue_from_live").checked;
   if ($("default_mode").value) settings.default_mode = $("default_mode").value;
-  settings.weather_enabled = $("weather_enabled").checked;
+  INTERNET_SWITCHES.forEach((key) => {
+    settings[key] = $(key).checked;
+  });
   const result = await bridge.save_global_settings(settings);
   if (!result.ok) {
     setFormError("global-error", result.message);
@@ -1132,6 +1141,7 @@ function bind() {
       const id = element.getAttribute("data-close");
       if (id === "scan") closeScan();
       else if (id === "confirm") settleConfirm(false);
+      else if (id === "location") closeLocation();
       else closeModal(id);
     });
   });
@@ -1207,6 +1217,10 @@ function bind() {
       const open = ["tuner", "global", "edit", "scan", "location"].find((id) => !$(id).hidden);
       if (open === "scan") {
         closeScan();
+        return;
+      }
+      if (open === "location") {
+        closeLocation();
         return;
       }
       if (open) {
@@ -1296,13 +1310,18 @@ async function submitSetup(event) {
     acknowledged: $("setup-ack").checked,
     supply_watts: $("setup-watts").value.trim(),
     weather: $("setup-weather").checked,
+    network_stats: $("setup-network-stats").checked,
+    pool_check: $("setup-pool-check").checked,
+    firmware_check: $("setup-firmware-check").checked,
   });
   if (!result || !result.ok) {
     setFormError("setup-error", (result && result.message) || "Setup was not saved.");
     return;
   }
   closeModal("setup");
-  openScan();
+  // Weather needs a place the user picks. Find miners once that is done.
+  if ($("setup-weather").checked) openLocation({ then: openScan });
+  else openScan();
 }
 
 function startPolling() {

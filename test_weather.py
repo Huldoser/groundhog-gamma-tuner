@@ -141,13 +141,22 @@ class DetectTests(unittest.TestCase):
                 stderr="",
             )
 
-        get = _get_returning({"address": {"city": "Moose Jaw", "state": "Saskatchewan"}})
+        looked_up = []
+        get = _get_returning(
+            {"address": {"city": "Moose Jaw", "state": "Saskatchewan"}}, looked_up
+        )
         place, error = weather.detect_device_location(
             run=run, get=get, platform="win32"
         )
         self.assertEqual(error, "")
         self.assertEqual(place["name"], "Moose Jaw, Saskatchewan")
         self.assertEqual(place["source"], "device")
+        # The exact fix never leaves the machine or reaches the settings file.
+        self.assertEqual((place["latitude"], place["longitude"]), (50.4, -105.53))
+        self.assertEqual(
+            (looked_up[0]["params"]["lat"], looked_up[0]["params"]["lon"]),
+            (50.4, -105.53),
+        )
         self.assertEqual(seen["command"][0], "powershell.exe")
         self.assertIn("GeoCoordinateWatcher", seen["command"][-1])
         self.assertEqual(seen["kwargs"]["timeout"], weather.DETECT_TIMEOUT_SECONDS)

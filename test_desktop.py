@@ -60,7 +60,7 @@ class DataDirTests(unittest.TestCase):
 
     def test_packaged_app_uses_the_user_data_folder(self):
         join = config.os.path.join
-        home = "/home/sam"
+        home = "/home/satoshi"
         self.assertEqual(
             config.data_dir(True, "linux", {}, home),
             join(home, ".config", "groundhog-gamma-tuner"),
@@ -70,15 +70,20 @@ class DataDirTests(unittest.TestCase):
             join("/xdg", "groundhog-gamma-tuner"),
         )
         self.assertEqual(
-            config.data_dir(True, "darwin", {}, "/Users/sam"),
+            config.data_dir(True, "darwin", {}, "/Users/satoshi"),
             config.os.path.join(
-                "/Users/sam", "Library", "Application Support", "Groundhog Gamma Tuner"
+                "/Users/satoshi",
+                "Library",
+                "Application Support",
+                "Groundhog Gamma Tuner",
             ),
         )
         self.assertEqual(
-            config.data_dir(True, "win32", {"APPDATA": "C:/Users/sam/AppData/Roaming"}),
+            config.data_dir(
+                True, "win32", {"APPDATA": "C:/Users/satoshi/AppData/Roaming"}
+            ),
             config.os.path.join(
-                "C:/Users/sam/AppData/Roaming", "Groundhog Gamma Tuner"
+                "C:/Users/satoshi/AppData/Roaming", "Groundhog Gamma Tuner"
             ),
         )
 

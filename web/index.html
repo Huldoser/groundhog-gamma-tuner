@@ -248,7 +248,7 @@
     <div class="backdrop" data-close="setup"></div>
     <form id="setup-form" class="dialog dialog-wide">
       <h2>Set Up the Tuner</h2>
-      <p class="hint">Four questions decide how new miners are tuned. You can change all of it later in Global Settings and AutoTuner Settings.</p>
+      <p class="hint">A few questions decide how new miners are tuned and whether the app may use the internet. You can change all of it later in Global Settings and AutoTuner Settings.</p>
       <fieldset>
         <legend>Cooling</legend>
         <label class="check"><input type="radio" name="setup-cooling" value="stock"> Stock heatsink and fan</label>
@@ -269,9 +269,16 @@
         <p class="hint">What your supply and wiring can give each miner. The tuner steps down above it. Blank uses each board's AxeOS max power (40 W on a Gamma).</p>
       </fieldset>
       <fieldset>
-        <legend>History</legend>
-        <label class="check"><input id="setup-weather" type="checkbox"> Record outdoor weather with the history</label>
-        <p class="hint">Reads Open-Meteo every 15 minutes for your location, and looks the place name up once on Nominatim. Nothing about your miners is sent. Set the place in Settings &gt; Weather Location.</p>
+        <legend>Privacy</legend>
+        <p class="hint"><strong>Your data stays on this computer.</strong> There is no account, no analytics, and no telemetry, and the author of this app collects nothing. Your settings and history are two files on this computer. Out of the box the app talks only to your miners. Each box below lets it reach one outside service. Leave them all clear to stay fully local.</p>
+        <label class="check"><input id="setup-weather" type="checkbox"> Outdoor weather in the history</label>
+        <p class="hint">The History screen can show when your miners run best against outdoor temperature, time of day, and sky. That needs your location: next you type a city, or on Windows let this computer find it. Open-Meteo gets that place every 15 minutes. Nothing about your miners is sent.</p>
+        <label class="check"><input id="setup-network-stats" type="checkbox"> Network difficulty</label>
+        <p class="hint">Bitcoin's current difficulty for the status bar and the block odds, from mempool.space every minute.</p>
+        <label class="check"><input id="setup-pool-check" type="checkbox"> Pool status</label>
+        <p class="hint">Checks every minute that each pool your miners use still answers. It connects to those pools the same way your miners do.</p>
+        <label class="check"><input id="setup-firmware-check" type="checkbox"> AxeOS update notice</label>
+        <p class="hint">Asks GitHub once a day for the newest stable AxeOS release, so the table can show when your miners are behind.</p>
       </fieldset>
       <p id="setup-error" class="form-error"></p>
       <div class="dialog-actions">
@@ -317,9 +324,12 @@
         <label>Flatline repeat count <input id="flatline_hashrate_repeat_count" inputmode="numeric"></label>
       </fieldset>
       <fieldset>
-        <legend>History</legend>
-        <p class="hint">Outdoor weather comes from Open-Meteo every 15 minutes for the place in Weather Location.</p>
-        <label class="check"><input id="weather_enabled" type="checkbox"> Record outdoor weather with the history</label>
+        <legend>Internet</legend>
+        <p class="hint">No account, no analytics, no telemetry: the author of this app collects nothing. Each switch lets the app reach one outside service. With all of them off it talks only to your miners.</p>
+        <label class="check"><input id="weather_enabled" type="checkbox"> Outdoor weather from Open-Meteo every 15 minutes, for the place in Weather Location</label>
+        <label class="check"><input id="network_stats_enabled" type="checkbox"> Network difficulty from mempool.space every minute</label>
+        <label class="check"><input id="pool_check_enabled" type="checkbox"> Pool status: check every minute that each pool answers</label>
+        <label class="check"><input id="firmware_check_enabled" type="checkbox"> AxeOS update notice from GitHub once a day</label>
       </fieldset>
       <p id="global-error" class="form-error"></p>
       <div class="dialog-actions">
@@ -381,7 +391,8 @@
     <div class="backdrop" data-close="location"></div>
     <form id="location-form" class="dialog dialog-wide">
       <h2>Weather Location</h2>
-      <p class="hint">The History screen compares each miner with the weather outside. It is read for this place every 15 minutes from Open-Meteo.</p>
+      <p class="hint">The History screen compares each miner with the weather outside, so it needs a place. Type a city, or on Windows let this computer find it. The place is saved only in this computer's settings file.</p>
+      <p class="hint">Where it goes: Open-Meteo gets the place every 15 minutes to read the weather, and gets what you type when you search. A place this computer finds is named once by OpenStreetMap. Nothing goes to the author of this app.</p>
       <div class="location-current">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21s-6.5-5.6-6.5-11a6.5 6.5 0 0 1 13 0c0 5.4-6.5 11-6.5 11z"></path><circle cx="12" cy="10" r="2.3"></circle></svg>
         <div>
@@ -391,12 +402,14 @@
       </div>
       <button type="button" id="location-detect" class="quiet location-detect">Use This Device's Location</button>
       <div class="location-search">
-        <input id="location-query" data-autofocus autocomplete="off" spellcheck="false" placeholder="City, e.g. Moose Jaw, Saskatchewan">
+        <input id="location-query" data-autofocus autocomplete="off" spellcheck="false" placeholder="City or town">
         <button type="submit" id="location-search" class="quiet">Search</button>
       </div>
       <div id="location-results" class="location-results" role="listbox" aria-label="Places" hidden></div>
       <p id="location-error" class="form-error"></p>
       <div class="dialog-actions">
+        <button type="button" id="location-clear" class="quiet" hidden>Forget Location</button>
+        <span class="spacer"></span>
         <button type="button" class="accent" data-close="location">Done</button>
       </div>
     </form>

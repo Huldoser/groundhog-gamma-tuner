@@ -64,12 +64,14 @@ from config import (
     FIRMWARE_ASIC_TRIP_C,
     FIRMWARE_TRIP_MARGIN_C,
     FIRMWARE_VR_TRIP_C,
+    INTERNET_SWITCHES,
     adopted_hostname,
     board_limits,
     config_problem,
     detect_miners,
     get_miner_defaults,
     get_miners,
+    internet_switch_on,
     load_config,
     miner_type_from_info,
     modify_config,
@@ -1057,17 +1059,20 @@ def pool_targets(info):
     return targets
 
 
-def read_network_status(get=None, connect=None, pools=()):
+def read_network_status(get=None, connect=None, pools=(), difficulty=True):
     """Current block difficulty, and whether each pool's Stratum port answers.
 
-    `pools` is the (host, port) list the miners report.
+    `pools` is the (host, port) list the miners report. With `difficulty` off,
+    mempool.space is not asked.
     """
     getter = requests.get if get is None else get
+    wanted = difficulty
     difficulty = None
     try:
-        response = getter(DIFFICULTY_URL, timeout=8)
-        response.raise_for_status()
-        difficulty = response.json().get("currentDifficulty")
+        if wanted:
+            response = getter(DIFFICULTY_URL, timeout=8)
+            response.raise_for_status()
+            difficulty = response.json().get("currentDifficulty")
     except Exception:
         difficulty = None
     results = []
@@ -1357,6 +1362,7 @@ class TunerDashboard:
             "difficulty": "-",
             "difficulty_title": "",
             "difficulty_value": None,
+            "difficulty_enabled": True,
             "pools": [],
         }
         self._latest_firmware = ""
@@ -1379,7 +1385,6 @@ class TunerDashboard:
         self._history = history.HistoryRecorder()
         self._weather_now = None
         self._weather_checked = 0.0
-        self._location_detect_tried = False
         # (host, port) pools each miner reported last, for the network panel.
         self._pool_targets = {}
 
@@ -1554,18 +1559,30 @@ class TunerDashboard:
         return {
             "difficulty": self._network["difficulty"],
             "difficulty_title": self._network["difficulty_title"],
+            "difficulty_enabled": self._network["difficulty_enabled"],
             "pools": [dict(pool) for pool in self._network["pools"]],
         }
 
-    def _refresh_network(self):
+    def _refresh_network(self, difficulty=True, pools=True):
+        """Read difficulty and pool status. A switched-off read is skipped and cleared."""
         with self._lock:
-            pools = []
-            for targets in self._pool_targets.values():
-                pools.extend(target for target in targets if target not in pools)
-        status = read_network_status(pools=pools)
+            targets = []
+            if pools:
+                for found in self._pool_targets.values():
+                    targets.extend(item for item in found if item not in targets)
+            self._network["difficulty_enabled"] = difficulty
+            if not difficulty:
+                self._network["difficulty"] = "-"
+                self._network["difficulty_title"] = ""
+                self._network["difficulty_value"] = None
+        if not difficulty and not targets:
+            with self._lock:
+                self._network["pools"] = []
+            return
+        status = read_network_status(pools=targets, difficulty=difficulty)
         number = _plain_number(status.get("difficulty"))
         with self._lock:
-            if number is not None:
+            if difficulty and number is not None:
                 self._network["difficulty"] = format_difficulty(number)
                 self._network["difficulty_title"] = difficulty_title(number)
                 self._network["difficulty_value"] = number
@@ -1590,11 +1607,23 @@ class TunerDashboard:
     def _network_loop(self):
         while not self._closed.is_set():
             try:
-                self._refresh_network()
+                settings = load_config()
+            except Exception:
+                settings = {}
+            try:
+                self._refresh_network(
+                    difficulty=internet_switch_on(settings, "network_stats_enabled"),
+                    pools=internet_switch_on(settings, "pool_check_enabled"),
+                )
             except Exception:
                 pass
             try:
-                self._refresh_firmware_if_due()
+                if internet_switch_on(settings, "firmware_check_enabled"):
+                    self._refresh_firmware_if_due()
+                else:
+                    with self._lock:
+                        self._latest_firmware = ""
+                        self._firmware_checked = None
             except Exception:
                 pass
             try:
@@ -1627,27 +1656,6 @@ class TunerDashboard:
 
         return modify_config(mutate) not in (None, False)
 
-    def _auto_detect_location(self):
-        """Find this computer's position once per run when no place is saved."""
-        with self._lock:
-            if self._location_detect_tried:
-                return None
-            self._location_detect_tried = True
-        place, error = weather.detect_device_location()
-        if place is None:
-            self.log_message(
-                f"No weather location yet. {error} "
-                "Pick one in Settings > Weather Location.",
-                "warning",
-            )
-            return None
-        if not self._store_location(place):
-            return None
-        self.log_message(
-            f"Weather location set to {place['name']} from this device.", "success"
-        )
-        return place
-
     def _refresh_weather_if_due(self, now=None, force=False):
         """Read outdoor weather every 15 minutes and fill gaps in the history."""
         now = time.time() if now is None else now
@@ -1661,9 +1669,8 @@ class TunerDashboard:
         settings = load_config()
         if not settings.get("weather_enabled", True):
             return
+        # The place is only ever one the user picked or asked this device for.
         place = weather.normalize_location(settings.get("location"))
-        if place is None:
-            place = self._auto_detect_location()
         if place is None:
             return
         current = weather.read_current_weather(place["latitude"], place["longitude"])
@@ -2093,11 +2100,17 @@ class TunerDashboard:
                 )
         mode = setup_mode(cooling, goal, _as_bool(answers.get("acknowledged")))
         weather_on = _as_bool(answers.get("weather"))
+        # Each internet read stays off unless its box was ticked.
+        switches = {
+            key: _as_bool(answers.get(key.removesuffix("_enabled")))
+            for key in INTERNET_SWITCHES
+        }
 
         def mutate(config):
             config["default_mode"] = mode.key
             config["setup_done"] = True
             config["weather_enabled"] = weather_on
+            config.update(switches)
             config["supply_watts"] = supply
 
         if modify_config(mutate) is False:
@@ -2156,6 +2169,19 @@ class TunerDashboard:
             target=self._refresh_weather_if_due, kwargs={"force": True}, daemon=True
         ).start()
         return {"ok": True, "location": place}
+
+    def clear_location(self):
+        """Forget the saved place. Weather is not read again until a new one is set."""
+
+        def mutate(config):
+            config.pop("location", None)
+
+        if modify_config(mutate) is False:
+            return _fail(CONFIG_CORRUPT_MESSAGE, "Config file damaged", "error")
+        with self._lock:
+            self._weather_now = None
+        self.log_message("Weather location removed.", "info")
+        return {"ok": True, "location": None}
 
     def get_hardware_limits(self):
         """Chip, regulator, firmware, and tuner limits for the Limits screen.
@@ -2519,6 +2545,8 @@ class TunerDashboard:
         settings["continue_from_live"] = continue_from_live_enabled(config)
         settings["default_mode"] = new_miner_mode(None, config).key
         settings["weather_enabled"] = bool(config.get("weather_enabled", True))
+        for key in INTERNET_SWITCHES:
+            settings[key] = internet_switch_on(config, key)
         settings["modes"] = [
             {"key": key, "name": modes.MODES[key].name} for key in modes.MODE_ORDER
         ]
@@ -2545,8 +2573,9 @@ class TunerDashboard:
             chosen = modes.mode_named(settings.get("default_mode"))
             if chosen is not None:
                 new_settings["default_mode"] = chosen.key
-            if "weather_enabled" in settings:
-                new_settings["weather_enabled"] = _as_bool(settings["weather_enabled"])
+            for key in ("weather_enabled", *INTERNET_SWITCHES):
+                if key in settings:
+                    new_settings[key] = _as_bool(settings[key])
             new_settings["flatline_detection_enabled"] = _as_bool(
                 settings.get("flatline_detection_enabled")
             )
@@ -3297,6 +3326,9 @@ class DashboardApi:
 
     def save_location(self, place):
         return self._dashboard.save_location(place)
+
+    def clear_location(self):
+        return self._dashboard.clear_location()
 
     def start_scan(self, start_ip, end_ip):
         return self._dashboard.start_scan(start_ip, end_ip)

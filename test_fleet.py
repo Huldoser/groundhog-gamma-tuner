@@ -231,9 +231,12 @@ class FleetTests(unittest.TestCase):
         for key, value in old.items():
             if key != "miners":
                 self.assertEqual(loaded[key], value, key)
-        # No first-run questions, weather stays on, new 601s join in Max mode.
+        # No first-run questions, weather and every other internet read stay
+        # on, new 601s join in Max mode.
         self.assertTrue(loaded["setup_done"])
         self.assertTrue(loaded["weather_enabled"])
+        for key in config.INTERNET_SWITCHES:
+            self.assertTrue(loaded[key], key)
         self.assertEqual(loaded["default_mode"], "max_hashrate")
         new = config.new_miner_record("BM1370 601", "192.168.1.105", "Goose", loaded)
         self.assertEqual(

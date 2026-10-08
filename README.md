@@ -6,9 +6,38 @@
 
 A desktop app that tunes Bitaxe miners running official AxeOS. It watches each miner's AxeOS API and moves frequency and voltage toward the goal you pick (the most hashrate, a balance, or the lowest J/TH) without crossing that board's limits. It runs on Windows, macOS, and Linux as a local window. The page is a file inside that window; nothing listens on the network.
 
-It started as one owner's tuner for six repasted, custom-cooled Gamma 601s on an oversized 5 V supply. That setup is still the one verified board. [docs/decisions.md](docs/decisions.md) lists every choice made for it and what other boards get instead.
+**Everything stays on your computer.** There is no account, no analytics, and no telemetry, and the author collects no data of any kind. A new install talks only to your miners until you switch on an internet feature yourself. See [Privacy](#privacy).
+
+It started as one owner's tuner for six repasted, custom-cooled Gamma 601s on an oversized 5 V supply. That upgraded setup is the only hardware it has run on so far. A stock Gamma 601, and every other board, has not been tested yet; [Support the project](#support-the-project) says how to help with that. [docs/decisions.md](docs/decisions.md) lists every choice made for the author's fleet and what other boards get instead.
 
 ![Dashboard while the tuner is running](docs/dashboard.png)
+
+## Privacy
+
+Your data stays on your computer. The app has no account, no sign-up, no analytics, no telemetry, and no crash reports. The author never receives anything from it, not even a count of who runs it.
+
+- **What it keeps:** two files on your computer. `config.json` holds the settings and the miner list, and `history.db` holds the history. Delete them and nothing is left.
+- **Your miners:** the app reads and writes each miner's AxeOS API on your local network. That traffic stays on your network.
+- **The window:** the page is a file inside the app. It loads nothing from the internet, and the app opens no port.
+
+A new install talks only to your miners. Each feature below reaches one outside service, and only after you switch it on, at first start or in **Global Settings > Internet**:
+
+| Feature | Service | What it sends | How often |
+| --- | --- | --- | --- |
+| Outdoor weather | [Open-Meteo](https://open-meteo.com/) | The place you picked | Every 15 minutes |
+| Network difficulty | [mempool.space](https://mempool.space/) | Only the request | Every minute |
+| Pool status | The pools your miners use | A connection that closes at once, like a miner opening one | Every minute |
+| AxeOS update notice | GitHub | Only the request | Once a day |
+
+Like any internet request, each one shows that service your public IP address.
+
+The weather location is only ever one you set yourself:
+
+- **Search:** what you type goes to Open-Meteo's place search.
+- **Use This Device's Location** (Windows): Windows location services find the computer. The app rounds the position to about 1 km before it saves or sends it, then asks [Nominatim](https://nominatim.org/) (OpenStreetMap) once for the place name.
+- **Forget Location** in the same dialog removes it.
+
+Updating from an older version keeps these features on, as they were. Turn any of them off in **Global Settings > Internet**.
 
 ## Supported boards
 
@@ -28,12 +57,14 @@ Every board in the official AxeOS v2.15.3 board list. The app reads the board ve
 | Naja Duo | 1201 | 2 × BM1373 | 12 V | Experimental |
 | Max | 2.2, 102 | BM1397 | 5 V | Experimental |
 
+**Verified** means it has run on the author's upgraded Gamma 601s: repasted, custom cooling, and a supply with room to spare. A 601 with its stock cooler has not run this tuner yet.
+
 **Experimental** means nobody has run that board with this tuner yet:
 
 - Its voltage stops at the ASIC's top AxeOS preset (1250 mV on a BM1370), and its frequency at 1.5 × the top frequency preset.
 - The first Start asks you to confirm, once per miner.
 - Boards without a regulator sensor (Max, Ultra 0.11–205, Supra 400/401) are judged on the ASIC alone, and their core-current limit is off. Their `current` reading is input current.
-- If you run one, please [report how it went](../../issues/new?template=board-report.md) so it can be marked verified.
+- If you run one, please [report how it went](../../issues/new?template=board-report.md) so it can be marked verified. You can also [send one](#send-a-board) to be tested.
 
 **Firmware:** official AxeOS v2.11.0 or newer. Older firmware uses a different fan setting and is refused. Versions newer than v2.15.x tune with a warning in the log.
 
@@ -137,9 +168,9 @@ On first start the app asks four questions:
 1. **Cooling:** stock, upgraded, or custom.
 2. **What you want most:** the most hashrate, a balance, or the lowest J/TH. Together with cooling this picks the mode for new miners. **Max hashrate** needs custom cooling and an explicit OK; otherwise "most hashrate" gives Balanced.
 3. **Watts per miner:** what your supply and wiring can give each miner. The tuner steps down above it. Blank uses each board's AxeOS max power (40 W on a Gamma).
-4. **Outdoor weather:** whether to record it with the history (see below).
+4. **Privacy:** which internet features to switch on, each with what it is for. All of them start off (see [Privacy](#privacy)).
 
-Then **Scan Network** finds the miners on your subnet, or you add one by IP. **AutoTuner Settings** shows each miner's mode and limits. **Start Autotuner** starts tuning.
+If you switch on outdoor weather, the app explains why it needs your location and asks for it: type a city, or on Windows let the computer find it. Then **Scan Network** finds the miners on your subnet, or you add one by IP. **AutoTuner Settings** shows each miner's mode and limits. **Start Autotuner** starts tuning.
 
 ![AutoTuner settings](docs/autotuner.png)
 
@@ -166,8 +197,8 @@ The **History** tab shows how each miner ran.
 
 - While the window is open, every miner is saved every 10 minutes in `history.db` next to `config.json`. Each sample has the clock, the 10-minute hashrate less the error share, the temperatures, and the power. A sample counts as settled once its setpoint and the miner's uptime are at least 10 minutes old, and the results use only settled samples.
 - The filters pick one miner or the whole fleet, a period (24 hours to everything, **Since reset**, or **Since change**), and a measure: good hashrate, efficiency (J/TH, lower is better), or clock.
-- **Outdoor weather is optional.** Turn it on in the first-start questions or in Global Settings. It then comes from [Open-Meteo](https://open-meteo.com/) every 15 minutes, free for personal use and under CC BY 4.0, and gaps are filled from Open-Meteo's hourly history up to 92 days back. **When it runs best** and **Best combinations** compare results against outdoor temperature, time of day, and sky. That matters most when the miners breathe outdoor air.
-- **Settings > Weather Location** sets the place. Search for a city, for example `Moose Jaw, Saskatchewan`. On Windows, **Use This Device's Location** asks Windows location services. That needs Location on, with **Let desktop apps access your location** on. The place name comes from one [Nominatim](https://nominatim.org/) lookup.
+- **Outdoor weather is optional and off until you turn it on,** in the first-start questions or in **Global Settings > Internet**. It then comes from [Open-Meteo](https://open-meteo.com/) every 15 minutes, free for personal use and under CC BY 4.0, and gaps are filled from Open-Meteo's hourly history up to 92 days back. **When it runs best** and **Best combinations** compare results against outdoor temperature, time of day, and sky. That matters most when the miners breathe outdoor air.
+- **Settings > Weather Location** sets the place. Search for your city, or on Windows use **Use This Device's Location**. That needs Location on, with **Let desktop apps access your location** on. The app never looks up a location on its own. **Forget Location** removes the saved place.
 
 ### Reset to baseline
 
@@ -202,6 +233,37 @@ pre-commit install
 - **Modes and their presets** live in `modes.py`.
 - **OS-specific code** (notifications, the clock format, window placement) lives in `desktop.py`.
 - **Prebuilt apps:** `pyinstaller --noconfirm packaging/groundhog-gamma-tuner.spec` builds the app for the OS you run it on. Pushing a `v*` tag builds all three on GitHub and opens a draft release.
+
+## Support the project
+
+The tuner has only run on the author's own upgraded Gamma 601s. Every other board, and every stock setup, needs a real unit to test on.
+
+Sponsorships and bitcoin pay for this project only: test boards and other hardware, development costs, and subscriptions.
+
+### Sponsor
+
+[GitHub Sponsors](https://github.com/sponsors/Huldoser) takes one-time or monthly support. GitHub keeps no fee on sponsorships from personal accounts.
+
+### Bitcoin
+
+```text
+bc1qukvdcnwacf7v2w3uwedq4hugs4p38f5hwncjmh
+```
+
+- On-chain bitcoin only. Do not send Lightning payments or tokens on other chains to it.
+- Payments are public on the blockchain but carry no name. To be listed as a supporter, email the transaction ID and the name to use to <huldoser@gmail.com>.
+
+### Send a board
+
+- **Wanted:** any experimental board from [the table above](#supported-boards), or a stock Gamma 601 with its stock cooler, so Balanced and Efficiency get tested on the setup they are made for.
+- **How:** open a [hardware offer](../../issues/new?template=hardware-offer.md) with the board and its setup, or email <huldoser@gmail.com>. Shipping details go by email. Do not post an address in the issue.
+- **What happens to it:** the board stays with the author as a test board and is not sent back. It runs with the tuner, the result is posted in its issue, and after a clean run its row in the table says Verified. There is no set date. A board that does not run cleanly stays experimental until the tuner handles it.
+
+### Supporters
+
+Public sponsors and everyone who sent a board are listed here, under the name they choose. Nobody is listed without asking.
+
+None yet.
 
 ## Credit
 

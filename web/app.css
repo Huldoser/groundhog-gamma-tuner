@@ -45,6 +45,9 @@
 
 * { box-sizing: border-box; }
 
+/* A display rule on a class must not undo the hidden attribute. */
+[hidden] { display: none !important; }
+
 *::-webkit-scrollbar {
   width: 12px;
   height: 12px;

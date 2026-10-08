@@ -189,11 +189,11 @@ What these mean for the tuner:
 
 | # | Decision | This fleet | Why | For others |
 | --- | --- | --- | --- | --- |
-| 44 | Pool status | stratum.ckpool.org:3336 (SV2) and public-pool.io:23330, hard-coded | This fleet's solo pools | **Rework:** show the pools the miners report (done) |
-| 45 | Network difficulty and block odds | mempool.space every 60 s | Solo-mining odds | **Keep** |
-| 46 | Firmware update notice | Stable ESP-Miner tags on GitHub | Stay on official releases | **Keep** |
+| 44 | Pool status | stratum.ckpool.org:3336 (SV2) and public-pool.io:23330, hard-coded | This fleet's solo pools | **Rework:** show the pools the miners report, behind its own Internet switch, off in a new install (done) |
+| 45 | Network difficulty and block odds | mempool.space every 60 s | Solo-mining odds | **Option:** its own Internet switch, off in a new install (done) |
+| 46 | Firmware update notice | Stable ESP-Miner tags on GitHub | Stay on official releases | **Option:** its own Internet switch, off in a new install (done) |
 | 47 | Weather and history | Open-Meteo every 15 minutes, outdoor temperature | The miners breathe outdoor air through open windows | **Option:** opt in on first start (done) |
-| 48 | Device location | Windows location services, then one Nominatim lookup | A tablet with Location on | **Keep** on Windows. Elsewhere, search for a city (already works) |
+| 48 | Device location | Windows location services, then one Nominatim lookup | A tablet with Location on | **Rework:** only when the user clicks **Use This Device's Location**, never on its own, rounded to about 1 km before it is saved or sent. Elsewhere, search for a city (done) |
 | 49 | History sampling | Every 10 minutes, settled after 10 minutes, 3 °C bands, 92 days of backfill | Readable daily patterns | **Keep** |
 | 50 | Repaste date per miner | Drives "Since reset" | The fleet gets repasted | **Rework:** label it "Hardware change", for paste, cooler, or supply changes (done) |
 | 51 | Notifications | Windows toast only | Tablet | **Rework:** a notification on each OS (done) |

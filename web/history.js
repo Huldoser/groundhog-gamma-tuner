@@ -984,12 +984,17 @@ function renderLocationDialog(result) {
     detail = parts.join(" · ");
   }
   $("location-detail").textContent = detail;
+  $("location-clear").hidden = !place;
   if (result && "device_supported" in result) {
     $("location-detect").hidden = !result.device_supported;
   }
 }
 
-async function openLocation() {
+// Runs once when the dialog closes, e.g. the scan after first-run setup.
+let locationThen = null;
+
+async function openLocation(options) {
+  locationThen = (options && typeof options.then === "function") ? options.then : null;
   hideSettingsMenu();
   setFormError("location-error", "");
   $("location-results").hidden = true;
@@ -1002,6 +1007,26 @@ async function openLocation() {
   } catch (_error) {
     // The dialog still works without the current place.
   }
+}
+
+function closeLocation() {
+  closeModal("location");
+  const next = locationThen;
+  locationThen = null;
+  if (next) next();
+}
+
+async function clearLocation() {
+  const bridge = api();
+  if (!bridge) return;
+  setFormError("location-error", "");
+  const result = await bridge.clear_location();
+  if (!result || !result.ok) {
+    setFormError("location-error", (result && result.message) || "The location was not removed.");
+    return;
+  }
+  renderLocationDialog({ location: null, weather: null });
+  if (historyState.view === "history") loadHistory();
 }
 
 function locationSaved(result) {
@@ -1096,6 +1121,7 @@ function bindHistory() {
   $("history-location").addEventListener("click", openLocation);
   $("weather-chip").addEventListener("click", openLocation);
   $("location-detect").addEventListener("click", detectLocation);
+  $("location-clear").addEventListener("click", clearLocation);
   $("location-form").addEventListener("submit", searchLocation);
   $("history-view").addEventListener("scroll", hideTip, { passive: true });
   window.addEventListener("resize", () => {

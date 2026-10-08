@@ -14,5 +14,6 @@ This repo tunes Bitaxe miners running official AxeOS, from a desktop window on W
 - Only boards in `VERIFIED_LIMITS` are verified (today the 601). Every other board tunes inside `preset_limits` and needs a one-time `experimental_ok` confirmation on Start.
 - Official AxeOS from `AXEOS_MIN_VERSION` (v2.11.0). Versions newer than `AXEOS_TESTED_VERSION` tune with a warning.
 - Do not add Docker, a network web server, Flask, a headless mode, or a Raspberry Pi service. The owner chose a desktop window only. The page is a local file inside the window.
+- Privacy matters most to the owner. No account, analytics, telemetry, crash reports, or update pings, and nothing is ever sent to the author. Every read that leaves the local network gets its own switch (`weather_enabled` or one of `config.INTERNET_SWITCHES`), off in a new config and explained in the first-run setup, Global Settings > Internet, and the README's Privacy table. The location is only ever one the user typed or asked this device for.
 - OS-specific code lives in `desktop.py` and stays behind a platform check, so every module imports on all three systems and the tests run on all three in CI.
 - A packaged build (`packaging/groundhog-gamma-tuner.spec`) keeps `config.json` and `history.db` in `config.data_dir()`; a source checkout keeps them beside the scripts.

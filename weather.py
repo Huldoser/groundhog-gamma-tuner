@@ -25,6 +25,9 @@ WEATHER_REFRESH_SECONDS = 15 * 60
 # The forecast endpoint returns at most this many past days of hourly data.
 MAX_PAST_DAYS = 92
 DETECT_TIMEOUT_SECONDS = 40
+# Decimal places kept from a device position before it is named or saved.
+# Two is about 1 km: enough for the weather, not enough to find a house.
+DEVICE_DECIMALS = 2
 ATTRIBUTION = "Weather data by Open-Meteo.com (CC BY 4.0)"
 
 # Open-Meteo variable name -> the name stored with each history sample.
@@ -374,6 +377,8 @@ def detect_device_location(run=None, get=None, platform=None):
     latitude, longitude, error = parse_detect_output(completed.stdout)
     if error:
         return None, error
+    latitude = round(latitude, DEVICE_DECIMALS)
+    longitude = round(longitude, DEVICE_DECIMALS)
     name = reverse_place_name(latitude, longitude, get=get)
     return (
         normalize_location(

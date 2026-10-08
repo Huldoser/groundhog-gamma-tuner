@@ -451,7 +451,23 @@ def _raise_limits(config):
 # Bumped when saved miner records gain a field older versions did not write.
 # 1: each miner records its board. 2: each miner records its mode, and a
 # config saved before the first-run setup existed counts as set up.
-CONFIG_VERSION = 2
+# 3: each internet read has its own switch, and an older config keeps them on.
+CONFIG_VERSION = 3
+
+# Reads that leave the local network, besides outdoor weather. A new config
+# has them off until the first-run setup or Global Settings turns them on.
+INTERNET_SWITCHES = (
+    "network_stats_enabled",
+    "pool_check_enabled",
+    "firmware_check_enabled",
+)
+
+
+def internet_switch_on(config, key):
+    """True when an internet read is switched on. A config without the key has it on."""
+    if not isinstance(config, dict):
+        return True
+    return bool(config.get(key, True))
 
 
 def _record_boards(config):
@@ -480,6 +496,9 @@ def _record_boards(config):
         config.setdefault("default_mode", modes.MAX_HASHRATE)
         config.setdefault("setup_done", True)
         config.setdefault("weather_enabled", True)
+    if version < 3:
+        for key in INTERNET_SWITCHES:
+            config.setdefault(key, True)
     config["config_version"] = CONFIG_VERSION
     return True
 
@@ -604,6 +623,9 @@ def get_default_config():
         "default_mode": modes.DEFAULT_MODE,
         "setup_done": False,
         "weather_enabled": False,
+        "network_stats_enabled": False,
+        "pool_check_enabled": False,
+        "firmware_check_enabled": False,
         "supply_watts": "",
         "flatline_detection_enabled": False,
         "flatline_hashrate_repeat_count": 5,
