@@ -23,8 +23,8 @@ jobs:
           - os: ubuntu-latest
             name: linux-x64
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
       - name: Install
@@ -50,7 +50,7 @@ jobs:
             macOS) ditto -c -k --keepParent "dist/Groundhog Gamma Tuner.app" "$out.zip" ;;
             Linux) tar -czf "$out.tar.gz" -C dist "Groundhog Gamma Tuner" ;;
           esac
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: groundhog-gamma-tuner-${{ matrix.name }}
           path: groundhog-gamma-tuner-${{ matrix.name }}.*
@@ -62,7 +62,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           merge-multiple: true
       - name: Draft release

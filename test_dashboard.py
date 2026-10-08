@@ -980,7 +980,13 @@ class SnapshotTests(unittest.TestCase):
             self.assertIn(f"{text} A of 28 A", row["watts_title"])
 
     def test_limits_screen_follows_the_code(self):
-        result = DashboardApi(TunerDashboard()).get_hardware_limits()
+        # The fleet's own config: new 601s join in Max hashrate mode.
+        fleet = config.get_default_config()
+        fleet["default_mode"] = "max_hashrate"
+        fleet["miners"] = [_gamma("10.0.0.8", "Alpha")]
+        with temp_config():
+            config.save_config(fleet)
+            result = DashboardApi(TunerDashboard()).get_hardware_limits()
         self.assertTrue(result["ok"])
         rows = {
             row[0]: row[1] for section in result["sections"] for row in section["rows"]
@@ -1000,6 +1006,14 @@ class SnapshotTests(unittest.TestCase):
             rows["ASIC temperature"], f"{config.GAMMA601_LIMITS['max_temp']} °C"
         )
         self.assertEqual(rows["Core current cap"], "up to 29 A")
+        # A fresh install starts new miners in Balanced.
+        with temp_config():
+            fresh = DashboardApi(TunerDashboard()).get_hardware_limits()
+        fresh_rows = {
+            row[0]: row[1] for section in fresh["sections"] for row in section["rows"]
+        }
+        self.assertEqual(fresh_rows["ASIC temperature"], "65 °C")
+        self.assertEqual(fresh_rows["Max voltage"], "1250 mV")
         page = os.path.join(os.path.dirname(dashboard.__file__), "web", "index.html")
         with open(page, encoding="utf-8") as handle:
             html = handle.read()
@@ -1404,6 +1418,12 @@ class SnapshotTests(unittest.TestCase):
                 self.assertTrue(result["ok"])
                 self.assertEqual(result["notice"]["title"], "Baseline Reset Started")
                 self.assertTrue(called.wait(2))
+                # The reset thread still marks the reset in history.db inside
+                # this temporary folder. Let it finish before the folder goes.
+                deadline = time.time() + 2
+                while app._baseline_reset_running and time.time() < deadline:
+                    time.sleep(0.01)
+                self.assertFalse(app._baseline_reset_running)
         self.assertFalse(seen["kwargs"].get("parallel", False))
 
     def test_reset_miner_baseline_resets_only_that_miner(self):
