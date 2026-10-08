@@ -6079,7 +6079,7 @@ class InstallAndConfigTests(unittest.TestCase):
         self.assertNotIn("daily_reset", html)
         self.assertNotIn("daily_reset", script)
         self.assertIn("flatline_detection_enabled", html)
-        self.assertIn("Groundhog Gamma Tuner", html)
+        self.assertIn("Groundhog Tuner", html)
         self.assertIn('id="settings-menu"', html)
         self.assertIn('id="scan-open"', html)
         brand = html.split('class="brand"', 1)[1].split('id="status-pill"', 1)[0]

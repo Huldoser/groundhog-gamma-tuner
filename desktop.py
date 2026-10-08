@@ -10,7 +10,9 @@ import subprocess
 from datetime import datetime
 from xml.sax.saxutils import escape as xml_escape
 
-APP_NAME = "Groundhog Gamma Tuner"
+APP_NAME = "Groundhog Tuner"
+# Folder and file names: the Linux data folder and the menu entry.
+APP_SLUG = "groundhog-tuner"
 
 
 def notify(title, message, system=None):
@@ -53,9 +55,7 @@ def _quiet(command):
 
 def _windows_toast(title, message):
     """A local Windows toast through PowerShell."""
-    heading = xml_escape(
-        str(title or "Groundhog Gamma Tuner").replace("\r", " ").replace("\n", " ")
-    )
+    heading = xml_escape(str(title or APP_NAME).replace("\r", " ").replace("\n", " "))
     body = xml_escape(str(message or "").replace("\r", " ").replace("\n", " "))
     toast_xml = (
         '<toast><visual><binding template="ToastGeneric">'

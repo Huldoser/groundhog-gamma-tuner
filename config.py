@@ -10,12 +10,13 @@ import requests
 
 import modes
 from boards import GAMMA_601, board_for_info, board_for_record, board_list_note
+from desktop import APP_NAME, APP_SLUG
 
 SYSTEM_INFO_TIMEOUT = 10
 # Addresses a network scan probes at the same time.
 SCAN_WORKERS = 32
 
-APP_FOLDER = "Groundhog Gamma Tuner"
+APP_FOLDER = APP_NAME
 
 
 def data_dir(frozen=None, system=None, environ=None, home=None):
@@ -38,7 +39,7 @@ def data_dir(frozen=None, system=None, environ=None, home=None):
     if system == "darwin":
         return os.path.join(home, "Library", "Application Support", APP_FOLDER)
     base = environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config")
-    return os.path.join(base, "groundhog-gamma-tuner")
+    return os.path.join(base, APP_SLUG)
 
 
 CONFIG_FILE = os.path.join(data_dir(), "config.json")

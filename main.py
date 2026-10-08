@@ -12,8 +12,10 @@ import sys
 import sysconfig
 import traceback
 
+from desktop import APP_NAME
+
 X64_PYTHON_MESSAGE = (
-    "Groundhog Gamma Tuner needs the 64-bit Python from python.org "
+    f"{APP_NAME} needs the 64-bit Python from python.org "
     "(Windows installer (64-bit)).\n\n"
     "The ARM64 installer cannot open this window.\n\n"
     "Install the 64-bit Python, then install the packages with that interpreter:\n"
@@ -197,7 +199,7 @@ def show_windows_dialog(message):
             ctypes.c_uint,
         ]
         message_box.restype = ctypes.c_int
-        message_box(None, str(message), "Groundhog Gamma Tuner", 0x10)
+        message_box(None, str(message), APP_NAME, 0x10)
     except (AttributeError, OSError):
         return
 

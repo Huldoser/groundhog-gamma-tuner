@@ -25,12 +25,17 @@ If Len(desktop) = 0 Then
   WScript.Quit 1
 End If
 
-linkPath = fso.BuildPath(desktop, "Groundhog Gamma Tuner.lnk")
+' The app was called Groundhog Gamma Tuner until October 2026.
+If fso.FileExists(fso.BuildPath(desktop, "Groundhog Gamma Tuner.lnk")) Then
+  fso.DeleteFile fso.BuildPath(desktop, "Groundhog Gamma Tuner.lnk")
+End If
+
+linkPath = fso.BuildPath(desktop, "Groundhog Tuner.lnk")
 Set link = shell.CreateShortcut(linkPath)
 link.TargetPath = batPath
 link.WorkingDirectory = root
 link.IconLocation = icoPath & ",0"
-link.Description = "Groundhog Gamma Tuner"
+link.Description = "Groundhog Tuner"
 link.Save
 
 WScript.Echo "Desktop shortcut created: " & linkPath

@@ -1,5 +1,5 @@
 #!/bin/sh
-# Open the Groundhog Gamma Tuner window on Linux or macOS.
+# Open the Groundhog Tuner window on Linux or macOS.
 # Uses .venv/bin/python when the folder has one, otherwise python3 on PATH.
 cd "$(dirname "$0")" || exit 1
 if [ -x .venv/bin/python ]; then

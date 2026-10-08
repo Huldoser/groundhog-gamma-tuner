@@ -44,7 +44,7 @@ A new miner starts in the mode the first-run setup picked (Balanced on a fresh i
 | M4 | Windows, macOS, and Linux. `desktop.py` holds notifications and window placement, plus the `run.sh` / `.command` / `install-shortcut.sh` launchers, CI on all three, and a per-user data folder for packaged builds. |
 | M5 | The first-run setup (cooling, goal, supply watts, weather). Pools come from what the miners report. Weather is opt-in. "Repasted" is now "Hardware changed". |
 | M6 | The firmware range (v2.11.0 and up, warning past v2.15.x), the README, the agent rules (`AGENTS.md`), and a board-report issue template. |
-| M7 | `packaging/groundhog-gamma-tuner.spec` and a release workflow that builds all three systems and opens a draft release. |
+| M7 | `packaging/groundhog-tuner.spec` and a release workflow that builds all three systems and opens a draft release. |
 
 Your fleet's config migrates once: each miner gets `"board": "601"` and `"mode": "max_hashrate"`, and the config gets `default_mode` Max hashrate, `setup_done` true, and weather on. No limit changes.
 

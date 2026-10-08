@@ -1633,7 +1633,7 @@ class SnapshotTests(unittest.TestCase):
             mock.patch("dashboard.get_system_info", return_value="timed out"),
         ):
             app.refresh_once()
-        toast.assert_called_once_with("Groundhog Gamma Tuner", "Alpha is offline.")
+        toast.assert_called_once_with("Groundhog Tuner", "Alpha is offline.")
         with (
             mock.patch("dashboard.notify") as toast,
             mock.patch("dashboard.get_system_info", return_value="timed out"),
@@ -1651,7 +1651,7 @@ class SnapshotTests(unittest.TestCase):
         ):
             app.refresh_once()
         toast.assert_called_once_with(
-            "Groundhog Gamma Tuner", "Alpha reported a power fault."
+            "Groundhog Tuner", "Alpha reported a power fault."
         )
         row = app.get_snapshot(0)["miners"][0]
         self.assertTrue(row["power_fault"])
@@ -1673,9 +1673,7 @@ class SnapshotTests(unittest.TestCase):
             mock.patch("dashboard.load_config", return_value={}),
         ):
             app.refresh_once()
-        toast.assert_called_once_with(
-            "Groundhog Gamma Tuner", "Alpha is in overheat mode."
-        )
+        toast.assert_called_once_with("Groundhog Tuner", "Alpha is in overheat mode.")
         self.assertEqual(app.get_snapshot(0)["miners"][0]["reason"], "overheat mode")
 
         app._focused = True

@@ -1,14 +1,16 @@
-# Groundhog Gamma Tuner
+# Groundhog Tuner
 
 <p align="center">
-  <img src="web/logo.png" alt="Groundhog Gamma Tuner" width="360">
+  <img src="web/logo.png" alt="Groundhog Tuner" width="360">
 </p>
 
 A desktop app that tunes Bitaxe miners running official AxeOS. It watches each miner's AxeOS API and moves frequency and voltage toward the goal you pick (the most hashrate, a balance, or the lowest J/TH) without crossing that board's limits. It runs on Windows, macOS, and Linux as a local window. The page is a file inside that window; nothing listens on the network.
 
 **Everything stays on your computer.** There is no account, no analytics, and no telemetry, and the author collects no data of any kind. A new install talks only to your miners until you switch on an internet feature yourself. See [Privacy](#privacy).
 
-It started as one owner's tuner for six repasted, custom-cooled Gamma 601s on an oversized 5 V supply. That upgraded setup is the only hardware it has run on so far. A stock Gamma 601, and every other board, has not been tested yet; [Support the project](#support-the-project) says how to help with that. [docs/decisions.md](docs/decisions.md) lists every choice made for the author's fleet and what other boards get instead.
+It started as one owner's tuner for six repasted, custom-cooled Gamma 601s on an oversized 5 V supply. That upgraded setup is the only hardware it has run on so far. A stock Gamma 601, and every other board, has not been tested yet; [Support the project](#support-the-project) says how to help with that. [docs/decisions.md](docs/decisions.md) lists every choice made for the author's fleet and what other boards get instead, and [docs/roadmap.md](docs/roadmap.md) lists what comes next.
+
+Until October 2026 it was called Groundhog Gamma Tuner. It was renamed when it grew past the Gamma.
 
 ![Dashboard while the tuner is running](docs/dashboard.png)
 
@@ -92,17 +94,17 @@ python tools/simulate.py --cooling stock --ambient 24 --hours 8
 
 ### Download
 
-Prebuilt apps are attached to each [release](../../releases): Windows (x64; also runs on Windows on ARM), macOS (Apple silicon), and Linux (x64). They are not code-signed:
+Prebuilt apps are attached to each [release](../../releases): Windows (x64; also runs on Windows on ARM), macOS (Apple silicon), and Linux (x64). They are not code-signed. No release has been published yet; until the first one, run it [from source](#from-source).
 
 - **Windows:** if SmartScreen says "Windows protected your PC", choose **More info**, then **Run anyway**.
 - **macOS:** if it says the app cannot be opened, right-click it, choose **Open**, then **Open** again.
-- **Linux:** extract the archive and run `Groundhog Gamma Tuner` inside the folder.
+- **Linux:** extract the archive and run `Groundhog Tuner` inside the folder.
 
 A downloaded app keeps `config.json` and `history.db` in your user data folder:
 
-- Windows: `%APPDATA%\Groundhog Gamma Tuner`
-- macOS: `~/Library/Application Support/Groundhog Gamma Tuner`
-- Linux: `~/.config/groundhog-gamma-tuner`
+- Windows: `%APPDATA%\Groundhog Tuner`
+- macOS: `~/Library/Application Support/Groundhog Tuner`
+- Linux: `~/.config/groundhog-tuner`
 
 ### From source
 
@@ -137,7 +139,7 @@ python3 -m venv .venv
 ./run.sh
 ```
 
-- **Open from Finder:** double-click `Groundhog Gamma Tuner.command`.
+- **Open from Finder:** double-click `Groundhog Tuner.command`.
 - **Start at login:** add that file under System Settings > General > Login Items.
 
 #### Linux
@@ -253,7 +255,7 @@ python -m coverage report
 - **A board AxeOS adds later:** copy its row from that release's `main/device_config.h` into `boards.py`. A board someone has verified gets its own entry in `VERIFIED_LIMITS`.
 - **Modes and their presets** live in `modes.py`.
 - **OS-specific code** (notifications, the clock format, window placement) lives in `desktop.py`.
-- **Prebuilt apps:** `pyinstaller --noconfirm packaging/groundhog-gamma-tuner.spec` builds the app for the OS you run it on. Pushing a `v*` tag builds all three on GitHub and opens a draft release.
+- **Prebuilt apps:** `pyinstaller --noconfirm packaging/groundhog-tuner.spec` builds the app for the OS you run it on. Pushing a `v*` tag builds all three on GitHub and opens a draft release.
 
 ## Support the project
 
@@ -288,7 +290,7 @@ None yet.
 
 ## Credit
 
-This project began as a fork of [bitaxe-temp-monitor](https://github.com/Hurllz/bitaxe-temp-monitor) by [Hurllz](https://github.com/Hurllz) and is now developed separately at [Huldoser/groundhog-gamma-tuner](https://github.com/Huldoser/groundhog-gamma-tuner). Copyright in the original work remains with Hurllz. Copyright in these modifications is held by Andrey Rychkov.
+This project began as a fork of [bitaxe-temp-monitor](https://github.com/Hurllz/bitaxe-temp-monitor) by [Hurllz](https://github.com/Hurllz) and is now developed separately at [Huldoser/groundhog-tuner](https://github.com/Huldoser/groundhog-tuner). Copyright in the original work remains with Hurllz. Copyright in these modifications is held by Andrey Rychkov.
 
 The upstream project also includes work by [DeanCollier](https://github.com/DeanCollier), Andrew Kuehne ([andewkuehne](https://github.com/andewkuehne)), [mrv777](https://github.com/mrv777), and GUI work credited to Birdman332. The headless web server and Docker setup from that project are not in this project.
 

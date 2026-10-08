@@ -80,7 +80,7 @@ from config import (
     remove_miner,
     update_miner,
 )
-from desktop import format_local_time, notify, snap_fullscreen_window
+from desktop import APP_NAME, format_local_time, notify, snap_fullscreen_window
 
 STATUS_REFRESH_SECONDS = 5
 # Reads a miner may miss in a row before it shows as offline. A reboot or a
@@ -1404,7 +1404,7 @@ class TunerDashboard:
         # An absolute file path loads in the window directly. A relative path would
         # make pywebview start its own local server, which this app does not use.
         window = webview.create_window(
-            "Groundhog Gamma Tuner",
+            APP_NAME,
             url=page,
             js_api=DashboardApi(self),
             width=1280,
@@ -2996,7 +2996,7 @@ class TunerDashboard:
     def _deliver_alerts(self, messages):
         for message in messages:
             try:
-                notify("Groundhog Gamma Tuner", message)
+                notify(APP_NAME, message)
             except Exception:
                 pass
 

@@ -45,20 +45,20 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         run: python tools/snapshot_release.py --check ${{ github.ref_name }}
       - name: Build
-        run: pyinstaller --noconfirm packaging/groundhog-gamma-tuner.spec
+        run: pyinstaller --noconfirm packaging/groundhog-tuner.spec
       - name: Package
         shell: bash
         run: |
-          out="groundhog-gamma-tuner-${{ matrix.name }}"
+          out="groundhog-tuner-${{ matrix.name }}"
           case "$RUNNER_OS" in
-            Windows) 7z a "$out.zip" "./dist/Groundhog Gamma Tuner" ;;
-            macOS) ditto -c -k --keepParent "dist/Groundhog Gamma Tuner.app" "$out.zip" ;;
-            Linux) tar -czf "$out.tar.gz" -C dist "Groundhog Gamma Tuner" ;;
+            Windows) 7z a "$out.zip" "./dist/Groundhog Tuner" ;;
+            macOS) ditto -c -k --keepParent "dist/Groundhog Tuner.app" "$out.zip" ;;
+            Linux) tar -czf "$out.tar.gz" -C dist "Groundhog Tuner" ;;
           esac
       - uses: actions/upload-artifact@v7
         with:
-          name: groundhog-gamma-tuner-${{ matrix.name }}
-          path: groundhog-gamma-tuner-${{ matrix.name }}.*
+          name: groundhog-tuner-${{ matrix.name }}
+          path: groundhog-tuner-${{ matrix.name }}.*
 
   draft:
     needs: build
@@ -77,9 +77,9 @@ jobs:
           cat > notes.md <<'NOTES'
           Builds for Windows (x64, also runs on Windows on ARM), macOS (Apple silicon), and Linux (x64).
 
-          These builds are not code-signed. Windows SmartScreen may say "Windows protected your PC": choose More info, then Run anyway. macOS may say the app "cannot be opened": right-click it, choose Open, then Open again. Linux: extract the archive and run "Groundhog Gamma Tuner" inside the folder.
+          These builds are not code-signed. Windows SmartScreen may say "Windows protected your PC": choose More info, then Run anyway. macOS may say the app "cannot be opened": right-click it, choose Open, then Open again. Linux: extract the archive and run "Groundhog Tuner" inside the folder.
 
           Settings and history live in your user data folder, not next to the app.
           NOTES
-          gh release create "$GITHUB_REF_NAME" groundhog-gamma-tuner-* \
+          gh release create "$GITHUB_REF_NAME" groundhog-tuner-* \
             --repo "$GITHUB_REPOSITORY" --draft --title "$GITHUB_REF_NAME" --notes-file notes.md

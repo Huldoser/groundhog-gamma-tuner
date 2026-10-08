@@ -74,7 +74,7 @@ class InterpreterDiscoveryTests(unittest.TestCase):
 
 class RelaunchTests(unittest.TestCase):
     def test_arm64_process_relaunches_with_each_argument_kept_whole(self):
-        script = r"C:\Users\First Last\groundhog-gamma-tuner\main.py"
+        script = r"C:\Users\First Last\groundhog-tuner\main.py"
         completed = mock.Mock(returncode=3)
         with (
             mock.patch.object(sys, "platform", "win32"),
@@ -259,7 +259,7 @@ class DialogTests(unittest.TestCase):
             mock.patch("ctypes.windll", windll, create=True),
         ):
             main.show_windows_dialog("hello")
-        box.assert_called_once_with(None, "hello", "Groundhog Gamma Tuner", 0x10)
+        box.assert_called_once_with(None, "hello", "Groundhog Tuner", 0x10)
 
     def test_a_missing_message_box_is_quiet(self):
         windll = mock.Mock()

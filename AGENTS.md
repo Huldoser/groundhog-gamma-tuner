@@ -1,10 +1,12 @@
 # AGENTS.md
 
-Groundhog Gamma Tuner tunes Bitaxe miners running official AxeOS from a desktop window on Windows, macOS, and Linux. It started as one owner's tuner for six custom-cooled Gamma 601s; that fleet's numbers stay as they are (see `docs/decisions.md`).
+Groundhog Tuner tunes Bitaxe miners running official AxeOS from a desktop window on Windows, macOS, and Linux. It started as one owner's tuner for six custom-cooled Gamma 601s; that fleet's numbers stay as they are (see `docs/decisions.md`).
+
+It was called Groundhog Gamma Tuner until October 2026. The name lives in `desktop.APP_NAME` (shown to people) and `desktop.APP_SLUG` (folder and file names); use those instead of writing it out. Keep "Bitaxe" out of the name itself: the mark is claimed by more than one party, so it appears only as "for Bitaxe" in descriptions. Planned work and its order are in `docs/roadmap.md`.
 
 ## Commands
 
-- Run the app: `python main.py` (or `run.bat`, `run.sh`, `Groundhog Gamma Tuner.command`).
+- Run the app: `python main.py` (or `run.bat`, `run.sh`, `Groundhog Tuner.command`).
 - After every change, run the push check before you finish. If `pre-commit` is not on PATH, use `.venv/bin/pre-commit` with the same arguments. It runs `ruff check`, `ruff format --check`, and `python -m unittest`, and only reports; it does not rewrite files.
 
   ```sh
@@ -21,13 +23,13 @@ Groundhog Gamma Tuner tunes Bitaxe miners running official AxeOS from a desktop 
 ## Supported boards and operating systems
 
 - Boards are the rows of `boards.BOARDS`, copied from ESP-Miner `main/device_config.h` at `AXEOS_SOURCE`. A board AxeOS adds later is one new row from that release. Do not guess hardware numbers; cite the source file and tag.
-- Keep the live `boards.board_for_info` check and the session check that the live board matches the saved one. Forks and unknown boards are refused.
+- Keep the live `boards.board_for_info` check and the session check that the live board matches the saved one. Forks and unknown boards are refused. NerdQAxe++ (a fork) is the first candidate once several Bitaxe boards are verified; see `docs/roadmap.md`.
 - Only boards in `VERIFIED_LIMITS` are verified (today the 601). Every other board tunes inside `preset_limits` and needs a one-time `experimental_ok` confirmation on Start.
 - Official AxeOS from `AXEOS_MIN_VERSION` (v2.11.0). Versions newer than `AXEOS_TESTED_VERSION` tune with a warning.
 - The window is pywebview: WebView2 on Windows, Cocoa on macOS, GTK (or Qt) on Linux. The page is a local file inside the window. Do not add Docker, a network web server, Flask, a headless mode, or a Raspberry Pi service; the owner chose a desktop window only.
 - Windows 10 and 11, on x64 PCs and on Windows on ARM. The window process must be 64-bit (x64) Python: on an x64 PC it starts directly; pywebview's .NET helper does not load in the ARM64 build, so `main.py` restarts an ARM64 process in the x64 one. Windows-11-only calls (square window corners) must fail quietly on Windows 10. macOS and Linux start directly.
 - OS-specific code lives in `desktop.py` and stays behind a platform check, so every module imports on all three systems and the tests run on all three in CI.
-- A packaged build (`packaging/groundhog-gamma-tuner.spec`) keeps `config.json` and `history.db` in `config.data_dir()`; a source checkout keeps them beside the scripts.
+- A packaged build (`packaging/groundhog-tuner.spec`) keeps `config.json` and `history.db` in `config.data_dir()`; a source checkout keeps them beside the scripts.
 
 ## Privacy
 
@@ -144,7 +146,7 @@ Applies to `dashboard.py`, `history.py`, `weather.py`, and `web/`.
 
   ```python
   page = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web", "index.html")
-  webview.create_window("Groundhog Gamma Tuner", url=page, js_api=DashboardApi(self))
+  webview.create_window(APP_NAME, url=page, js_api=DashboardApi(self))
   ```
 
 - A new page action is a public method on `DashboardApi` plus a call through `api()` in `web/app.js` (`const bridge = api(); if (bridge) bridge.start_autotuner();`). Method names stay public; pywebview skips `_` names. The page polls `get_snapshot`.

@@ -66,11 +66,11 @@ class DataDirTests(unittest.TestCase):
         home = "/home/satoshi"
         self.assertEqual(
             config.data_dir(True, "linux", {}, home),
-            join(home, ".config", "groundhog-gamma-tuner"),
+            join(home, ".config", "groundhog-tuner"),
         )
         self.assertEqual(
             config.data_dir(True, "linux", {"XDG_CONFIG_HOME": "/xdg"}, home),
-            join("/xdg", "groundhog-gamma-tuner"),
+            join("/xdg", "groundhog-tuner"),
         )
         self.assertEqual(
             config.data_dir(True, "darwin", {}, "/Users/satoshi"),
@@ -78,16 +78,14 @@ class DataDirTests(unittest.TestCase):
                 "/Users/satoshi",
                 "Library",
                 "Application Support",
-                "Groundhog Gamma Tuner",
+                "Groundhog Tuner",
             ),
         )
         self.assertEqual(
             config.data_dir(
                 True, "win32", {"APPDATA": "C:/Users/satoshi/AppData/Roaming"}
             ),
-            config.os.path.join(
-                "C:/Users/satoshi/AppData/Roaming", "Groundhog Gamma Tuner"
-            ),
+            config.os.path.join("C:/Users/satoshi/AppData/Roaming", "Groundhog Tuner"),
         )
 
 
