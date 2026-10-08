@@ -754,3 +754,15 @@ class SessionBoardTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BoardEdgeTests(unittest.TestCase):
+    def test_a_missing_reply_is_explained_and_has_no_reading(self):
+        self.assertEqual(boards.board_list_note(None), "The miner did not answer.")
+        self.assertIsNone(boards.asic_temp(None))
+
+    def test_a_version_with_text_in_it_is_unknown(self):
+        self.assertIsNone(boards.firmware_version({"version": "v2.x.1"}))
+        self.assertEqual(
+            boards.firmware_version({"version": "v2.15.3-rc1"}), (2, 15, 3)
+        )

@@ -5,7 +5,7 @@ alwaysApply: true
 
 # Latest dependencies
 
-Direct dependencies of the window live only in `requirements.txt`. Today those are `requests` and `pywebview`. The push checks `ruff` and `pre-commit` live in `requirements-dev.txt` and are not part of the window install.
+Direct dependencies of the window live only in `requirements.txt`. Today those are `requests` and `pywebview`. The push checks `ruff` and `pre-commit`, and `coverage` for the CI coverage gate, live in `requirements-dev.txt` and are not part of the window install.
 
 - When adding or changing a package, check PyPI and require at least the current release: `package>=X.Y.Z`.
 - Do not pin an older release. Do not add an upper bound.

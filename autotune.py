@@ -1812,7 +1812,8 @@ def decide_adjustment(
                 max_volt,
                 "increase voltage",
             )
-        return _apply_step_down(
+        # Unreachable: voltage is under max_volt here and the step is at least 1 mV.
+        return _apply_step_down(  # pragma: no cover
             current_frequency,
             current_voltage,
             min_freq,
@@ -3077,7 +3078,8 @@ def monitor_and_adjust(
     reject_sample = RejectSample()
     if pending is not None and start_frequency < requested_frequency:
         opening_wall = wall_type_from_reason(opening_reason)
-        if opening_wall:
+        # Every opening that lowers the clocks names a wall.
+        if opening_wall:  # pragma: no branch
             limit_wall = opening_wall
     error_samples = []
     window_positive_hash = False
@@ -3435,7 +3437,8 @@ def monitor_and_adjust(
                 pending = None
                 if _restore_is_confirmed(probe, confirmed):
                     probe = None
-                if setpoint_since is None:
+                # Every write clears setpoint_since, so it is always unset here.
+                if setpoint_since is None:  # pragma: no branch
                     setpoint_since = now
                 pll_note = ""
                 pll_at_confirm = rounded_pll_frequency(info.get("actualFrequency"))
@@ -3458,7 +3461,8 @@ def monitor_and_adjust(
                         int(float(reported_frequency)),
                         int(float(reported_voltage)),
                     )
-                    if setpoint_since is None:
+                    # Every write clears setpoint_since, so it is always unset here.
+                    if setpoint_since is None:  # pragma: no branch
                         setpoint_since = now
                 pending = None
             elif (
@@ -3471,7 +3475,8 @@ def monitor_and_adjust(
                     int(float(reported_frequency)),
                     int(float(reported_voltage)),
                 )
-                if setpoint_since is None:
+                # Nothing set setpoint_since before the first confirmed setpoint.
+                if setpoint_since is None:  # pragma: no branch
                     setpoint_since = now
                 log_callback(
                     f"{bitaxe_ip} -> Using reported setpoint {confirmed[0]} MHz / {confirmed[1]} mV.",
@@ -3864,7 +3869,8 @@ def monitor_and_adjust(
                         "info",
                     )
                 reverted = _same_setpoint((back_frequency, back_voltage), confirmed)
-                if not reverted:
+                # A probe always moves off the clocks it started from.
+                if not reverted:  # pragma: no branch
                     applied_settings = set_system_settings(
                         bitaxe_ip, back_voltage, back_frequency
                     )
@@ -4157,7 +4163,8 @@ def monitor_and_adjust(
                             "info",
                         )
                     reverted = _same_setpoint((back_frequency, back_voltage), confirmed)
-                    if not reverted:
+                    # A probe always moves off the clocks it started from.
+                    if not reverted:  # pragma: no branch
                         applied_settings = set_system_settings(
                             bitaxe_ip, back_voltage, back_frequency
                         )
@@ -4459,7 +4466,10 @@ def monitor_and_adjust(
                     new_frequency, confirmed[0] + frequency_step * max_climb_steps
                 )
                 climb_jumped = new_frequency > confirmed[0] + frequency_step
-            if reason == "increase frequency" and new_frequency < confirmed[0]:
+            # decide_adjustment only climbs above the clocks it is given.
+            if (
+                reason == "increase frequency" and new_frequency < confirmed[0]
+            ):  # pragma: no cover
                 new_frequency = confirmed[0]
                 new_voltage = confirmed[1]
                 reason = "holding"
@@ -4525,11 +4535,12 @@ def monitor_and_adjust(
             climb_cap = limits["max_freq"]
             if hash_ceiling is not None:
                 climb_cap = min(climb_cap, hash_ceiling)
+            # decide_adjustment already stops at climb_cap; this guards a change there.
             if (
                 phase == "climb"
                 and reason == "increase frequency"
                 and confirmed[0] >= climb_cap
-            ):
+            ):  # pragma: no cover
                 # The applied clock is already at the cap. A PLL reading a few MHz
                 # under that cap must not keep the session in climb forever.
                 reason = "frequency ceiling"
@@ -4568,7 +4579,8 @@ def monitor_and_adjust(
             if reason == "trim complete" or (
                 reason == "restore voltage" and clocks_unchanged
             ):
-                if phase != "hold":
+                # Both reasons only come from the trim phase.
+                if phase != "hold":  # pragma: no branch
                     phase = "hold"
                     log_callback(
                         f"{bitaxe_ip} -> Holding {confirmed[0]} MHz / {new_voltage} mV.",

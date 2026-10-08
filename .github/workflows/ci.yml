@@ -25,4 +25,10 @@ jobs:
           python -m ruff check .
           python -m ruff format --check .
       - name: Unit tests
-        run: python -m unittest
+        run: python -m coverage run -m unittest
+      - name: Coverage
+        run: python -m coverage report
+      # Linux runs every Windows and macOS path through mocks, so it must reach 100%.
+      - name: Full coverage
+        if: matrix.os == 'ubuntu-latest'
+        run: python -m coverage report --fail-under=100

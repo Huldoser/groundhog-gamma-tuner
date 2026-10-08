@@ -6104,7 +6104,7 @@ class InstallAndConfigTests(unittest.TestCase):
                 config.CONFIG_FILE = old_path
                 config._last_good_config = old_last
 
-    def test_load_raises_old_limits_once(self):
+    def test_an_old_limits_version_keeps_every_saved_cap(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "config.json")
             old_path = config.CONFIG_FILE
@@ -6120,73 +6120,26 @@ class InstallAndConfigTests(unittest.TestCase):
                             "max_temp": 68,
                             "max_vr_temp": 88,
                             "max_volt": 1300,
+                            "max_core_amps": 25,
                         },
-                        {
-                            "ip": "b",
-                            "max_temp": 66,
-                            "max_vr_temp": 96,
-                            "max_volt": 1450,
-                        },
-                        {"ip": "c", "max_temp": "", "max_watts": 40},
+                        {"ip": "b", "max_temp": "", "max_watts": 40},
                     ],
                 }
                 with open(path, "w", encoding="utf-8") as handle:
                     json.dump(old, handle)
-                miners = config.load_config()["miners"]
-                self.assertEqual(
-                    [(m["max_temp"], m["max_vr_temp"], m["max_volt"]) for m in miners],
-                    [(70, 95, 1500), (70, 96, 1500), (70, 95, 1500)],
-                )
-                self.assertEqual(miners[2]["max_watts"], 40)
+                loaded = config.load_config()
+                self.assertEqual(loaded["default_target_temp"], 68)
+                for before, after in zip(old["miners"], loaded["miners"], strict=True):
+                    self.assertEqual({key: after[key] for key in before}, before)
                 with open(path, encoding="utf-8") as handle:
                     on_disk = json.load(handle)
                 self.assertEqual(on_disk["limits_version"], config.LIMITS_VERSION)
-                self.assertEqual(on_disk["default_target_temp"], 70)
-                self.assertEqual(on_disk["miners"][0]["max_temp"], 70)
-                # A cap the user lowers afterwards stays lowered.
-                config.update_miner("a", {"max_temp": 66})
-                config._last_good_config = None
-                self.assertEqual(config.load_config()["miners"][0]["max_temp"], 66)
+                self.assertEqual(on_disk["miners"][0]["max_volt"], 1300)
                 # A fresh config is already on the current version.
                 self.assertEqual(
                     config.get_default_config()["limits_version"],
                     config.LIMITS_VERSION,
                 )
-            finally:
-                config.CONFIG_FILE = old_path
-                config._last_good_config = old_last
-
-    def test_a_new_limit_step_leaves_earlier_steps_alone(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = os.path.join(directory, "config.json")
-            old_path = config.CONFIG_FILE
-            old_last = config._last_good_config
-            try:
-                config.CONFIG_FILE = path
-                config._last_good_config = None
-                # Already raised once; the user then lowered a cap.
-                saved = {
-                    "limits_version": 2,
-                    "default_target_temp": 66,
-                    "miners": [
-                        {
-                            "ip": "a",
-                            "max_temp": 66,
-                            "max_volt": 1400,
-                            "max_core_amps": 28,
-                        },
-                        {"ip": "b", "max_temp": 70},
-                    ],
-                }
-                with open(path, "w", encoding="utf-8") as handle:
-                    json.dump(saved, handle)
-                loaded = config.load_config()
-                first, second = loaded["miners"]
-                self.assertEqual(first["max_core_amps"], 29.0)
-                self.assertEqual(second["max_core_amps"], 29.0)
-                self.assertEqual((first["max_temp"], first["max_volt"]), (66, 1400))
-                self.assertEqual(loaded["default_target_temp"], 66)
-                self.assertEqual(loaded["limits_version"], 3)
             finally:
                 config.CONFIG_FILE = old_path
                 config._last_good_config = old_last

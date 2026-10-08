@@ -10,7 +10,7 @@ Writes go through `save_config` / `_write_config`: hold `_config_lock`, write a 
 
 A `JSONDecodeError` keeps `_last_good_config`. `_drop_retired_keys` removes `RETIRED_GLOBAL_KEYS` and each miner's `RETIRED_MINER_KEYS` (learned setpoints from older versions) on load and save. Each tuning session starts fresh from the miner's start clocks; nothing learned is saved.
 
-`detect_miners` checks `boards.board_for_info` before `new_miner_record`, and the record saves that board's version as `board`. `board_limits(board, config)` fills a new record: the 601 gets `GAMMA601_LIMITS`, other boards get preset-bound caps (65°C / 85°C, the regulator's warning current, the family's `maxPower`), and a limit the board has no sensor for (`Board.unused_limit_fields`) is saved blank. A miner on an unverified board gets `experimental_ok` once its first Start is confirmed. `_record_boards` brings an older config up to `CONFIG_VERSION` once: version 1 gives each miner its board ("601" before boards were recorded), version 2 its mode (Max hashrate on a 601) and marks an existing config `setup_done` with weather on, version 3 turns every `INTERNET_SWITCHES` key on, as those reads ran before they had switches. A fresh config has `default_mode` Balanced, `setup_done` false, `weather_enabled` and every `INTERNET_SWITCHES` key false, and a blank `supply_watts` until the first-run setup sets them. `config.data_dir()` puts the file beside the scripts, or in the user's data folder for a packaged build. `add_miner` does not perform that check. `config.json` stays gitignored.
+`detect_miners` checks `boards.board_for_info` before `new_miner_record`, and the record saves that board's version as `board`. `board_limits(board, config)` fills a new record: the 601 gets `GAMMA601_LIMITS`, other boards get preset-bound caps (65°C / 85°C, the regulator's warning current, the family's `maxPower`), and a limit the board has no sensor for (`Board.unused_limit_fields`) is saved blank. A miner on an unverified board gets `experimental_ok` once its first Start is confirmed. An update never changes a value the user saved: it only adds missing keys, drops `RETIRED_*_KEYS`, and stamps versions, and before it rewrites the file it keeps the original as `config.backup-v<saved config_version>.json` (gitignored, never overwritten). `_record_boards` brings an older config up to `CONFIG_VERSION` once: version 1 gives each miner its board ("601" before boards were recorded), version 2 its mode (Max hashrate on a 601) and marks an existing config `setup_done` with weather on, version 3 turns every `INTERNET_SWITCHES` key on, as those reads ran before they had switches. A fresh config has `default_mode` Balanced, `setup_done` false, `weather_enabled` and every `INTERNET_SWITCHES` key false, and a blank `supply_watts` until the first-run setup sets them. `config.data_dir()` puts the file beside the scripts, or in the user's data folder for a packaged build. `add_miner` does not perform that check. `config.json` stays gitignored.
 
 ```python
 # BAD
@@ -20,3 +20,15 @@ with open("config.json", "w") as file:
 # GOOD
 save_config(config)
 ```
+
+## Release policy
+
+Until the first release (`test_fixtures/released/` is empty), the owner is the only user, so `config.json` and `history.db` may change shape without a migration. The owner's own config must still load (`test_fleet.py`, `test_upgrade.py`).
+
+From the first release on:
+
+- Before each `v*` tag, run `python tools/snapshot_release.py vX.Y.Z` on the code being released and commit `test_fixtures/released/vX.Y.Z/`. The release workflow runs `--check` and refuses a tag without a matching snapshot.
+- `test_upgrade.ReleasedVersionTests` loads every released snapshot with the current code and checks that each saved value is kept and history can still be read and written.
+- A change that renames, removes, or changes the meaning of a saved key needs a `CONFIG_VERSION` bump and a step in `_record_boards` that converts the old value. A new or changed `history.db` column needs a schema migration in `history.py`, not just a new `CREATE TABLE`.
+- When `ReleasedVersionTests` fails, write the migration. Never edit, delete, or regenerate a released snapshot to make it pass.
+

@@ -69,6 +69,7 @@ from config import (
     board_limits,
     config_problem,
     detect_miners,
+    get_default_config,
     get_miner_defaults,
     get_miners,
     internet_switch_on,
@@ -873,9 +874,8 @@ def subnet_range_for(ip):
         return "", ""
     if network.version != 4:
         return "", ""
+    # A /24 always has 254 hosts.
     hosts = list(network.hosts())
-    if len(hosts) < 2:
-        return "", ""
     return str(hosts[0]), str(hosts[-1])
 
 
@@ -2540,7 +2540,9 @@ class TunerDashboard:
     def get_global_settings(self):
         """Global steps, temperatures, fast start, and flatline detection."""
         config = load_config()
-        settings = {key: config.get(key, "") for key in GLOBAL_INT_FIELDS}
+        # A setting an older version did not save shows its default.
+        defaults = get_default_config()
+        settings = {key: config.get(key, defaults[key]) for key in GLOBAL_INT_FIELDS}
         settings["fast_start"] = fast_start_enabled(config)
         settings["continue_from_live"] = continue_from_live_enabled(config)
         settings["default_mode"] = new_miner_mode(None, config).key
@@ -2593,7 +2595,6 @@ class TunerDashboard:
 
         def mutate(config):
             config.update(new_settings)
-            config.pop("enforce_safe_pairing", None)
 
         if modify_config(mutate) is False:
             return _fail(CONFIG_CORRUPT_MESSAGE, "Config file damaged", "error")

@@ -6,7 +6,7 @@ alwaysApply: false
 
 # Tests
 
-Tests use `unittest.TestCase` and `unittest.mock`. Session tests patch miner I/O with `patched_io` in `test_autotune.py`. Leave the network and live miners out of tests.
+Tests use `unittest.TestCase` and `unittest.mock`. Session tests patch miner I/O with `patched_io` in `test_autotune.py`; `FakeMiner` and `run_session` in `test_autotune_session_paths.py` script a miner and can stop a session at the wait after a given status or log line. Upgrade tests in `test_upgrade.py` load config.json as each older version saved it. Leave the network and live miners out of tests.
 
 ```python
 # BAD

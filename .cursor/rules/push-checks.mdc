@@ -13,7 +13,14 @@ pre-commit run --all-files --hook-stage pre-push
 
 If `pre-commit` is not on PATH, run `.venv/bin/pre-commit` with the same arguments. The check is `ruff check`, `ruff format --check`, and `python -m unittest`. It only reports. It does not rewrite files.
 
-GitHub Actions (`.github/workflows/ci.yml`) runs the same checks on Windows, macOS, and Linux, so keep tests free of OS-specific paths and calls.
+GitHub Actions (`.github/workflows/ci.yml`) runs the same checks on Windows, macOS, and Linux, so keep tests free of OS-specific paths and calls. It also measures branch coverage, and the Linux job fails under 100%. Check it before you finish:
+
+```bat
+python -m coverage run -m unittest
+python -m coverage report
+```
+
+New code needs tests for every branch. Reach Windows and macOS code with mocks (fake `ctypes.WinDLL`, a patched `sys.platform`), not a real system. Only a branch that cannot run gets `# pragma: no branch` or `# pragma: no cover`, with a comment saying why.
 
 No Ruff or test issues are allowed in code this change owns. A failure is related when it is in a file you changed, or it started because of your change. Fix it and run the check again. Apply Ruff's safe fixes and the formatter only to those files:
 

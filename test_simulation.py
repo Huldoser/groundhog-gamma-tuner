@@ -1,6 +1,7 @@
 import os
 import sys
 import unittest
+from unittest import mock
 
 import modes
 
@@ -34,3 +35,19 @@ class SimulationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CommandLineTests(unittest.TestCase):
+    def test_main_prints_one_line_per_mode(self):
+        argv = ["simulate.py", "--hours", "0.5", "--cooling", "custom"]
+        with (
+            mock.patch.object(sys, "argv", argv),
+            mock.patch("simulate.run", side_effect=lambda key, *a: key) as run,
+            mock.patch("builtins.print") as printed,
+        ):
+            simulate.main()
+        self.assertEqual(
+            [call.args[0] for call in run.call_args_list], list(modes.MODE_ORDER)
+        )
+        self.assertEqual(run.call_args.args[1:], (0.5, 24, "custom"))
+        self.assertIn("custom cooling", printed.call_args_list[0].args[0])

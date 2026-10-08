@@ -347,3 +347,45 @@ class SummaryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EdgeTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.directory.name, "history.db")
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def test_nothing_is_written_or_read_before_the_first_sample(self):
+        history.record_samples([], self.path)
+        self.assertFalse(os.path.exists(self.path))
+        self.assertEqual(history.last_events("reset", self.path), {})
+        self.assertIsNone(history.oldest_missing_weather(0, self.path))
+        self.assertEqual(history.fill_missing_weather([(0, {})], self.path), 0)
+        self.assertEqual(history.fill_missing_weather([], self.path), 0)
+
+    def test_readings_that_are_not_finite_are_dropped(self):
+        self.assertIsNone(history._number(float("nan")))
+        self.assertIsNone(history._number("-inf"))
+
+    def test_each_metric_reads_its_own_value(self):
+        sample = _sample(100, frequency=900)
+        self.assertEqual(history.metric_value(sample, "frequency"), 900)
+        self.assertIsNone(history.metric_value(dict(sample, power=None), "efficiency"))
+        points = history.fleet_points(
+            [_sample(100, frequency=900), _sample(100, ip="b", frequency=1000)],
+            "frequency",
+        )
+        self.assertEqual(points[0]["value"], 950)
+
+    def test_an_hour_outside_the_day_counts_as_night(self):
+        self.assertEqual(history.daypart(24), ("night", "Night"))
+
+    def test_an_unknown_metric_falls_back_to_good_hashrate(self):
+        samples = [_sample(100), _sample(700)]
+        self.assertEqual(
+            history.summarize(samples, "nonsense"),
+            history.summarize(samples, "good_hashrate"),
+        )
+        self.assertEqual(history._downsample([], 3600), [])

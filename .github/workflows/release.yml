@@ -39,6 +39,11 @@ jobs:
           fi
       - name: Unit tests
         run: python -m unittest
+      # Each release keeps a snapshot of the settings and history it saves.
+      # Later versions are tested against it, so they need a migration to change it.
+      - name: Release snapshot
+        if: startsWith(github.ref, 'refs/tags/')
+        run: python tools/snapshot_release.py --check ${{ github.ref_name }}
       - name: Build
         run: pyinstaller --noconfirm packaging/groundhog-gamma-tuner.spec
       - name: Package

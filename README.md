@@ -161,6 +161,16 @@ python3 -m venv --system-site-packages .venv
 - **No GTK:** `.venv/bin/python -m pip install "pywebview[qt]"` uses Qt instead.
 - **Application menu:** `./install-shortcut.sh` adds the app. `./install-shortcut.sh --autostart` also opens it when you log in.
 
+### Updating
+
+An update never changes a value you saved: limits, modes, start clocks, nicknames, and location stay as they are.
+
+- **Downloaded app:** replace it with the new version. `config.json` and `history.db` stay in your user data folder.
+- **From source:** run `git pull`, then `python -m pip install -U -r requirements.txt`. `config.json` and `history.db` are not in git, so a pull never touches them. Do not run `git clean -x`, which deletes them.
+- **A copy cloned before 2026-10-08:** the published history was cleaned that day, so `git pull` reports that the branches have diverged. Run `git fetch origin` and then `git reset --hard origin/main`. Neither touches `config.json` or `history.db`. Copy both somewhere safe first anyway: on a copy cloned before 2026-09-22, git itself still tracks `config.json`.
+- **New settings:** a newer version can add settings, each set to match how your older version behaved, and drop settings nothing uses any more. Before it rewrites `config.json` for that, it keeps the old file next to it as `config.backup-v<N>.json`.
+- **Your miners:** the app writes nothing to a miner until you press **Start Autotuner**. The one exception is a cooled miner that AxeOS left in overheat mode: the app clears that flag. With **Continue from current clocks** on (the default), each miner picks up from the clocks it is running.
+
 ## First start
 
 On first start the app asks four questions:
@@ -226,6 +236,17 @@ pre-commit install
 ```
 
 `git push` then runs `ruff check`, `ruff format --check`, and `python -m unittest`, and stops if any fail. Run the same checks by hand with `pre-commit run --all-files --hook-stage pre-push`. GitHub Actions runs them on Windows, macOS, and Linux for every push and pull request.
+
+Every line and branch of the app is covered by a test. GitHub Actions measures it, and the Linux job fails under 100%. Check it before you push:
+
+```bash
+python -m coverage run -m unittest
+python -m coverage report
+```
+
+- **Updates keep saved values:** `test_upgrade.py` loads `config.json` as each earlier version saved it, from the original upstream app on, and checks that every value stays, that the old file is kept as a backup, and that the next start changes nothing.
+- **Rare tuner paths:** `test_autotune_session_paths.py` drives real tuning sessions against a scripted miner: silent replies, refused writes, trips, and a stop at each wait.
+- **Releases:** until the first release, `config.json` and `history.db` may change shape without a migration. Before tagging a release, run `python tools/snapshot_release.py vX.Y.Z` on the code being released and commit `test_fixtures/released/vX.Y.Z`. The release build refuses a tag without a matching snapshot. From then on, `test_upgrade.py` loads every released snapshot with the current code. A change that breaks one needs a migration (a `CONFIG_VERSION` step in `config.py`, or a schema step in `history.py`). Never edit or regenerate a released snapshot.
 
 - **The author's fleet:** `test_fleet.py` pins how a Gamma 601 in Max hashrate mode is tuned to a fingerprint of the tuner's answers taken before other boards and modes existed. A change that moves it changes that fleet's tuning.
 - **Every board and mode:** `test_modes.py` checks that each preset stays inside its board's limits, and that randomized readings never push a decision past them.

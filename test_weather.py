@@ -222,3 +222,51 @@ class ForecastTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EdgeTests(unittest.TestCase):
+    def test_numbers_that_are_not_finite_are_dropped(self):
+        self.assertIsNone(weather._number(float("nan")))
+        self.assertIsNone(weather._number("inf"))
+        self.assertEqual(weather._number("2.5"), 2.5)
+
+    def test_unknown_or_missing_sky_codes_have_no_name(self):
+        self.assertEqual(weather.sky_group(42), "")
+        self.assertEqual(weather.sky_label(42), "")
+        self.assertEqual(weather.sky_label(None), "")
+
+    def test_a_reading_without_a_temperature_is_not_kept(self):
+        get = _get_returning({"current": {"weather_code": 0}})
+        self.assertIsNone(weather.read_current_weather(1, 2, get=get))
+
+    def test_hourly_history_skips_bad_rows_and_bad_replies(self):
+        self.assertEqual(
+            weather.read_hourly_weather(1, 2, 3, get=_get_returning({"hourly": {}})),
+            [],
+        )
+        payload = {
+            "hourly": {
+                "time": ["x", 3600],
+                "temperature_2m": [5.0, 6.0],
+            }
+        }
+        hours = weather.read_hourly_weather(1, 2, 3, get=_get_returning(payload))
+        self.assertEqual([moment for moment, _values in hours], [3600])
+
+    def test_a_reverse_lookup_without_an_address_has_no_name(self):
+        get = _get_returning({"error": "Unable to geocode"})
+        self.assertIsNone(weather.reverse_place_name(1, 2, get=get))
+
+    def test_detect_output_that_is_not_an_object_is_refused(self):
+        _lat, _lon, error = weather.parse_detect_output("[1, 2]")
+        self.assertIn("did not return", error)
+
+    def test_detect_passes_on_a_windows_refusal(self):
+        def run(command, **kwargs):
+            return subprocess.CompletedProcess(
+                command, 0, stdout='{"permission":"Denied"}', stderr=""
+            )
+
+        place, error = weather.detect_device_location(run=run, platform="win32")
+        self.assertIsNone(place)
+        self.assertIn("Let desktop apps access your location", error)

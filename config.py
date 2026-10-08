@@ -42,9 +42,17 @@ def data_dir(frozen=None, system=None, environ=None, home=None):
 
 
 CONFIG_FILE = os.path.join(data_dir(), "config.json")
-if getattr(sys, "frozen", False):
-    # A packaged app's data folder may not exist on its first start.
-    os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+
+
+def ensure_data_dir(path=None, frozen=None):
+    """Create a packaged app's data folder, which may not exist on its first start."""
+    if frozen is None:
+        frozen = getattr(sys, "frozen", False)
+    if frozen:
+        os.makedirs(os.path.dirname(path or CONFIG_FILE), exist_ok=True)
+
+
+ensure_data_dir()
 CONFIG_CORRUPT_MESSAGE = (
     "config.json is damaged and was not loaded. "
     "Fix that file before saving. The empty defaults were not written over it."
@@ -79,6 +87,8 @@ RETIRED_GLOBAL_KEYS = (
     "daily_reset_enabled",
     "daily_reset_time",
     "ceiling_soak_seconds",
+    # Upstream's frequency/voltage pairing table, which this fork never used.
+    "enforce_safe_pairing",
 )
 RETIRED_MINER_KEYS = (
     "last_good_freq",
@@ -326,10 +336,11 @@ def load_config():
             return default
 
         try:
+            with open(CONFIG_FILE, "rb") as file:
+                raw = file.read()
             # utf-8-sig also reads a file Notepad saved with a byte-order mark.
             # Without an encoding, Windows would decode it as cp1252.
-            with open(CONFIG_FILE, "r", encoding="utf-8-sig") as file:
-                loaded = json.load(file)
+            loaded = json.loads(raw.decode("utf-8-sig"))
             if not isinstance(loaded, dict):
                 raise ValueError("config.json is not a JSON object")
         except ValueError:
@@ -345,11 +356,14 @@ def load_config():
             _config_corrupt = False
             return default
 
-        _drop_retired_keys(loaded)
-        changed = _raise_limits(loaded)
+        saved_version = _saved_config_version(loaded)
+        changed = _drop_retired_keys(loaded)
+        if _record_limits_version(loaded):
+            changed = True
         if _record_boards(loaded):
             changed = True
         if changed:
+            _keep_backup(raw, saved_version)
             _write_config(loaded)
         _last_good_config = copy.deepcopy(loaded)
         _config_corrupt = False
@@ -391,24 +405,15 @@ def modify_config(mutator):
         return config
 
 
-# Bumped when the default caps rise and saved miners should follow once.
+# Versions 2 and 3 once raised the fleet's saved caps when the defaults rose.
+# An update must never change a value the user saved, so an older config now
+# only records the current version. Kept so an older app reading this config
+# does not raise anything either.
 LIMITS_VERSION = 3
-# Caps each version raises on saved miners. A config at an older version gets
-# every later step once; a saved value that is already higher stays.
-RAISED_LIMITS = {
-    # The fleet was repasted.
-    2: {"max_temp": 70, "max_vr_temp": 95, "max_volt": 1500},
-    # The user asked for 29 A.
-    3: {"max_core_amps": DEFAULT_MAX_CORE_AMPS},
-}
 
 
-def _raise_limits(config):
-    """Apply each RAISED_LIMITS step newer than the saved `limits_version`.
-
-    True when the config changed. `limits_version` records what ran, so a cap
-    lowered later is not raised again, and a new step leaves older ones alone.
-    """
+def _record_limits_version(config):
+    """Stamp the current `limits_version`. No saved cap changes. True when it changed."""
     if not isinstance(config, dict):
         return False
     try:
@@ -417,33 +422,6 @@ def _raise_limits(config):
         version = 1
     if version >= LIMITS_VERSION:
         return False
-    raises = {}
-    for step in sorted(RAISED_LIMITS):
-        if step > version:
-            raises.update(RAISED_LIMITS[step])
-    if "max_temp" in raises:
-        try:
-            default_temp = float(config.get("default_target_temp"))
-        except (TypeError, ValueError):
-            default_temp = None
-        if default_temp is not None and default_temp < raises["max_temp"]:
-            config["default_target_temp"] = raises["max_temp"]
-    for miner in config.get("miners") or []:
-        if not isinstance(miner, dict):
-            continue
-        # These steps are the 601 fleet's own history in Max mode.
-        if board_for_record(miner) is not GAMMA_601 or miner.get("mode") not in (
-            None,
-            modes.MAX_HASHRATE,
-        ):
-            continue
-        for key, value in raises.items():
-            try:
-                saved = float(miner.get(key))
-            except (TypeError, ValueError):
-                saved = None
-            if saved is None or saved < value:
-                miner[key] = value
     config["limits_version"] = LIMITS_VERSION
     return True
 
@@ -463,6 +441,14 @@ INTERNET_SWITCHES = (
 )
 
 
+def _saved_config_version(config):
+    """The `config_version` a file was saved with. 0 before versions were recorded."""
+    try:
+        return int(config.get("config_version", 0))
+    except (TypeError, ValueError, AttributeError):
+        return 0
+
+
 def internet_switch_on(config, key):
     """True when an internet read is switched on. A config without the key has it on."""
     if not isinstance(config, dict):
@@ -479,10 +465,7 @@ def _record_boards(config):
     """
     if not isinstance(config, dict):
         return False
-    try:
-        version = int(config.get("config_version", 0))
-    except (TypeError, ValueError):
-        version = 0
+    version = _saved_config_version(config)
     if version >= CONFIG_VERSION:
         return False
     for miner in config.get("miners") or []:
@@ -496,7 +479,8 @@ def _record_boards(config):
         config.setdefault("default_mode", modes.MAX_HASHRATE)
         config.setdefault("setup_done", True)
         config.setdefault("weather_enabled", True)
-    if version < 3:
+    # Always true until CONFIG_VERSION passes 3.
+    if version < 3:  # pragma: no branch
         for key in INTERNET_SWITCHES:
             config.setdefault(key, True)
     config["config_version"] = CONFIG_VERSION
@@ -504,15 +488,39 @@ def _record_boards(config):
 
 
 def _drop_retired_keys(config):
-    """Drop settings and learned setpoints an older version saved."""
+    """Drop settings and learned setpoints an older version saved. True when any were."""
     if not isinstance(config, dict):
+        return False
+    dropped = False
+    records = [config] + [m for m in config.get("miners") or [] if isinstance(m, dict)]
+    for index, record in enumerate(records):
+        for key in RETIRED_MINER_KEYS if index else RETIRED_GLOBAL_KEYS:
+            if key in record:
+                del record[key]
+                dropped = True
+    return dropped
+
+
+def backup_path(version):
+    """Where the file an older version saved is kept before this one rewrites it."""
+    directory = os.path.dirname(os.path.abspath(CONFIG_FILE))
+    return os.path.join(directory, f"config.backup-v{version}.json")
+
+
+def _keep_backup(raw, version):
+    """Copy config.json as an older version saved it, once per version.
+
+    An update adds settings but never changes a saved one. The copy is there
+    so nothing is lost even if that ever goes wrong. An existing copy stays.
+    """
+    path = backup_path(version)
+    if os.path.exists(path):
         return
-    for key in RETIRED_GLOBAL_KEYS:
-        config.pop(key, None)
-    for miner in config.get("miners") or []:
-        if isinstance(miner, dict):
-            for key in RETIRED_MINER_KEYS:
-                miner.pop(key, None)
+    try:
+        with open(path, "xb") as file:
+            file.write(raw)
+    except OSError:
+        pass
 
 
 def _write_config(config):
@@ -700,12 +708,6 @@ def update_miner(ip, new_settings):
 def get_miners():
     """Returns the list of configured miners."""
     return load_config().get("miners", [])
-
-
-def reset_config():
-    """Resets configuration to default settings."""
-    save_config(get_default_config())
-    print("Configuration reset to default.")
 
 
 if __name__ == "__main__":

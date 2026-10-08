@@ -146,7 +146,7 @@ What these mean for the tuner:
 | 18 | Hysteresis | 3 °C on the ASIC and the regulator | Stops flapping at a cap | **Keep** |
 | 19 | Size of a heat retreat | One step per 3 °C over, plus one voltage step while errors are at most half the budget | A hot afternoon needs a bigger cut | **Keep** |
 | 20 | Climbing again after a wall | Once 3 °C cooler, or after 6 hours | Day and night with the windows open | **Keep** |
-| 21 | One-off raises of saved caps | `RAISED_LIMITS` step 2 (repaste: 70 °C / 95 °C / 1500 mV) and step 3 (29 A) | This fleet's history | **Rework:** apply only to a 601 in Max mode. New installs never run them (done) |
+| 21 | One-off raises of saved caps | Step 2 (repaste: 70 °C / 95 °C / 1500 mV) and step 3 (29 A) raised saved caps on load | This fleet's history | **Removed:** an update never changes a saved value. New defaults reach new miners only, and the file an older version saved is kept as `config.backup-vN.json` (done) |
 
 ## Power and wiring
 

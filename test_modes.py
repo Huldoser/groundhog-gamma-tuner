@@ -439,7 +439,7 @@ class ModeConfigTests(unittest.TestCase):
         self.assertFalse(fresh["setup_done"])
         self.assertEqual(fresh["default_mode"], "balanced")
 
-    def test_fleet_raises_skip_other_boards_and_modes(self):
+    def test_an_old_limits_version_raises_nothing_on_any_board_or_mode(self):
         old = {
             "limits_version": 2,
             "config_version": config.CONFIG_VERSION,
@@ -462,7 +462,7 @@ class ModeConfigTests(unittest.TestCase):
         with open(self.path, "w", encoding="utf-8") as handle:
             json.dump(old, handle)
         amps = [miner["max_core_amps"] for miner in config.load_config()["miners"]]
-        self.assertEqual(amps, [29.0, 25, 25])
+        self.assertEqual(amps, [25, 25, 25])
 
 
 def _record(ip, name, board, mode=None):
@@ -547,3 +547,18 @@ class ModeDashboardTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PresetEdgeTests(unittest.TestCase):
+    def test_a_bad_default_temperature_keeps_the_mode_cap(self):
+        balanced = modes.preset_limits("balanced", boards.GAMMA_601)
+        broken = modes.preset_limits(
+            "balanced", boards.GAMMA_601, default_target_temp="hot"
+        )
+        self.assertEqual(broken["max_temp"], balanced["max_temp"])
+
+    def test_a_miner_that_is_not_a_record_gets_its_boards_default(self):
+        self.assertIs(
+            modes.mode_for_record(None, boards.GAMMA_601),
+            modes.MODES[modes.default_mode_for(boards.GAMMA_601)],
+        )

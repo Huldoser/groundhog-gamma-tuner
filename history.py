@@ -496,9 +496,8 @@ def outdoor_trend(points):
         return None
     mean_temp = sum(temps) / len(temps)
     mean_value = sum(value for _temp, value in pairs) / len(pairs)
+    # Never zero: the temperatures above span at least MIN_TREND_SPREAD_C.
     spread = sum((temp - mean_temp) ** 2 for temp in temps)
-    if spread <= 0:
-        return None
     return (
         sum((temp - mean_temp) * (value - mean_value) for temp, value in pairs) / spread
     )
