@@ -106,6 +106,48 @@ def _info(frequency=400, voltage=1100, **overrides):
     return info
 
 
+class FakeClock:
+    """Simulated time for a tuning session. Nothing sleeps."""
+
+    def __init__(self, seconds):
+        self.now = 1_000_000.0
+        self.end = self.now + seconds
+
+    def time(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += max(float(seconds or 0), 0)
+
+
+@contextmanager
+def fake_clock(seconds):
+    """Run sessions on simulated time.
+
+    Each wait in the session moves the clock forward instead of sleeping, and
+    the session stops itself after `seconds` of simulated time. A test then
+    sees the same polls and settles on every machine; a slow CI runner, a
+    coarse system timer, or coverage tracing cannot change what happened.
+    """
+    clock = FakeClock(seconds)
+
+    def wait(event, delay):
+        if delay is None or delay <= 0:
+            return event.is_set()
+        clock.now += delay
+        if clock.now >= clock.end:
+            event.set()
+        # Let the test's own thread run between polls.
+        time.sleep(0)
+        return event.is_set()
+
+    with (
+        mock.patch.object(autotune, "time", clock),
+        mock.patch.object(autotune, "_wait", wait),
+    ):
+        yield clock
+
+
 @contextmanager
 def patched_io(get_info, set_settings, restart=None, runtime_config=None):
     runtime_config = runtime_config or FAST_CONFIG
@@ -3145,9 +3187,13 @@ class SessionTests(unittest.TestCase):
         runtime = dict(FAST_CONFIG)
         runtime["refresh_interval"] = 0.25
         runtime["monitor_interval"] = 0.02
-        with patched_io(get_info, set_settings, runtime_config=runtime):
+        # Simulated time: a settle holds exactly as many polls on any machine.
+        with (
+            patched_io(get_info, set_settings, runtime_config=runtime),
+            fake_clock(3),
+        ):
             thread = _start_miner("miner", stop_event, lambda *args: None)
-            thread.join(3)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertGreaterEqual(len(errors), 8)
         self.assertEqual(errors[-1], 0)
@@ -5378,9 +5424,12 @@ class SessionTests(unittest.TestCase):
                 hashRate=0,
             )
 
-        with patched_io(get_info, set_settings, restart=restart):
+        with (
+            patched_io(get_info, set_settings, restart=restart),
+            fake_clock(2),
+        ):
             thread = _start_miner("miner", stop_event, lambda *args: None)
-            thread.join(2)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertIn(("restart",), events)
         restart_at = events.index(("restart",))

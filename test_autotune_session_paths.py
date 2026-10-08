@@ -1,9 +1,9 @@
 """Rare turns of a tuning session: silent miners, refused writes, and stops mid-wait.
 
 A FakeMiner keeps the clocks it was last given. run_session drives a real
-session against it and can stop the session at the wait right after a given
-status or log line, so each "stop while waiting here" path is reached the
-way a user's Stop would reach it.
+session against it on simulated time (test_autotune.fake_clock), and can stop
+the session at the wait right after a given status or log line, so each
+"stop while waiting here" path is reached the way a user's Stop would reach it.
 """
 
 import contextlib
@@ -12,7 +12,7 @@ import unittest
 from unittest import mock
 
 import autotune
-from test_autotune import FAST_CONFIG, _info, _start_miner, patched_io
+from test_autotune import FAST_CONFIG, _info, _start_miner, fake_clock, patched_io
 
 # A reply field set to MISSING is left out of the reply.
 MISSING = object()
@@ -70,18 +70,14 @@ def run_session(
     patches=(),
     **limits,
 ):
-    """Run one session. Stop at the first wait after a matching status or log."""
+    """Run one session for `seconds` of simulated time.
+
+    Stop at the first wait after a matching status or log.
+    """
     stop = threading.Event()
     armed = threading.Event()
     run = Run()
-    real_wait = autotune._wait
     real_publish = autotune._publish_status
-
-    def wait(event, seconds):
-        if armed.is_set():
-            event.set()
-            return True
-        return real_wait(event, seconds)
 
     def publish(ip, **fields):
         real_publish(ip, **fields)
@@ -98,12 +94,23 @@ def run_session(
         stack.enter_context(
             patched_io(miner.get_info, miner.set_settings, runtime_config=runtime)
         )
+        stack.enter_context(fake_clock(seconds))
+        clock_wait = autotune._wait
+
+        def wait(event, delay):
+            if armed.is_set():
+                event.set()
+                return True
+            return clock_wait(event, delay)
+
         stack.enter_context(mock.patch.object(autotune, "_wait", wait))
         stack.enter_context(mock.patch.object(autotune, "_publish_status", publish))
         for patch in patches:
             stack.enter_context(patch)
         thread = _start_miner("miner", stop, log, **limits)
-        thread.join(seconds)
+        # The session stops itself when simulated time runs out. The real
+        # timeout only guards against a session that never waits.
+        thread.join(30)
         stop.set()
         thread.join(2)
     test.assertFalse(thread.is_alive())
