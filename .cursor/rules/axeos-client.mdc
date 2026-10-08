@@ -9,12 +9,12 @@ alwaysApply: false
 Miner traffic is these three calls:
 
 - `GET http://{ip}/api/system/info`
-- `PATCH http://{ip}/api/system` with `coreVoltage`, `frequency`, `overclockEnabled`, and fan keys `autofanspeed` / `manualFanSpeed` (GET reports the live fan percent as `fanspeed`; v2.15.1 ignores a PATCH `fanspeed`)
+- `PATCH http://{ip}/api/system` with `coreVoltage`, `frequency`, `overclockEnabled`, and fan keys `autofanspeed` / `manualFanSpeed` / `temptarget` (35–66°C). GET reports the live fan percent as `fanspeed`; AxeOS ignores a PATCH `fanspeed`.
 - `POST http://{ip}/api/system/restart`
 
-`get_system_info` returns a dict or an error string. `patch_system` returns `(ok, error_text)`. A missing `errorPercentage` skips that miner. Read `ASICModel` and `boardVersion` through `is_gamma_601`.
+`get_system_info` returns a dict or an error string. `patch_system` returns `(ok, error_text)`. A missing `errorPercentage` skips that miner (every ASIC reports it in v2.15.3). Read `ASICModel` and `boardVersion` through `boards.board_for_info`. Read the ASIC temperature through `boards.asic_temp` (the hotter of `temp` and `temp2`) and core current through `core_current_amps(info, board)`: on INA260 boards `current` is input current and `vrTemp` is 0. `asicCount` is not in the reply; it comes from the board table.
 
-Two other HTTP reads stay as they are, and they are not miner endpoints: `DIFFICULTY_URL` for mempool difficulty, and `FIRMWARE_RELEASES_URL` for the official stable-tag notice. Both live in `dashboard.py`.
+The network panel probes the TCP port of each pool the miners report (`stratumURL`/`stratumPort` and the fallback pair). Two other HTTP reads stay as they are, and they are not miner endpoints: `DIFFICULTY_URL` for mempool difficulty, and `FIRMWARE_RELEASES_URL` for the official stable-tag notice. Both live in `dashboard.py`.
 
 Weather reads live in `weather.py` and are not miner endpoints either: Open-Meteo forecast (current every 15 minutes, hourly for backfill), Open-Meteo geocoding for a typed place, and one Nominatim reverse lookup with the app's `User-Agent` after a device location. The device location itself comes from Windows `GeoCoordinateWatcher` through PowerShell, with no extra package.
 

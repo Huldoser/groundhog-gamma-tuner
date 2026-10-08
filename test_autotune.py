@@ -2266,14 +2266,14 @@ class SessionTests(unittest.TestCase):
                 f"{ip} -> Applied settings: Voltage = {volt}mV, Frequency = {freq}MHz"
             )
 
-        with patched_io(lambda ip: _info(boardVersion="602"), set_settings):
+        with patched_io(lambda ip: _info(boardVersion="999"), set_settings):
             thread = _start_miner(
                 "miner", stop_event, lambda message, level="info": logs.append(message)
             )
             thread.join(2)
         self.assertFalse(thread.is_alive())
         self.assertEqual(calls, [])
-        self.assertTrue(any("Gamma 601" in message for message in logs))
+        self.assertTrue(any("board list" in message for message in logs))
 
         calls.clear()
         logs.clear()
@@ -5643,9 +5643,25 @@ class InstallAndConfigTests(unittest.TestCase):
             try:
                 config.CONFIG_FILE = path
                 config._last_good_config = None
-                config.save_config(config.get_default_config())
+                # A fresh install starts new miners in Balanced.
+                fresh = config.new_miner_record(
+                    "Gamma", "10.0.0.7", "gamma-2", config.get_default_config()
+                )
+                self.assertEqual(fresh["mode"], "balanced")
+                self.assertEqual(
+                    (fresh["max_temp"], fresh["max_vr_temp"], fresh["max_volt"]),
+                    (65, 85, 1250),
+                )
+                self.assertEqual(
+                    (fresh["max_core_amps"], fresh["max_watts"]), (25.0, 40)
+                )
+                # The fleet's own config makes new 601s Max hashrate miners.
+                saved = config.get_default_config()
+                saved["default_mode"] = "max_hashrate"
+                config.save_config(saved)
                 config.add_miner("Gamma", "10.0.0.6", "gamma-1")
                 miners = config.get_miners()
+                self.assertEqual(miners[0]["mode"], "max_hashrate")
                 self.assertEqual(miners[0]["max_temp"], 70)
                 self.assertEqual(miners[0]["start_freq"], 525)
                 self.assertEqual(miners[0]["start_volt"], 1150)
@@ -6035,16 +6051,15 @@ class InstallAndConfigTests(unittest.TestCase):
         self.assertLess(
             statusbar.find('id="updated"'), statusbar.find('id="network-diff"')
         )
-        self.assertIn("stratum.ckpool.org", statusbar)
-        self.assertIn("public-pool.io", statusbar)
+        # Pools come from what the miners report, not from the page.
+        self.assertIn('id="network-pools"', statusbar)
+        self.assertNotIn("ckpool", statusbar)
         self.assertNotIn('class="group"', html)
         self.assertNotIn('id="start"', html)
         self.assertNotIn('id="stop"', html)
         self.assertNotIn("start_label", script)
         self.assertIn("Stopping…", script)
         self.assertIn('id="network-diff"', html)
-        self.assertIn("stratum.ckpool.org", html)
-        self.assertIn("public-pool.io", html)
         self.assertNotIn('id="add-menu"', html)
         self.assertNotIn('id="add-open"', html)
         self.assertNotIn("Add Miner", html)

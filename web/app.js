@@ -11,7 +11,7 @@ const GLOBAL_FIELDS = [
   "flatline_hashrate_repeat_count",
 ];
 const FALLBACK_PROMPT = "Set every miner to the Gamma 601 stock clocks (525 MHz / 1150 mV) and make those its start clocks?\n\nThe next Start Autotuner tunes every miner up from there.";
-const FALLBACK_MINER_PROMPT = "Set {miner} to the Gamma 601 stock clocks (525 MHz / 1150 mV) and make those its start clocks?\n\nHistory marks the reset, so Since reset can start there.";
+const FALLBACK_MINER_PROMPT = "Set {miner} to the {board} stock clocks ({stock}) and make those its start clocks?\n\nHistory marks the reset, so Since reset can start there.";
 
 const $ = (id) => document.getElementById(id);
 
@@ -26,6 +26,7 @@ let pollStarted = false;
 let tunerRows = [];
 let tunerIndex = -1;
 let tunerClipboard = null;
+let tunerModes = [];
 let lastSnapshot = {
   miners: [],
   updated: "--:--:--",
@@ -271,7 +272,7 @@ function localDay(moment) {
   return `${moment.getFullYear()}-${pad(moment.getMonth() + 1)}-${pad(moment.getDate())}`;
 }
 
-// "Repasted Oct 4, 2026 (yesterday)" for a saved YYYY-MM-DD, or "".
+// "Hardware changed Oct 4, 2026 (yesterday)" for a saved YYYY-MM-DD, or "".
 function repasteText(day) {
   const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(day || "").trim());
   if (!match) return "";
@@ -282,11 +283,12 @@ function repasteText(day) {
   const days = Math.round((today - then) / 86400000);
   const ago = days <= 0 ? "today" : days === 1 ? "yesterday" : `${days} days ago`;
   const date = then.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
-  return `Repasted ${date} (${ago})`;
+  return `Hardware changed ${date} (${ago})`;
 }
 
 function nameTitle(miner) {
-  return [firmwareTitle(miner), repasteText(miner.repasted_on)].filter(Boolean).join("\n");
+  const board = [miner.board, miner.mode && `${miner.mode} mode`].filter(Boolean).join(", ");
+  return [board, firmwareTitle(miner), repasteText(miner.repasted_on)].filter(Boolean).join("\n");
 }
 
 function levelClass(level, quiet) {
@@ -475,16 +477,17 @@ function renderNetwork(network) {
   label.title = exact
     ? `Difficulty a share must beat to find a block\n${exact}`
     : "Difficulty a share must beat to find a block";
-  const byName = {};
+  // One dot per pool the miners report, primary and fallback.
+  const pools = $("network-pools");
+  pools.replaceChildren();
   (network.pools || []).forEach((pool) => {
-    byName[pool.name] = pool;
-  });
-  document.querySelectorAll(".pool").forEach((item) => {
-    const pool = byName[item.dataset.pool];
-    if (!pool) return;
+    const item = document.createElement("span");
     const state = pool.online === true ? "online" : pool.online === false ? "offline" : "unknown";
     item.className = `pool ${state}`;
+    item.dataset.pool = pool.name;
     item.title = state === "online" ? "Online" : state === "offline" ? "Offline" : "Checking";
+    item.textContent = pool.name;
+    pools.appendChild(item);
   });
 }
 
@@ -588,7 +591,11 @@ async function onRun() {
     if (action === "stop") {
       await bridge.stop_autotuner();
     } else {
-      const result = await bridge.start_autotuner();
+      let result = await bridge.start_autotuner();
+      if (result && result.confirm) {
+        const yes = await confirmAction(result.confirm);
+        result = yes ? await bridge.start_autotuner(true) : null;
+      }
       if (result && result.notice) showNotice(result.notice);
     }
     const snapshot = await bridge.get_snapshot(logCursor, windowFocused());
@@ -810,7 +817,10 @@ async function resetSelected() {
   const template = (lastSnapshot.prompts && lastSnapshot.prompts.miner_baseline) || FALLBACK_MINER_PROMPT;
   const yes = await confirmAction({
     title: "Reset Miner to Baseline",
-    message: template.replace("{miner}", `${miner.name} (${miner.ip})`),
+    message: template
+      .replace("{miner}", `${miner.name} (${miner.ip})`)
+      .replace("{board}", miner.board || "Gamma 601")
+      .replace("{stock}", miner.stock || "525 MHz / 1150 mV"),
     confirmLabel: "Reset",
     danger: true,
   });
@@ -836,6 +846,8 @@ async function openGlobal() {
   $("flatline_detection_enabled").checked = Boolean(settings.flatline_detection_enabled);
   $("fast_start").checked = settings.fast_start !== false;
   $("continue_from_live").checked = settings.continue_from_live !== false;
+  fillSelect($("default_mode"), settings.modes || [], settings.default_mode);
+  $("weather_enabled").checked = settings.weather_enabled !== false;
   openModal("global");
   $("voltage_step").focus();
 }
@@ -851,6 +863,8 @@ async function submitGlobal(event) {
   settings.flatline_detection_enabled = $("flatline_detection_enabled").checked;
   settings.fast_start = $("fast_start").checked;
   settings.continue_from_live = $("continue_from_live").checked;
+  if ($("default_mode").value) settings.default_mode = $("default_mode").value;
+  settings.weather_enabled = $("weather_enabled").checked;
   const result = await bridge.save_global_settings(settings);
   if (!result.ok) {
     setFormError("global-error", result.message);
@@ -864,18 +878,75 @@ function tunerField(name) {
   return $(`tune-${name}`);
 }
 
+function fillSelect(select, options, value) {
+  select.replaceChildren();
+  options.forEach((option) => {
+    const item = document.createElement("option");
+    item.value = option.key;
+    item.textContent = option.name;
+    select.appendChild(item);
+  });
+  if (value) select.value = value;
+}
+
+// True when every limit this board uses matches the mode's preset.
+function matchesPreset(row) {
+  const preset = (row.presets || {})[row.mode];
+  if (!preset) return true;
+  return TUNER_FIELDS.every((field) => {
+    if (row.unused.includes(field)) return true;
+    const typed = tunerField(field).value.trim();
+    return typed === "" ? preset[field] === "" : Number(typed) === Number(preset[field]);
+  });
+}
+
+function showModeNote(row) {
+  const mode = tunerModes.find((item) => item.key === row.mode);
+  const custom = matchesPreset(row) ? "" : " Custom limits.";
+  $("tuner-mode-note").textContent = mode ? `${mode.summary}${custom}` : "";
+}
+
+async function changeTunerMode() {
+  const row = tunerRows[tunerIndex];
+  if (!row) return;
+  const select = $("tune-mode");
+  const next = select.value;
+  const mode = tunerModes.find((item) => item.key === next);
+  const yes = await confirmAction({
+    title: "Change Mode",
+    message: `Replace ${row.name}'s limits with the ${mode ? mode.name : next} preset?\n\nSave keeps them; Cancel leaves this miner as it was.`,
+    confirmLabel: "Replace",
+  });
+  if (!yes) {
+    select.value = row.mode;
+    return;
+  }
+  row.mode = next;
+  const preset = (row.presets || {})[next] || {};
+  TUNER_FIELDS.forEach((field) => {
+    if (!row.unused.includes(field) && field in preset) tunerField(field).value = preset[field];
+  });
+  validateTuner();
+  storeTunerForm();
+}
+
 function storeTunerForm() {
   if (tunerIndex < 0 || !tunerRows[tunerIndex]) return;
   const row = tunerRows[tunerIndex];
   const box = $("tune-enabled");
   row.enabled = box.checked && !box.disabled;
   TUNER_FIELDS.forEach((field) => {
+    if (row.unused.includes(field)) return;
     row.fields[field] = tunerField(field).value.trim();
   });
 }
 
 function validateTuner() {
-  const empty = TUNER_FIELDS.some((field) => tunerField(field).value.trim() === "");
+  const row = tunerRows[tunerIndex];
+  const unused = row ? row.unused : [];
+  const empty = TUNER_FIELDS.some(
+    (field) => !unused.includes(field) && tunerField(field).value.trim() === "",
+  );
   const box = $("tune-enabled");
   if (empty) {
     box.checked = false;
@@ -883,6 +954,7 @@ function validateTuner() {
   } else {
     box.disabled = false;
   }
+  if (row) showModeNote(row);
 }
 
 function showTuner(index) {
@@ -890,9 +962,19 @@ function showTuner(index) {
   const row = tunerRows[index];
   $("tuner-title").textContent = row.label;
   $("tune-enabled").checked = Boolean(row.enabled);
+  fillSelect($("tune-mode"), tunerModes, row.mode);
   TUNER_FIELDS.forEach((field) => {
-    tunerField(field).value = row.fields[field] == null ? "" : row.fields[field];
+    const input = tunerField(field);
+    const unused = row.unused.includes(field);
+    // A board with no sensor for this limit leaves it blank and ignored.
+    input.disabled = unused;
+    input.placeholder = unused ? "No sensor" : "";
+    input.value = unused || row.fields[field] == null ? "" : row.fields[field];
   });
+  tunerField("max_core_amps").closest("label").title = row.ampsNote;
+  if (row.freqHint) $("tuner-freq-hint").textContent = row.freqHint;
+  if (row.voltHint) $("tuner-volt-hint").textContent = row.voltHint;
+  $("tuner-board-note").hidden = !row.experimental;
   validateTuner();
   Array.from($("tuner-list").children).forEach((button, buttonIndex) => {
     button.classList.toggle("selected", buttonIndex === index);
@@ -933,12 +1015,20 @@ async function openTuner() {
     showNotice(result.notice || { title: "No Miners Found", message: result.message, level: "warning" });
     return;
   }
+  tunerModes = result.modes || [];
   tunerRows = (result.miners || []).map((miner) => ({
     ip: miner.ip,
     name: miner.name || miner.label || miner.ip,
     label: miner.label,
     enabled: Boolean(miner.enabled),
     fields: Object.assign({}, miner.fields),
+    unused: miner.unused || [],
+    mode: miner.mode || "",
+    presets: miner.presets || {},
+    ampsNote: miner.amps_note || "",
+    freqHint: miner.freq_hint || "",
+    voltHint: miner.volt_hint || "",
+    experimental: Boolean(miner.experimental),
   }));
   tunerIndex = -1;
   renderTunerList();
@@ -959,7 +1049,8 @@ function pasteTuner() {
     return;
   }
   TUNER_FIELDS.forEach((field) => {
-    if (field in tunerClipboard) tunerField(field).value = tunerClipboard[field];
+    const input = tunerField(field);
+    if (field in tunerClipboard && !input.disabled) input.value = tunerClipboard[field];
   });
   validateTuner();
   storeTunerForm();
@@ -1021,12 +1112,17 @@ function bind() {
   $("scan-cancel").addEventListener("click", closeScan);
   $("edit-form").addEventListener("submit", submitEdit);
   $("global-form").addEventListener("submit", submitGlobal);
+  $("setup-form").addEventListener("submit", submitSetup);
+  document
+    .querySelectorAll('#setup-form input[type="radio"], #setup-ack')
+    .forEach((input) => input.addEventListener("change", previewSetup));
   $("tuner-form").addEventListener("submit", submitTuner);
   $("tuner-copy").addEventListener("click", copyTuner);
   $("tuner-paste").addEventListener("click", pasteTuner);
   TUNER_FIELDS.forEach((field) => {
     tunerField(field).addEventListener("input", validateTuner);
   });
+  $("tune-mode").addEventListener("change", changeTunerMode);
   $("confirm-ok").addEventListener("click", () => settleConfirm(true));
   $("confirm-cancel").addEventListener("click", () => settleConfirm(false));
   $("notice-ok").addEventListener("click", () => closeModal("notice"));
@@ -1147,11 +1243,74 @@ function bind() {
   });
 }
 
+let setupModes = [];
+
+function checkedValue(name) {
+  const input = document.querySelector(`input[name="${name}"]:checked`);
+  return input ? input.value : "";
+}
+
+// Mirrors dashboard.setup_mode: Max hashrate needs custom cooling and an OK.
+function setupModeKey() {
+  const cooling = checkedValue("setup-cooling");
+  const goal = checkedValue("setup-goal");
+  if (!cooling || !goal) return "";
+  if (goal === "efficiency") return "efficiency";
+  if (goal === "hashrate" && cooling === "custom" && $("setup-ack").checked) return "max_hashrate";
+  return "balanced";
+}
+
+function previewSetup() {
+  const cooling = checkedValue("setup-cooling");
+  const goal = checkedValue("setup-goal");
+  $("setup-ack-label").hidden = !(goal === "hashrate" && cooling === "custom");
+  const key = setupModeKey();
+  const mode = setupModes.find((item) => item.key === key);
+  let text = mode ? `New miners start in ${mode.name} mode. ${mode.summary}` : "";
+  if (goal === "hashrate" && key === "balanced") {
+    text += cooling === "custom"
+      ? " Tick the box above for Max hashrate."
+      : " Max hashrate is for custom cooling only.";
+  }
+  $("setup-mode").textContent = text;
+}
+
+async function checkSetup() {
+  const bridge = api();
+  if (!bridge || !bridge.get_setup_state) return;
+  const state = await bridge.get_setup_state();
+  if (!state || !state.ok || state.setup_done) return;
+  setupModes = state.modes || [];
+  setFormError("setup-error", "");
+  previewSetup();
+  openModal("setup");
+}
+
+async function submitSetup(event) {
+  event.preventDefault();
+  const bridge = api();
+  if (!bridge) return;
+  const result = await bridge.complete_setup({
+    cooling: checkedValue("setup-cooling"),
+    goal: checkedValue("setup-goal"),
+    acknowledged: $("setup-ack").checked,
+    supply_watts: $("setup-watts").value.trim(),
+    weather: $("setup-weather").checked,
+  });
+  if (!result || !result.ok) {
+    setFormError("setup-error", (result && result.message) || "Setup was not saved.");
+    return;
+  }
+  closeModal("setup");
+  openScan();
+}
+
 function startPolling() {
   if (pollStarted) return;
   pollStarted = true;
   poll();
   setInterval(poll, 500);
+  checkSetup();
 }
 
 bind();

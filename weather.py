@@ -18,7 +18,7 @@ FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
 REVERSE_URL = "https://nominatim.openstreetmap.org/reverse"
 # Nominatim refuses stock library user agents.
-USER_AGENT = "groundhog-gamma-tuner/1.0 (Bitaxe Gamma 601 dashboard)"
+USER_AGENT = "groundhog-gamma-tuner/1.0 (Bitaxe tuner dashboard)"
 WEATHER_TIMEOUT = 10
 # Open-Meteo current conditions are 15-minute model data.
 WEATHER_REFRESH_SECONDS = 15 * 60

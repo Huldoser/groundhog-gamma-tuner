@@ -219,6 +219,9 @@ h1 { font-size: 22px; letter-spacing: -0.02em; }
   min-width: 0;
 }
 
+/* Pool dots are flex items of .network. */
+.network-pools { display: contents; }
+
 .network-diff strong {
   color: var(--text);
   font-variant-numeric: tabular-nums;

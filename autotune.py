@@ -4,25 +4,32 @@ import time
 
 import requests
 
+from boards import (
+    GAMMA_601,
+    TPS546_DEFAULT,
+    asic_temp,
+    board_for_info,
+    board_for_record,
+    board_list_note,
+    firmware_check,
+)
 from config import (
-    DEFAULT_MAX_CORE_AMPS,
     DEFAULT_MAX_DROOP_MV,
     DEFAULT_MAX_ERROR_PERCENTAGE,
-    DEFAULT_MIN_INPUT_VOLTAGE,
     FIRMWARE_ASIC_TRIP_C,
     FIRMWARE_TRIP_MARGIN_C,
     FIRMWARE_VR_TRIP_C,
-    HARD_MAX_CORE_AMPS,
-    HARD_MAX_FREQ,
-    HARD_MAX_VOLT,
-    HARD_MIN_FREQ,
-    HARD_MIN_VOLT,
-    STOCK_FREQ,
-    STOCK_VOLT,
     SYSTEM_INFO_TIMEOUT,
-    is_gamma_601,
     load_config,
     update_miner,
+)
+from modes import (
+    EFFICIENCY,
+    HASHRATE,
+    MAX_HASHRATE,
+    MODES,
+    fan_payload,
+    mode_for_record,
 )
 
 # Load global configuration for callers that still use the module-level defaults.
@@ -81,10 +88,11 @@ def _reset_one_miner_to_baseline(miner, log_callback):
     ip = (miner or {}).get("ip")
     if not ip:
         return True
-    message = set_system_settings(ip, STOCK_VOLT, STOCK_FREQ)
+    stock_freq, stock_volt = board_for_record(miner).stock_clocks
+    message = set_system_settings(ip, stock_volt, stock_freq)
     applied = settings_were_applied(message)
     log_callback(message, "success" if applied else "error")
-    update_miner(ip, {"start_freq": STOCK_FREQ, "start_volt": STOCK_VOLT})
+    update_miner(ip, {"start_freq": stock_freq, "start_volt": stock_volt})
     _clear_miner_status(ip)
     return applied
 
@@ -211,19 +219,20 @@ TRIP_SAFE_MAX_TEMP = FIRMWARE_ASIC_TRIP_C - FIRMWARE_TRIP_MARGIN_C
 TRIP_SAFE_MAX_VR_TEMP = FIRMWARE_VR_TRIP_C - FIRMWARE_TRIP_MARGIN_C
 
 
-def clamp_limits(limits):
-    """Pull user limits inside the Gamma 601 hard range. Max stays at or above min.
+def clamp_limits(limits, board=GAMMA_601):
+    """Pull user limits inside the board's hard range. Max stays at or above min.
 
     Temperature caps are pulled under the AxeOS overheat trip.
     """
+    hard = board.limits
     clamped = dict(limits)
-    clamped["min_freq"] = _clamp(int(clamped["min_freq"]), HARD_MIN_FREQ, HARD_MAX_FREQ)
+    clamped["min_freq"] = _clamp(int(clamped["min_freq"]), hard.min_freq, hard.max_freq)
     clamped["max_freq"] = _clamp(
-        int(clamped["max_freq"]), clamped["min_freq"], HARD_MAX_FREQ
+        int(clamped["max_freq"]), clamped["min_freq"], hard.max_freq
     )
-    clamped["min_volt"] = _clamp(int(clamped["min_volt"]), HARD_MIN_VOLT, HARD_MAX_VOLT)
+    clamped["min_volt"] = _clamp(int(clamped["min_volt"]), hard.min_volt, hard.max_volt)
     clamped["max_volt"] = _clamp(
-        int(clamped["max_volt"]), clamped["min_volt"], HARD_MAX_VOLT
+        int(clamped["max_volt"]), clamped["min_volt"], hard.max_volt
     )
     if clamped.get("max_temp") is not None:
         clamped["max_temp"] = min(clamped["max_temp"], TRIP_SAFE_MAX_TEMP)
@@ -244,7 +253,7 @@ _RUNNING_LIMIT_FIELDS = (
 _REAL_LIMIT_FIELDS = ("max_temp", "max_watts", "max_vr_temp")
 
 
-def refresh_running_limits(limits, record):
+def refresh_running_limits(limits, record, board=GAMMA_601):
     """Apply caps saved while a session is already running.
 
     A missing field keeps the value already in use. A reversed frequency or
@@ -270,7 +279,7 @@ def refresh_running_limits(limits, record):
         or updated["min_volt"] > updated["max_volt"]
     ):
         return limits
-    return clamp_limits(updated)
+    return clamp_limits(updated, board)
 
 
 def normalize_input_voltage(value):
@@ -292,9 +301,12 @@ def _record_float(record, key, default):
     return number
 
 
-def core_current_amps(info):
-    """Regulator output current in amps, or None. AxeOS reports milliamps."""
-    if not isinstance(info, dict):
+def core_current_amps(info, board=GAMMA_601):
+    """Regulator output current in amps, or None. AxeOS reports milliamps.
+
+    None on a board whose `current` is the input current (INA260 boards).
+    """
+    if not isinstance(info, dict) or not board.has_core_current:
         return None
     number = _as_float(info.get("current"))
     if number is None or number <= 0:
@@ -302,12 +314,18 @@ def core_current_amps(info):
     return number / 1000.0 if number > 200 else number
 
 
-def core_amps_cap(record):
-    """This miner's current cap, never over HARD_MAX_CORE_AMPS."""
-    cap = _record_float(record, "max_core_amps", DEFAULT_MAX_CORE_AMPS)
+def core_amps_cap(record, board=GAMMA_601):
+    """This miner's current cap, never over the board's hard cap.
+
+    None when the board reports no core current.
+    """
+    hard = board.limits.max_core_amps
+    if hard is None:
+        return None
+    cap = _record_float(record, "max_core_amps", hard)
     if cap is None or cap <= 0:
-        cap = DEFAULT_MAX_CORE_AMPS
-    return min(float(cap), HARD_MAX_CORE_AMPS)
+        cap = hard
+    return min(float(cap), hard)
 
 
 def _over_current(core_current, max_core_amps):
@@ -365,6 +383,10 @@ def _thermal_frequency_steps(overshoot, tolerance):
 
 # A climb far under every cap takes up to this many frequency steps at once.
 MAX_CLIMB_FREQUENCY_STEPS = 4
+# Efficiency: a voltage trim that cost energy per hash is tried once more this
+# many frequency steps lower. Lower voltage lowers the clock a chip can run, so
+# the two have to come down together to find a more efficient point.
+EFFICIENCY_TRIM_FREQUENCY_STEPS = 2
 
 
 def climb_frequency_steps(
@@ -381,6 +403,7 @@ def climb_frequency_steps(
     max_steps=MAX_CLIMB_FREQUENCY_STEPS,
     core_current=None,
     max_core_amps=None,
+    vr_temp_required=True,
 ):
     """How many frequency steps one climb may take on this much headroom.
 
@@ -390,7 +413,8 @@ def climb_frequency_steps(
     conduction loss grows with the square of current, so its rise counts twice.
     The jump still has to leave both sensors a tolerance band under their caps
     and keep power under its cap. A missing reading, or a sensor within two
-    bands of its cap, takes one step. A band is at least 1°C.
+    bands of its cap, takes one step. A band is at least 1°C. A board with
+    no regulator sensor (`vr_temp_required` false) is judged on the ASIC.
     """
     max_steps = max(int(max_steps or 1), 1)
     clock = _as_float(frequency)
@@ -403,6 +427,8 @@ def climb_frequency_steps(
         (_usable_temp(temp), max_temp, temp_tolerance, 1),
         (_usable_temp(vr_temp), max_vr_temp, vr_tolerance, 2),
     ):
+        if value is None and cap is max_vr_temp and not vr_temp_required:
+            continue
         if value is None:
             return 1
         band = max(float(tolerance or 0), 1.0)
@@ -462,35 +488,47 @@ def _overheat_mode_set(value):
 # AxeOS v2.15.1 reports Gamma power as regulator output plus a fixed 5 W for
 # the rest of the board, so a board with the ASIC powered off still reads 5 W.
 # At or under this the ASIC is off. The lowest running clocks read well above it.
-ASIC_OFF_POWER_WATTS = 5.5
+# Other boards use their own `limits.asic_off_watts`.
+ASIC_OFF_POWER_WATTS = GAMMA_601.limits.asic_off_watts
 
 
-def overheat_ready_to_clear(info, max_temp, max_vr_temp):
+def _asic_off_power(power, asic_off_watts):
+    """True when a power reading says the ASIC is off. False when it cannot tell."""
+    return power is not None and asic_off_watts is not None and power <= asic_off_watts
+
+
+def overheat_ready_to_clear(
+    info,
+    max_temp,
+    max_vr_temp,
+    asic_off_watts=ASIC_OFF_POWER_WATTS,
+    vr_temp_required=True,
+):
     """True when a sticky overheat flag can be cleared.
 
     Both sensors have a positive reading at or under their caps, and the
     board is drawing more than the idle floor. A powered-down Gamma 601
-    reports no ASIC temperature, so that latch stays.
+    reports no ASIC temperature, so that latch stays. A board with no
+    regulator sensor is judged on the ASIC alone.
     """
     if not isinstance(info, dict) or not _overheat_mode_set(info.get("overheat_mode")):
         return False
-    temp = _usable_temp(info.get("temp"))
-    vr_temp = _usable_temp(info.get("vrTemp"))
+    temp = _usable_temp(asic_temp(info))
     power = _as_float(info.get("power"))
     temp_cap = _as_float(max_temp)
-    vr_cap = _as_float(max_vr_temp)
     if (
         temp is None
-        or vr_temp is None
         or power is None
         or temp_cap is None
-        or vr_cap is None
-        or power <= ASIC_OFF_POWER_WATTS
+        or _asic_off_power(power, asic_off_watts)
         or temp > temp_cap
-        or vr_temp > vr_cap
     ):
         return False
-    return True
+    if not vr_temp_required:
+        return True
+    vr_temp = _usable_temp(info.get("vrTemp"))
+    vr_cap = _as_float(max_vr_temp)
+    return vr_temp is not None and vr_cap is not None and vr_temp <= vr_cap
 
 
 def _power_fault_set(value):
@@ -531,6 +569,9 @@ OVERHEAT_LATCH_SECONDS = 120
 # AxeOS leaves its cool-down once the regulator is at or under 95°C. A few
 # degrees under that, the cool-down is over for certain.
 OVERHEAT_LATCH_VR_C = FIRMWARE_VR_TRIP_C - 10 - FIRMWARE_TRIP_MARGIN_C
+# Boards whose ASIC sensor reads while the ASIC is off cool under this before
+# AxeOS restarts them (SAFE_TEMP in power_management_task.c).
+OVERHEAT_SAFE_ASIC_C = 45.0
 # The ASIC reading as powered off this long without overheat mode or a user
 # pause earns one restart. A failed start or a regulator that shut itself off
 # otherwise holds forever.
@@ -649,7 +690,7 @@ def floor_setpoint(frequency, voltage, min_freq, min_volt):
     return max(int(frequency), int(min_freq)), max(int(voltage), int(min_volt))
 
 
-def overheat_latched(info, overheat_since, now, max_vr_temp):
+def overheat_latched(info, overheat_since, now, max_vr_temp, vr_temp_required=True):
     """True when AxeOS left overheat mode on after its own recovery failed.
 
     The flag has been set for OVERHEAT_LATCH_SECONDS and the regulator reads at
@@ -660,11 +701,17 @@ def overheat_latched(info, overheat_since, now, max_vr_temp):
     Power is not checked. The restart turns the regulator back on at the saved
     voltage before it tries the ASIC, so a failed start can read well above
     the 5 W the board shows with the regulator off.
+
+    A board with no regulator sensor cools until its ASIC reads at or under
+    OVERHEAT_SAFE_ASIC_C, when that sensor still reads with the ASIC off.
     """
     if not isinstance(info, dict) or not _overheat_mode_set(info.get("overheat_mode")):
         return False
     if overheat_since is None or now - overheat_since < OVERHEAT_LATCH_SECONDS:
         return False
+    if not vr_temp_required:
+        temp = _usable_temp(asic_temp(info))
+        return temp is None or temp <= OVERHEAT_SAFE_ASIC_C
     vr_value = _usable_temp(info.get("vrTemp"))
     vr_cap = _as_float(max_vr_temp)
     if vr_value is None or vr_cap is None:
@@ -688,6 +735,7 @@ def _needs_immediate_retreat(
     overheat_mode,
     core_current=None,
     max_core_amps=None,
+    asic_off_watts=ASIC_OFF_POWER_WATTS,
 ):
     """True when the clocks the miner is running are past a safety limit.
 
@@ -710,8 +758,8 @@ def _needs_immediate_retreat(
         return True
     if _over_current(core_current, max_core_amps):
         return True
-    if _overheat_mode_set(overheat_mode) or (
-        power_value is not None and power_value <= ASIC_OFF_POWER_WATTS
+    if _overheat_mode_set(overheat_mode) or _asic_off_power(
+        power_value, asic_off_watts
     ):
         return False
     if (
@@ -895,7 +943,8 @@ _HARDWARE_REJECT_MARKERS = ("hardware",)
 _IGNORED_REJECT_MARKERS = ("duplicate", "ntime", "worker", "unauthorized", "mismatch")
 
 # BM1370 expected hashrate is frequency * 2040 / 1000 GH/s. A 5 MHz step is 10.2 GH/s.
-BM1370_HASHRATE_PER_MHZ = 2.04
+# Other boards use their own `hashrate_per_mhz`.
+BM1370_HASHRATE_PER_MHZ = GAMMA_601.hashrate_per_mhz
 
 
 def average_error(samples):
@@ -1037,12 +1086,12 @@ class RejectSample:
         return hardware_share, sustained
 
 
-def expected_step_gain(frequency_step):
-    """GH/s a BM1370 should gain from this many MHz, before errors."""
+def expected_step_gain(frequency_step, hashrate_per_mhz=BM1370_HASHRATE_PER_MHZ):
+    """GH/s the board should gain from this many MHz, before errors."""
     step = _as_float(frequency_step)
     if step is None or step <= 0:
         step = 1
-    return step * BM1370_HASHRATE_PER_MHZ
+    return step * hashrate_per_mhz
 
 
 def good_hashrate_held(baseline_good, current_good, band):
@@ -1245,6 +1294,50 @@ def frequency_step_paid(
     return good_hashrate_held(baseline_good, current_good, band)
 
 
+def energy_per_hash(power, good):
+    """Watts per good GH/s (J/TH divided by 1000), or None when a reading is missing."""
+    watts = _as_float(power)
+    rate = _as_float(good)
+    if watts is None or rate is None or watts <= 0 or rate <= 0:
+        return None
+    return watts / rate
+
+
+def efficiency_step_paid(
+    baseline_power,
+    baseline_good,
+    current_power,
+    current_good,
+    ratio,
+    baseline_actual=None,
+    current_actual=None,
+):
+    """True when a settled step did not cost more energy per good hash than noise.
+
+    The Efficiency objective keeps a step on this instead of on good hashrate.
+    `ratio` is the noise allowance as a share of the baseline: one step's
+    expected hashrate over the baseline hashrate, the same slack the hashrate
+    test gives. None when a reading is missing, so the caller waits. As with
+    frequency_step_paid, a clock whose PLL did not rise did not pay.
+    """
+    baseline = energy_per_hash(baseline_power, baseline_good)
+    current = energy_per_hash(current_power, current_good)
+    if baseline is None or current is None:
+        return None
+    baseline_clock = _as_float(baseline_actual)
+    current_clock = _as_float(current_actual)
+    if (
+        baseline_clock is not None
+        and current_clock is not None
+        and current_clock <= baseline_clock
+    ):
+        return False
+    allowance = _as_float(ratio)
+    if allowance is None or allowance < 0:
+        allowance = 0
+    return current <= baseline * (1 + allowance)
+
+
 def _guard_bounds(
     current_frequency,
     current_voltage,
@@ -1406,6 +1499,10 @@ def decide_adjustment(
     max_climb_steps=1,
     core_current=None,
     max_core_amps=None,
+    asic_off_watts=ASIC_OFF_POWER_WATTS,
+    vr_temp_required=True,
+    objective=HASHRATE,
+    trim_floor_voltage=None,
 ):
     """Choose the next frequency and voltage.
 
@@ -1424,6 +1521,14 @@ def decide_adjustment(
     headroom. The climb still stops short of `blocked_frequency`.
     `core_current` over `max_core_amps` steps down like power. A climb or a
     voltage raise that would carry the current past the cap does not happen.
+    `asic_off_watts` is the board's power reading with the ASIC off.
+    `vr_temp_required` is false on a board with no regulator sensor; a missing
+    regulator reading then does not hold the climb.
+    `objective` EFFICIENCY answers chip errors with a lower clock while there
+    is one, never more voltage: at the clocks a Bitaxe runs, 10 mV costs
+    several times the energy per hash that 5 MHz does. Held at a heat wall,
+    it trims voltage one step instead of only waiting, staying above
+    `trim_floor_voltage` (a trim that already failed at this clock).
     `tier_list`, `expected_hashrate`, and `shares_rejected_delta` stay in the
     signature so older callers keep working.
     """
@@ -1501,8 +1606,8 @@ def decide_adjustment(
             shed_at_floor,
         )
 
-    if _overheat_mode_set(overheat_mode) or (
-        power_value is not None and power_value <= ASIC_OFF_POWER_WATTS
+    if _overheat_mode_set(overheat_mode) or _asic_off_power(
+        power_value, asic_off_watts
     ):
         return (
             current_frequency,
@@ -1668,12 +1773,17 @@ def decide_adjustment(
             and current_value * (current_voltage + voltage_step) / current_voltage
             > current_cap
         )
+        # Power is about P0 + k·f·V², so J/TH is about P0/f + k·V². A 5 MHz
+        # drop only moves the small P0/f share; a 10 mV raise moves the V²
+        # share by about 2·dV/V.
+        prefer_clock = objective == EFFICIENCY and current_frequency > min_freq
         if (
             phase == "hold"
             or thermal_hold
             or safety_hold
             or current_voltage >= max_volt
             or raise_crosses_current
+            or prefer_clock
         ):
             return _apply_step_down(
                 current_frequency,
@@ -1687,7 +1797,7 @@ def decide_adjustment(
                 quality_tag,
                 shed_voltage_at_floor=False,
             )
-        if vr_value is None:
+        if vr_value is None and vr_temp_required:
             return current_frequency, current_voltage, "holding for telemetry"
         stepped = min(max_volt, current_voltage + voltage_step)
         if stepped > current_voltage:
@@ -1716,6 +1826,28 @@ def decide_adjustment(
         )
 
     if thermal_hold and phase == "climb":
+        # At the heat wall, less voltage is less heat per hash. The caller
+        # judges the trim on energy per good hash and puts it back if it lost.
+        floor = min_volt
+        if trim_floor_voltage is not None:
+            floor = max(min_volt, int(trim_floor_voltage) + voltage_step)
+        if (
+            objective == EFFICIENCY
+            and error is not None
+            and error <= error_budget
+            and current_voltage - voltage_step >= floor
+        ):
+            return _guard_bounds(
+                current_frequency,
+                current_voltage,
+                current_frequency,
+                current_voltage - voltage_step,
+                min_freq,
+                max_freq,
+                min_volt,
+                max_volt,
+                "trim voltage",
+            )
         return current_frequency, current_voltage, "holding after thermal retreat"
 
     if safety_hold and phase == "climb":
@@ -1762,7 +1894,7 @@ def decide_adjustment(
     if current_frequency >= max_freq:
         return current_frequency, current_voltage, "frequency ceiling"
 
-    if vr_value is None:
+    if vr_value is None and vr_temp_required:
         return current_frequency, current_voltage, "holding for telemetry"
 
     # Core current grows in proportion to frequency at a fixed voltage.
@@ -1790,6 +1922,7 @@ def decide_adjustment(
             max_climb_steps,
             current_value,
             current_cap,
+            vr_temp_required,
         )
     new_frequency = min(max_freq, current_frequency + frequency_step * steps)
     blocked = coerce_limit(blocked_frequency)
@@ -1979,7 +2112,24 @@ def _apply_fan(bitaxe_ip, payload, log_callback):
 # "fanspeed" in v2.11.0 and ignores unknown PATCH keys, so the old key would turn
 # auto fan off and leave the fan on whatever manual speed was saved before.
 # GET still reports the live fan percent as "fanspeed".
-MANUAL_FULL_FAN = {"autofanspeed": 0, "manualFanSpeed": 100}
+MANUAL_FULL_FAN = fan_payload(MODES[MAX_HASHRATE], None)
+
+
+def fan_matches(info, payload):
+    """True when AxeOS reports the fan the way `payload` set it.
+
+    Manual payloads have to read back as manual 100%. Auto payloads have to
+    read back as auto, at the target when the firmware reports one. AxeOS
+    turns auto off and runs 100% after an overheat trip, so this is how a
+    session notices and puts auto back.
+    """
+    if not payload.get("autofanspeed"):
+        return _fan_is_manual_full(info)
+    if not isinstance(info, dict) or not _overheat_mode_set(info.get("autofanspeed")):
+        return False
+    wanted = payload.get("temptarget")
+    reported = _as_float(info.get("temptarget"))
+    return wanted is None or reported is None or int(reported) == int(wanted)
 
 
 def _fan_is_manual_full(info):
@@ -2033,14 +2183,30 @@ RAMP_DONE_MHZ = 15
 # Core voltage added per MHz on the way up, from these miners at 525-955 MHz.
 # A little under what they settled at: errors raise it, and extra voltage would
 # spend heat the clock could use.
-RAMP_MV_PER_MHZ = 0.3
+RAMP_MV_PER_MHZ = GAMMA_601.limits.mv_per_mhz
 RAMP_ERROR_VOLTAGE_STEPS = 2
 RAMP_MAX_MOVES = 30
 # AxeOS adds this much to Gamma power for the rest of the board. It does not
-# change with the clocks.
-BOARD_POWER_W = 5.0
+# change with the clocks. Other boards use their own `board_power_w`.
+BOARD_POWER_W = GAMMA_601.board_power_w
 RAMP_MIN_C_PER_W = 0.2
 RAMP_MAX_C_PER_W = 6.0
+
+
+def ramp_headroom(board=GAMMA_601):
+    """Fast-start headroom as `(watts, amps, input volts)` for this board.
+
+    The Gamma's 2 W, 1.5 A, and 0.05 V scale with ASIC count, the regulator's
+    shutdown current, and the nominal input.
+    """
+    family = board.family
+    return (
+        RAMP_POWER_HEADROOM_W * family.asic_count,
+        RAMP_CURRENT_HEADROOM_A
+        * family.regulator.iout_fault
+        / TPS546_DEFAULT.iout_fault,
+        RAMP_INPUT_HEADROOM_V * family.nominal_voltage / 5,
+    )
 
 
 def fast_start_enabled(runtime):
@@ -2059,7 +2225,7 @@ def continue_from_live_enabled(runtime):
     return bool(value)
 
 
-def live_start_clocks(info, limits):
+def live_start_clocks(info, limits, asic_off_watts=ASIC_OFF_POWER_WATTS):
     """The clocks a healthy miner is running now, as `(frequency, voltage)`, or None.
 
     A restarted session continues from these instead of the start clocks.
@@ -2082,8 +2248,7 @@ def live_start_clocks(info, limits):
         info.get("power_fault")
     ):
         return None
-    power = _as_float(info.get("power"))
-    if power is not None and power <= ASIC_OFF_POWER_WATTS:
+    if _asic_off_power(_as_float(info.get("power")), asic_off_watts):
         return None
     if board_hashrate_is_dead(info) and not pool_is_down(info):
         return None
@@ -2091,16 +2256,22 @@ def live_start_clocks(info, limits):
 
 
 def ramp_voltage(
-    frequency, start_frequency, start_voltage, floor_voltage, max_volt, voltage_step
+    frequency,
+    start_frequency,
+    start_voltage,
+    floor_voltage,
+    max_volt,
+    voltage_step,
+    mv_per_mhz=RAMP_MV_PER_MHZ,
 ):
     """Core voltage for a fast-start clock.
 
-    The start voltage plus RAMP_MV_PER_MHZ for each MHz above the start clock,
+    The start voltage plus `mv_per_mhz` for each MHz above the start clock,
     in whole voltage steps. Never under `floor_voltage`, the voltage errors
     already asked for, and never over `max_volt`.
     """
     step = max(int(voltage_step), 1)
-    rise = RAMP_MV_PER_MHZ * max(0, int(frequency) - int(start_frequency))
+    rise = mv_per_mhz * max(0, int(frequency) - int(start_frequency))
     line = int(start_voltage) + step * int(round(rise / step))
     return int(min(int(max_volt), max(int(floor_voltage), line)))
 
@@ -2141,6 +2312,8 @@ def ramp_target(
     voltage_step,
     min_input_voltage=None,
     max_core_amps=None,
+    board=GAMMA_601,
+    headroom_c=RAMP_HEADROOM_C,
 ):
     """The next fast-start jump as `(frequency, voltage, aim_frequency, aim_temp)`.
 
@@ -2156,56 +2329,78 @@ def ramp_target(
 
     None when fine tuning should take over: the aim is within RAMP_DONE_MHZ,
     a reading is missing, or the input is near its floor.
+
+    `board` sets the board's share of the power reading, the voltage per MHz,
+    the headroom (`ramp_headroom`), and how many chips share the regulator's
+    output. A board with no regulator sensor is projected on the ASIC alone.
     """
+    board_power_w = board.board_power_w
+    mv_per_mhz = board.limits.mv_per_mhz
+    power_headroom, current_headroom, input_headroom = ramp_headroom(board)
     frequency = coerce_limit(sample.get("frequency"))
     voltage = coerce_limit(sample.get("voltage"))
     power = _as_float(sample.get("power"))
     temp = _usable_temp(sample.get("temp"))
     vr_temp = _usable_temp(sample.get("vr_temp"))
-    if None in (frequency, voltage, power, temp, vr_temp) or frequency <= 0:
+    if None in (frequency, voltage, power, temp) or frequency <= 0:
+        return None
+    if vr_temp is None and board.has_vr_temp:
         return None
     input_voltage = _as_float(sample.get("input_voltage"))
     if (
         min_input_voltage is not None
         and input_voltage is not None
-        and input_voltage < min_input_voltage + RAMP_INPUT_HEADROOM_V
+        and input_voltage < min_input_voltage + input_headroom
     ):
         return None
-    scale = (power - BOARD_POWER_W) / (frequency * (voltage / 1000.0) ** 2)
+    scale = (power - board_power_w) / (frequency * (voltage / 1000.0) ** 2)
     if scale <= 0:
         return None
     readings = [*history, sample]
     asic = thermal_fit(
         [(item.get("power"), _usable_temp(item.get("temp"))) for item in readings]
     ) or (0.0, temp / power)
-    regulator = thermal_fit(
-        [(item.get("power"), _usable_temp(item.get("vr_temp"))) for item in readings]
-    ) or (0.0, vr_temp / power)
-    temp_cap = limits["max_temp"] - RAMP_HEADROOM_C
-    vr_cap = limits["max_vr_temp"] - RAMP_HEADROOM_C
-    watts_cap = limits["max_watts"] - RAMP_POWER_HEADROOM_W
+    regulator = None
+    if vr_temp is not None:
+        regulator = thermal_fit(
+            [
+                (item.get("power"), _usable_temp(item.get("vr_temp")))
+                for item in readings
+            ]
+        ) or (0.0, vr_temp / power)
+    temp_cap = limits["max_temp"] - headroom_c
+    vr_cap = limits["max_vr_temp"] - headroom_c
+    watts_cap = limits["max_watts"] - power_headroom
     amps_cap = (
         None
         if _as_float(max_core_amps) is None
-        else float(max_core_amps) - RAMP_CURRENT_HEADROOM_A
+        else float(max_core_amps) - current_headroom
     )
+    # The regulator drives every voltage domain in series.
+    domains = board.family.voltage_domains
     step = max(int(frequency_step), 1)
 
     def clocks_at(clock):
         return clock, ramp_voltage(
-            clock, start[0], start[1], voltage, limits["max_volt"], voltage_step
+            clock,
+            start[0],
+            start[1],
+            voltage,
+            limits["max_volt"],
+            voltage_step,
+            mv_per_mhz,
         )
 
     aim = frequency
     aim_temp = temp
     for clock in range(frequency + step, int(limits["max_freq"]) + 1, step):
         _clock, volts = clocks_at(clock)
-        watts = BOARD_POWER_W + scale * clock * (volts / 1000.0) ** 2
+        watts = board_power_w + scale * clock * (volts / 1000.0) ** 2
         projected = asic[0] + asic[1] * watts
-        amps = (watts - BOARD_POWER_W) / (volts / 1000.0)
+        amps = (watts - board_power_w) / (volts * domains / 1000.0)
         if (
             projected > temp_cap
-            or regulator[0] + regulator[1] * watts > vr_cap
+            or (regulator is not None and regulator[0] + regulator[1] * watts > vr_cap)
             or watts > watts_cap
             or (amps_cap is not None and amps > amps_cap)
         ):
@@ -2221,18 +2416,21 @@ def ramp_target(
     return next_frequency, next_voltage, aim, aim_temp
 
 
-def _ramp_breach(info, clocks, limits, min_input_voltage, max_core_amps=None):
+def _ramp_breach(
+    info, clocks, limits, min_input_voltage, max_core_amps=None, board=GAMMA_601
+):
     """Plain text for a limit this reading crosses at the ramp clocks, or ""."""
-    temp = _usable_temp(info.get("temp"))
+    asic_off_watts = board.limits.asic_off_watts
+    temp = _usable_temp(asic_temp(info))
     vr_temp = _usable_temp(info.get("vrTemp"))
     power = _as_float(info.get("power"))
     if _overheat_mode_set(info.get("overheat_mode")):
         return "overheat mode"
     if _power_fault_set(info.get("power_fault")):
         return "power fault"
-    if power is not None and power <= ASIC_OFF_POWER_WATTS:
+    if _asic_off_power(power, asic_off_watts):
         return "the ASIC is off"
-    if _over_current(core_current_amps(info), max_core_amps):
+    if _over_current(core_current_amps(info, board), max_core_amps):
         return "the core current limit"
     if _needs_immediate_retreat(
         temp,
@@ -2248,6 +2446,7 @@ def _ramp_breach(info, clocks, limits, min_input_voltage, max_core_amps=None):
         None,
         None,
         None,
+        asic_off_watts=asic_off_watts,
     ):
         return "a heat, power, or input limit"
     return ""
@@ -2267,6 +2466,7 @@ def _ramp_settle(
     min_input_voltage,
     stop_event,
     max_core_amps=None,
+    board=GAMMA_601,
 ):
     """Hold `clocks` until the chip settles.
 
@@ -2293,12 +2493,14 @@ def _ramp_settle(
             if time.time() - began > settle_seconds * RAMP_MAX_SETTLES:
                 return None, info, "the miner did not take the new clocks"
             continue
-        problem = _ramp_breach(info, clocks, limits, min_input_voltage, max_core_amps)
+        problem = _ramp_breach(
+            info, clocks, limits, min_input_voltage, max_core_amps, board
+        )
         if problem:
             return None, info, problem
         polls.append(
             {
-                "temp": _usable_temp(info.get("temp")),
+                "temp": _usable_temp(asic_temp(info)),
                 "vr_temp": _usable_temp(info.get("vrTemp")),
                 "power": _as_float(info.get("power")),
                 "input_voltage": normalize_input_voltage(info.get("voltage")),
@@ -2325,8 +2527,13 @@ def _ramp_settle(
         return sample, info, ""
 
 
-def _ramp_quality(sample, info, max_error_percentage, settled_for):
-    """ "dead", "errors", "low hashrate", or "" for a settled ramp reading."""
+def _ramp_quality(
+    sample, info, max_error_percentage, settled_for, ratio=HASHRATE_SHORTFALL_RATIO
+):
+    """ "dead", "errors", "low hashrate", or "" for a settled ramp reading.
+
+    `ratio` is the board's AxeOS self-test pass share (80% on a BM1368).
+    """
     if board_hashrate_is_dead(info) and not pool_is_down(info):
         return "dead"
     error = sample.get("error")
@@ -2338,7 +2545,9 @@ def _ramp_quality(sample, info, max_error_percentage, settled_for):
     if error is not None and error > budget:
         return "errors"
     if settled_for >= HASHRATE_1M_SETTLE_SECONDS and hashrate_well_below_expected(
-        info.get("hashRate_1m"), expected_hashrate_from_info(info, sample["frequency"])
+        info.get("hashRate_1m"),
+        expected_hashrate_from_info(info, sample["frequency"]),
+        ratio,
     ):
         return "low hashrate"
     return ""
@@ -2359,6 +2568,8 @@ def ramp_session(
     stop_event,
     log_callback,
     max_core_amps=None,
+    board=GAMMA_601,
+    headroom_c=RAMP_HEADROOM_C,
 ):
     """Fast start: jump from the start clocks toward the heat caps.
 
@@ -2408,6 +2619,7 @@ def ramp_session(
             min_input_voltage,
             stop_event,
             max_core_amps,
+            board,
         )
         if settled is None:
             return None
@@ -2417,7 +2629,11 @@ def ramp_session(
         if problem:
             return finish(good or start, f"stepped back after {problem}")
         quality = _ramp_quality(
-            sample, polled, max_error_percentage, time.time() - settle_began
+            sample,
+            polled,
+            max_error_percentage,
+            time.time() - settle_began,
+            board.asic.self_test_ratio,
         )
         if quality == "dead":
             return finish(good or start, "stepped back after the board stopped hashing")
@@ -2461,6 +2677,8 @@ def ramp_session(
             voltage_step,
             min_input_voltage,
             max_core_amps,
+            board,
+            headroom_c,
         )
         history.append(sample)
         if target is not None and failed_frequency is not None:
@@ -2506,6 +2724,7 @@ def opening_setpoint(
     max_error_percentage,
     max_droop_mv,
     max_core_amps=None,
+    board=GAMMA_601,
 ):
     """Clocks for the first write. A live breach lowers them. A cool chip does not climb."""
     if not isinstance(info, dict):
@@ -2520,7 +2739,7 @@ def opening_setpoint(
         max_temp=limits["max_temp"],
         max_watts=limits["max_watts"],
         max_vr_temp=limits["max_vr_temp"],
-        temp=info.get("temp") if "temp" in info else None,
+        temp=asic_temp(info),
         vr_temp=info.get("vrTemp") if "vrTemp" in info else None,
         power=info.get("power") if "power" in info else None,
         hash_rate=measured_hashrate(info),
@@ -2539,8 +2758,10 @@ def opening_setpoint(
         phase="climb",
         max_error_percentage=max_error_percentage,
         vr_temp_tolerance=vr_temp_tolerance,
-        core_current=core_current_amps(info),
+        core_current=core_current_amps(info, board),
         max_core_amps=max_core_amps,
+        asic_off_watts=board.limits.asic_off_watts,
+        vr_temp_required=board.has_vr_temp,
     )
     if (new_frequency < frequency or new_voltage < voltage) and _is_safety_retreat(
         reason
@@ -2566,9 +2787,15 @@ def monitor_and_adjust(
     stop_event=None,
     startup_delay=0,
 ):
-    """Monitor and auto-adjust one Gamma 601. A missing limit skips this miner only."""
+    """Monitor and auto-adjust one miner. A missing limit skips this miner only."""
     del bitaxe_type  # Kept so existing callers can still pass the miner type.
     event = stop_event if stop_event is not None else _default_stop_event
+    # The saved board sets the hard range. The live reply has to match it.
+    # The saved mode sets the objective, the fan, and the fast-start headroom.
+    saved = _miner_record(bitaxe_ip)
+    board = board_for_record(saved)
+    mode = mode_for_record(saved, board)
+    asic_off_watts = board.limits.asic_off_watts
 
     limits = {
         "min_freq": coerce_limit(min_freq),
@@ -2579,6 +2806,9 @@ def monitor_and_adjust(
         "max_watts": coerce_real_limit(max_watts),
         "max_vr_temp": coerce_real_limit(max_vr_temp),
     }
+    if limits["max_vr_temp"] is None and not board.has_vr_temp:
+        # No regulator sensor, so this cap is never compared.
+        limits["max_vr_temp"] = TRIP_SAFE_MAX_VR_TEMP
     missing = [name for name, value in limits.items() if value is None]
     if missing:
         log_callback(
@@ -2597,7 +2827,7 @@ def monitor_and_adjust(
         _publish_status(bitaxe_ip, phase="skipped", reason="limits reversed")
         return
     requested_caps = (limits["max_temp"], limits["max_vr_temp"])
-    limits = clamp_limits(limits)
+    limits = clamp_limits(limits, board)
     if (limits["max_temp"], limits["max_vr_temp"]) != requested_caps:
         log_callback(
             f"{bitaxe_ip} -> Temperature caps are too close to the AxeOS overheat trip. "
@@ -2625,13 +2855,28 @@ def monitor_and_adjust(
         log_callback(f"{bitaxe_ip} -> Autotuning stopped.", "warning")
         return
 
-    if not is_gamma_601(info):
+    live_board = board_for_info(info)
+    if live_board is None:
         log_callback(
-            f"{bitaxe_ip} -> Skipping tuning. This tuner only runs on a Bitaxe Gamma 601 (BM1370).",
+            f"{bitaxe_ip} -> Skipping tuning. {board_list_note(info)}", "error"
+        )
+        _publish_status(bitaxe_ip, phase="skipped", reason="not on the board list")
+        return
+    if live_board is not board:
+        log_callback(
+            f"{bitaxe_ip} -> Skipping tuning. The miner reports a {live_board.name}, "
+            f"but it was saved as a {board.name}. Remove it and add it again.",
             "error",
         )
-        _publish_status(bitaxe_ip, phase="skipped", reason="not a gamma 601")
+        _publish_status(bitaxe_ip, phase="skipped", reason="board changed")
         return
+    firmware_problem, firmware_note = firmware_check(info)
+    if firmware_problem:
+        log_callback(f"{bitaxe_ip} -> Skipping tuning. {firmware_problem}", "error")
+        _publish_status(bitaxe_ip, phase="skipped", reason="firmware too old")
+        return
+    if firmware_note:
+        log_callback(f"{bitaxe_ip} -> {firmware_note}", "warning")
     if not _reports_error_percentage(info):
         log_callback(
             f"{bitaxe_ip} -> Skipping tuning. Firmware did not report errorPercentage.",
@@ -2642,13 +2887,13 @@ def monitor_and_adjust(
 
     record = _miner_record(bitaxe_ip)
     min_input_voltage = _record_float(
-        record, "min_input_voltage", DEFAULT_MIN_INPUT_VOLTAGE
+        record, "min_input_voltage", board.default_min_input_voltage
     )
     max_error_percentage = _record_float(
         record, "max_error_percentage", DEFAULT_MAX_ERROR_PERCENTAGE
     )
     max_droop_mv = _record_float(record, "max_droop_mv", DEFAULT_MAX_DROOP_MV)
-    max_core_amps = core_amps_cap(record)
+    max_core_amps = core_amps_cap(record, board)
 
     start_frequency = coerce_limit(start_freq)
     start_voltage = coerce_limit(start_volt)
@@ -2663,7 +2908,7 @@ def monitor_and_adjust(
     start_voltage = _clamp(start_voltage, limits["min_volt"], limits["max_volt"])
 
     runtime = load_config()
-    live = live_start_clocks(info, limits)
+    live = live_start_clocks(info, limits, asic_off_watts)
     if live is not None and continue_from_live_enabled(runtime):
         start_frequency, start_voltage = live
         log_callback(
@@ -2695,6 +2940,9 @@ def monitor_and_adjust(
         droop_reference = int(previous)
         droop_grace_until = last_tune_time + refresh_interval
 
+    def _fan():
+        return fan_payload(mode, limits["max_temp"])
+
     def _opening_from(sample):
         return opening_setpoint(
             requested_frequency,
@@ -2709,13 +2957,17 @@ def monitor_and_adjust(
             max_error_percentage,
             max_droop_mv,
             max_core_amps,
+            board,
         )
 
-    _apply_fan(bitaxe_ip, dict(MANUAL_FULL_FAN), log_callback)
+    log_callback(
+        f"{bitaxe_ip} -> Tuning as a {board.name} in {mode.name} mode.", "info"
+    )
+    _apply_fan(bitaxe_ip, _fan(), log_callback)
     start_frequency, start_voltage, opening_reason = _opening_from(info)
     # A downward opening is applied even if the fan has not read back yet.
-    # An overclock waits until AxeOS reports manual 100%.
-    if not opening_reason and not _fan_is_manual_full(info):
+    # An overclock waits until AxeOS reports the mode's fan setting.
+    if not opening_reason and not fan_matches(info, _fan()):
         while not event.is_set():
             if _wait(event, interval):
                 break
@@ -2730,14 +2982,15 @@ def monitor_and_adjust(
             replies.answered()
             info = polled
             start_frequency, start_voltage, opening_reason = _opening_from(info)
-            if opening_reason or _fan_is_manual_full(info):
+            if opening_reason or fan_matches(info, _fan()):
                 break
-            _apply_fan(bitaxe_ip, dict(MANUAL_FULL_FAN), log_callback)
+            _apply_fan(bitaxe_ip, _fan(), log_callback)
+            fan_text = "auto" if mode.auto_fan else "manual 100%"
             log_callback(
-                f"{bitaxe_ip} -> Waiting for the fan to hold manual 100%.",
+                f"{bitaxe_ip} -> Waiting for the fan to hold {fan_text}.",
                 "info",
             )
-    if event.is_set() or (not opening_reason and not _fan_is_manual_full(info)):
+    if event.is_set() or (not opening_reason and not fan_matches(info, _fan())):
         log_callback(f"{bitaxe_ip} -> Autotuning stopped.", "warning")
         return
     if opening_reason:
@@ -2762,6 +3015,8 @@ def monitor_and_adjust(
             event,
             log_callback,
             max_core_amps,
+            board,
+            mode.ramp_headroom_c,
         )
         if ramped is None:
             log_callback(f"{bitaxe_ip} -> Autotuning stopped.", "warning")
@@ -2798,6 +3053,9 @@ def monitor_and_adjust(
     # A silicon frequency retreat below max voltage stays in hold until the
     # chip looks healthy. Entering trim immediately would raise voltage.
     trim_after_retreat = False
+    # Efficiency trims voltage at a heat wall. A trim that lost stays out:
+    # (frequency, voltage) of the first voltage that did not pay.
+    wall_trim_floor = None
     limit_wall = ""
     # Frequency step or voltage trim waiting on a settled good-hashrate reading.
     # hash_ceiling is the last clock that still paid, after a higher clock
@@ -2895,7 +3153,7 @@ def monitor_and_adjust(
                 runtime = load_config()
                 record = _miner_record(bitaxe_ip)
                 min_input_voltage = _record_float(
-                    record, "min_input_voltage", DEFAULT_MIN_INPUT_VOLTAGE
+                    record, "min_input_voltage", board.default_min_input_voltage
                 )
                 max_error_percentage = _record_float(
                     record, "max_error_percentage", DEFAULT_MAX_ERROR_PERCENTAGE
@@ -2903,8 +3161,8 @@ def monitor_and_adjust(
                 max_droop_mv = _record_float(
                     record, "max_droop_mv", DEFAULT_MAX_DROOP_MV
                 )
-                max_core_amps = core_amps_cap(record)
-                limits = refresh_running_limits(limits, record)
+                max_core_amps = core_amps_cap(record, board)
+                limits = refresh_running_limits(limits, record, board)
                 last_config_refresh = now
 
             voltage_step = _positive_int(runtime.get("voltage_step"), 10)
@@ -2929,8 +3187,8 @@ def monitor_and_adjust(
                 continue
             replies.answered()
 
-            if not _fan_is_manual_full(info) and time.time() >= fan_retry_at:
-                _apply_fan(bitaxe_ip, dict(MANUAL_FULL_FAN), log_callback)
+            if not fan_matches(info, _fan()) and time.time() >= fan_retry_at:
+                _apply_fan(bitaxe_ip, _fan(), log_callback)
                 fan_retry_at = time.time() + max(float(interval or 0), 0)
 
             reported_frequency = info.get("frequency")
@@ -3008,7 +3266,7 @@ def monitor_and_adjust(
                 overheat_since = None
                 overheat_recovered = False
             if not overheat_recovered and overheat_latched(
-                info, overheat_since, now, limits["max_vr_temp"]
+                info, overheat_since, now, limits["max_vr_temp"], board.has_vr_temp
             ):
                 # AxeOS clears overheat_mode only when the ASIC comes back. At
                 # its lowered clocks it may not, and a restart alone replays
@@ -3080,12 +3338,15 @@ def monitor_and_adjust(
                 not overheat_now
                 and not _overheat_mode_set(info.get("miningPaused"))
                 and not info.get("hardware_fault")
-                and power_now is not None
-                and power_now <= ASIC_OFF_POWER_WATTS
+                and _asic_off_power(power_now, asic_off_watts)
             )
             if not asic_off:
                 asic_off_since = None
-                if power_now is not None and power_now > ASIC_OFF_POWER_WATTS:
+                if (
+                    power_now is not None
+                    and asic_off_watts is not None
+                    and power_now > asic_off_watts
+                ):
                     asic_off_restarted = False
             elif asic_off_since is None:
                 asic_off_since = now
@@ -3217,7 +3478,7 @@ def monitor_and_adjust(
                     "info",
                 )
 
-            temp = info.get("temp") if "temp" in info else None
+            temp = asic_temp(info)
             vr_temp = info.get("vrTemp") if "vrTemp" in info else None
             live_hash = _as_float(info.get("hashRate"))
             minute_hash = _as_float(info.get("hashRate_1m"))
@@ -3387,8 +3648,9 @@ def monitor_and_adjust(
                 max_droop_mv,
                 info.get("power_fault"),
                 info.get("overheat_mode"),
-                core_current_amps(info),
+                core_current_amps(info, board),
                 max_core_amps,
+                asic_off_watts,
             )
             if retreat_clocks is None:
                 immediate_retreat = False
@@ -3464,11 +3726,15 @@ def monitor_and_adjust(
                 settled_for = time.time() - setpoint_since
                 if settled_for >= HASHRATE_10M_SETTLE_SECONDS:
                     hashrate_short = hashrate_well_below_expected(
-                        info.get("hashRate_10m"), expected_hashrate
+                        info.get("hashRate_10m"),
+                        expected_hashrate,
+                        board.asic.self_test_ratio,
                     )
                 elif settled_for >= HASHRATE_1M_SETTLE_SECONDS:
                     hashrate_short = hashrate_well_below_expected(
-                        info.get("hashRate_1m"), expected_hashrate
+                        info.get("hashRate_1m"),
+                        expected_hashrate,
+                        board.asic.self_test_ratio,
                     )
             if pool_is_down(info):
                 hashrate_short = False
@@ -3545,7 +3811,7 @@ def monitor_and_adjust(
                 droop_reference if droop_reference is not None else confirmed[1],
                 max_droop_mv,
                 info.get("power_fault"),
-                core_current_amps(info),
+                core_current_amps(info, board),
                 max_core_amps,
             ):
                 safety_hold = ""
@@ -3620,7 +3886,11 @@ def monitor_and_adjust(
                             "warning",
                         )
                 if reverted:
-                    if kind == "trim":
+                    if kind == "trim" and probe.get("wall"):
+                        probe["restore"] = True
+                        wall_trim_floor = (back_frequency, probe["to_volt"])
+                        retreat_reason = "restore voltage"
+                    elif kind == "trim":
                         # Keep the probe until the miner echoes the restore.
                         probe["restore"] = True
                         phase = "hold"
@@ -3656,8 +3926,19 @@ def monitor_and_adjust(
             if probe_ready:
                 current_good = good_hashrate(measured_hashrate(info), error_percentage)
                 kind = probe.get("kind") or "frequency"
-                band = expected_step_gain(frequency_step)
-                if kind == "trim":
+                band = expected_step_gain(frequency_step, board.hashrate_per_mhz)
+                if mode.objective == EFFICIENCY:
+                    baseline_good = _as_float(probe["baseline"])
+                    paid = efficiency_step_paid(
+                        probe.get("baseline_power"),
+                        probe["baseline"],
+                        _as_float(info.get("power")),
+                        current_good,
+                        band / baseline_good if baseline_good else 0,
+                        None if kind == "trim" else probe.get("actual"),
+                        None if kind == "trim" else info.get("actualFrequency"),
+                    )
+                elif kind == "trim":
                     paid = good_hashrate_held(probe["baseline"], current_good, band)
                 else:
                     paid = frequency_step_paid(
@@ -3707,6 +3988,7 @@ def monitor_and_adjust(
                     )
                     can_raise_voltage = (
                         kind != "trim"
+                        and mode.objective != EFFICIENCY
                         and not jumped
                         and not clock_stuck
                         and not thermal_hold
@@ -3731,8 +4013,54 @@ def monitor_and_adjust(
                         glitch_only and minute_retry_frequency != failed_frequency
                     )
                     short_text = (
-                        f"under {int(HASHRATE_SHORTFALL_RATIO * 100)}% of expected"
+                        f"under {round(board.asic.self_test_ratio * 100)}% of expected"
                     )
+                    lower_frequency = (
+                        probe["to_freq"]
+                        - EFFICIENCY_TRIM_FREQUENCY_STEPS * frequency_step
+                    )
+                    can_lower_clock = (
+                        kind == "trim"
+                        and mode.objective == EFFICIENCY
+                        and not probe.get("lowered")
+                        and lower_frequency >= limits["min_freq"]
+                    )
+                    if can_lower_clock:
+                        log_callback(
+                            f"{bitaxe_ip} -> {confirmed[1]} mV cost energy per hash "
+                            f"at {confirmed[0]} MHz. Trying {lower_frequency} MHz "
+                            f"/ {confirmed[1]} mV.",
+                            "info",
+                        )
+                        applied_settings = set_system_settings(
+                            bitaxe_ip, confirmed[1], lower_frequency
+                        )
+                        log_callback(applied_settings, "info")
+                        last_tune_time = time.time()
+                        if settings_were_applied(applied_settings):
+                            # Judged against the clocks the trim started from.
+                            probe = dict(probe, to_freq=lower_frequency, lowered=True)
+                            pending = (lower_frequency, confirmed[1])
+                            setpoint_since = None
+                            settle_until = time.time() + refresh_interval
+                            hashrate_history.clear()
+                            rolling_hashrate.clear()
+                            error_samples.clear()
+                        else:
+                            log_callback(
+                                f"{bitaxe_ip} -> Miner rejected the change. Setpoint left unchanged.",
+                                "warning",
+                            )
+                        _publish_status(
+                            bitaxe_ip,
+                            phase=phase,
+                            wall_type=limit_wall,
+                            error_percentage=error_percentage,
+                            reason="trim voltage",
+                        )
+                        if _wait(event, interval):
+                            break
+                        continue
                     if can_raise_voltage:
                         raised_voltage = min(
                             limits["max_volt"], confirmed[1] + voltage_step
@@ -3779,8 +4107,13 @@ def monitor_and_adjust(
                             break
                         continue
                     if kind == "trim":
+                        lost = (
+                            "cost energy per hash"
+                            if mode.objective == EFFICIENCY
+                            else "lowered good hashrate"
+                        )
                         log_callback(
-                            f"{bitaxe_ip} -> {confirmed[1]} mV lowered good hashrate. "
+                            f"{bitaxe_ip} -> {confirmed[1]} mV {lost}. "
                             f"Restoring {back_voltage} mV.",
                             "info",
                         )
@@ -3844,7 +4177,13 @@ def monitor_and_adjust(
                                 "warning",
                             )
                     if reverted:
-                        if kind == "trim":
+                        if kind == "trim" and probe.get("wall"):
+                            # Keep the probe until the miner echoes the restore.
+                            # The climb goes on; this voltage stays out at this clock.
+                            probe["restore"] = True
+                            wall_trim_floor = (back_frequency, probe["to_volt"])
+                            retreat_reason = "restore voltage"
+                        elif kind == "trim":
                             # Keep the probe until the miner echoes the restore.
                             probe["restore"] = True
                             phase = "hold"
@@ -3890,15 +4229,20 @@ def monitor_and_adjust(
                     if _wait(event, interval):
                         break
                     continue
+                held = (
+                    "Energy per hash held"
+                    if mode.objective == EFFICIENCY
+                    else "Good hashrate held"
+                )
                 if kind == "trim":
                     trim_good_voltage = confirmed[1]
                     log_callback(
-                        f"{bitaxe_ip} -> Kept {confirmed[1]} mV. Good hashrate held.",
+                        f"{bitaxe_ip} -> Kept {confirmed[1]} mV. {held}.",
                         "success",
                     )
                 else:
                     log_callback(
-                        f"{bitaxe_ip} -> Kept {confirmed[0]} MHz. Good hashrate held.",
+                        f"{bitaxe_ip} -> Kept {confirmed[0]} MHz. {held}.",
                         "success",
                     )
                 probe = None
@@ -4017,8 +4361,17 @@ def monitor_and_adjust(
                 "min_input_voltage": min_input_voltage,
                 "core_voltage_actual": _as_float(info.get("coreVoltageActual")),
                 "max_droop_mv": max_droop_mv,
-                "core_current": core_current_amps(info),
+                "core_current": core_current_amps(info, board),
                 "max_core_amps": max_core_amps,
+                "asic_off_watts": asic_off_watts,
+                "vr_temp_required": board.has_vr_temp,
+                "objective": mode.objective,
+                "trim_floor_voltage": (
+                    wall_trim_floor[1]
+                    if wall_trim_floor is not None
+                    and confirmed[0] >= wall_trim_floor[0]
+                    else None
+                ),
                 "droop_voltage": droop_reference,
                 "power_fault": info.get("power_fault"),
                 "phase": phase,
@@ -4120,7 +4473,7 @@ def monitor_and_adjust(
                 reason = "holding for good hashrate"
 
             if reason in ("increase frequency", "increase voltage") and not (
-                _fan_is_manual_full(info)
+                fan_matches(info, _fan())
             ):
                 new_frequency = confirmed[0]
                 new_voltage = confirmed[1]
@@ -4280,11 +4633,14 @@ def monitor_and_adjust(
                             "baseline": good_hashrate(
                                 measured_hashrate(info), error_percentage
                             ),
+                            "baseline_power": _as_float(info.get("power")),
                             "actual": _as_float(info.get("actualFrequency")),
                         }
                     elif reason == "trim voltage":
                         probe = {
                             "kind": "trim",
+                            # A heat-wall trim (Efficiency) keeps climbing after.
+                            "wall": phase == "climb",
                             "from_freq": confirmed[0],
                             "from_volt": confirmed[1],
                             "to_freq": new_frequency,
@@ -4292,6 +4648,7 @@ def monitor_and_adjust(
                             "baseline": good_hashrate(
                                 measured_hashrate(info), error_percentage
                             ),
+                            "baseline_power": _as_float(info.get("power")),
                             "actual": None,
                         }
                     elif probe is not None:

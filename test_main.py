@@ -91,6 +91,18 @@ class RelaunchTests(unittest.TestCase):
         run.assert_called_once_with([AMD64, script], check=False)
         self.assertEqual(stopped.exception.code, 3)
 
+    def test_x64_windows_and_other_systems_start_directly(self):
+        for platform, arch in (("win32", "AMD64"), ("darwin", ""), ("linux", "")):
+            with (
+                mock.patch.object(main.sys, "platform", platform),
+                mock.patch.object(main, "interpreter_arch", return_value=arch),
+                mock.patch.object(main, "discover_interpreters") as discover,
+                mock.patch.object(main.subprocess, "run") as run,
+            ):
+                self.assertIsNone(main.ensure_amd64_python())
+            discover.assert_not_called()
+            run.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

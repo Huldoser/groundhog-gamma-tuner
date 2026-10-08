@@ -19,3 +19,7 @@ history.db-journal
 # Local logs and secrets
 *.log
 .env
+
+# PyInstaller output
+build/
+dist/

@@ -104,7 +104,7 @@
             <button type="button" role="radio" data-period="90d">90 days</button>
             <button type="button" role="radio" data-period="all">All</button>
             <button type="button" role="radio" data-period="reset" title="Since the last Reset to Baseline">Since reset</button>
-            <button type="button" role="radio" data-period="repaste" title="Since each miner's repaste date">Since repaste</button>
+            <button type="button" role="radio" data-period="repaste" title="Since each miner's hardware change date">Since change</button>
           </div>
           <div id="history-metric" class="segmented" role="radiogroup" aria-label="Measure">
             <button type="button" role="radio" data-metric="good_hashrate" title="Hashrate less the error share">Good hashrate</button>
@@ -191,8 +191,7 @@
         <span class="network-diff" title="Difficulty a share must beat to find a block">
           Network <strong id="network-diff">--</strong>
         </span>
-        <span class="pool unknown" data-pool="stratum.ckpool.org" title="Checking">stratum.ckpool.org</span>
-        <span class="pool unknown" data-pool="public-pool.io" title="Checking">public-pool.io</span>
+        <span id="network-pools" class="network-pools"></span>
       </div>
     </footer>
   </div>
@@ -217,7 +216,7 @@
     <div class="backdrop" data-close="scan"></div>
     <form id="scan-form" class="dialog">
       <h2>Scan Network</h2>
-      <p class="hint">Only a Gamma 601 is added. Leave this panel open to watch the scan.</p>
+      <p class="hint">Any board on the AxeOS board list is added. A board nobody has verified with the tuner yet starts inside its AxeOS presets. Leave this panel open to watch the scan.</p>
       <label>Starting IP <input id="scan-start-ip" data-autofocus autocomplete="off" spellcheck="false"></label>
       <label>Ending IP <input id="scan-end-ip" autocomplete="off" spellcheck="false"></label>
       <p id="scan-progress" class="progress" aria-live="polite"></p>
@@ -235,12 +234,48 @@
       <h2>Edit Miner</h2>
       <label>Nickname <input id="edit-name" data-autofocus autocomplete="off"></label>
       <label>IP Address <input id="edit-ip" autocomplete="off" spellcheck="false" required></label>
-      <label>Repasted on <input id="edit-repasted" type="date"></label>
-      <p class="hint">The day this miner last got new thermal paste. History marks it and can start there. Leave blank if unknown.</p>
+      <label>Hardware changed on <input id="edit-repasted" type="date"></label>
+      <p class="hint">The day this miner last got new paste, a new cooler, or a new supply. History marks it and can start there. Leave blank if unknown.</p>
       <p id="edit-error" class="form-error"></p>
       <div class="dialog-actions">
         <button type="button" class="quiet" data-close="edit">Cancel</button>
         <button type="submit" id="edit-submit" class="accent">Save</button>
+      </div>
+    </form>
+  </div>
+
+  <div id="setup" class="modal" hidden>
+    <div class="backdrop" data-close="setup"></div>
+    <form id="setup-form" class="dialog dialog-wide">
+      <h2>Set Up the Tuner</h2>
+      <p class="hint">Four questions decide how new miners are tuned. You can change all of it later in Global Settings and AutoTuner Settings.</p>
+      <fieldset>
+        <legend>Cooling</legend>
+        <label class="check"><input type="radio" name="setup-cooling" value="stock"> Stock heatsink and fan</label>
+        <label class="check"><input type="radio" name="setup-cooling" value="upgraded"> Upgraded heatsink or fan</label>
+        <label class="check"><input type="radio" name="setup-cooling" value="custom"> Custom cooling: new paste, a custom shell, or strong extra airflow</label>
+      </fieldset>
+      <fieldset>
+        <legend>What you want most</legend>
+        <label class="check"><input type="radio" name="setup-goal" value="hashrate"> Most hashrate</label>
+        <label class="check"><input type="radio" name="setup-goal" value="balance"> More hashrate, still inside stock-cooler temperatures</label>
+        <label class="check"><input type="radio" name="setup-goal" value="efficiency"> Lowest power per TH (J/TH)</label>
+        <label id="setup-ack-label" class="check" hidden><input id="setup-ack" type="checkbox"> I understand Max hashrate runs the fan at 100% and raises voltage to the board's hard cap (1500 mV on a Gamma 601). Cooling or a supply that cannot take it can damage the board.</label>
+        <p id="setup-mode" class="hint"></p>
+      </fieldset>
+      <fieldset>
+        <legend>Power supply</legend>
+        <label>Watts per miner <input id="setup-watts" inputmode="decimal" placeholder="Optional"></label>
+        <p class="hint">What your supply and wiring can give each miner. The tuner steps down above it. Blank uses each board's AxeOS max power (40 W on a Gamma).</p>
+      </fieldset>
+      <fieldset>
+        <legend>History</legend>
+        <label class="check"><input id="setup-weather" type="checkbox"> Record outdoor weather with the history</label>
+        <p class="hint">Reads Open-Meteo every 15 minutes for your location, and looks the place name up once on Nominatim. Nothing about your miners is sent. Set the place in Settings &gt; Weather Location.</p>
+      </fieldset>
+      <p id="setup-error" class="form-error"></p>
+      <div class="dialog-actions">
+        <button type="submit" id="setup-submit" class="accent">Save and Find Miners</button>
       </div>
     </form>
   </div>
@@ -256,6 +291,11 @@
         <label>Frequency step (MHz) <input id="frequency_step" inputmode="numeric"></label>
         <label>Monitor interval (sec) <input id="monitor_interval" inputmode="numeric"></label>
         <label>Tune interval (sec) <input id="refresh_interval" inputmode="numeric"></label>
+      </fieldset>
+      <fieldset>
+        <legend>New miners</legend>
+        <p class="hint">The mode a miner gets when it is added. Change one miner's mode in AutoTuner Settings.</p>
+        <label>Mode for new miners <select id="default_mode"></select></label>
       </fieldset>
       <fieldset>
         <legend>Start</legend>
@@ -276,6 +316,11 @@
         <label class="check"><input id="flatline_detection_enabled" type="checkbox"> Enable flatline hashrate detection</label>
         <label>Flatline repeat count <input id="flatline_hashrate_repeat_count" inputmode="numeric"></label>
       </fieldset>
+      <fieldset>
+        <legend>History</legend>
+        <p class="hint">Outdoor weather comes from Open-Meteo every 15 minutes for the place in Weather Location.</p>
+        <label class="check"><input id="weather_enabled" type="checkbox"> Record outdoor weather with the history</label>
+      </fieldset>
       <p id="global-error" class="form-error"></p>
       <div class="dialog-actions">
         <button type="button" class="quiet" data-close="global">Cancel</button>
@@ -294,15 +339,18 @@
           <h3 id="tuner-title"></h3>
           <p class="hint">Limits for the selected miner.</p>
           <label class="check"><input id="tune-enabled" type="checkbox"> Tune this miner</label>
+          <label>Mode <select id="tune-mode"></select></label>
+          <p id="tuner-mode-note" class="hint"></p>
+          <p id="tuner-board-note" class="hint" hidden>Nobody has verified this board with the tuner yet. Its limits stay inside the board's AxeOS presets, and the first Start asks you to confirm.</p>
           <h4>Frequency</h4>
-          <p class="hint">Min is 350–1100 MHz. 350 is the lowest BM1370 preset in AxeOS v2.15.1.</p>
+          <p id="tuner-freq-hint" class="hint">Min is 350–1100 MHz. 350 is the lowest BM1370 preset in AxeOS.</p>
           <div class="trio">
             <label>Min <input id="tune-min_freq" inputmode="numeric"></label>
             <label>Start <input id="tune-start_freq" inputmode="numeric"></label>
             <label>Max <input id="tune-max_freq" inputmode="numeric"></label>
           </div>
           <h4>Voltage</h4>
-          <p class="hint">Voltage stays 1000–1500 mV. 1000 is the lowest BM1370 voltage preset. At the frequency ceiling the tuner trims voltage down, then restores it if hashrate or errors get worse. Voltage is lowered again only after frequency is already at its minimum.</p>
+          <p class="hint"><span id="tuner-volt-hint">Voltage stays 1000–1500 mV. 1000 is the lowest BM1370 voltage preset.</span> At the frequency ceiling the tuner trims voltage down, then restores it if hashrate or errors get worse. Voltage is lowered again only after frequency is already at its minimum.</p>
           <div class="trio">
             <label>Min <input id="tune-min_volt" inputmode="numeric"></label>
             <label>Start <input id="tune-start_volt" inputmode="numeric"></label>
@@ -315,7 +363,7 @@
           <label>Input voltage (V) <input id="tune-min_input_voltage" inputmode="decimal"></label>
           <label>Error % <input id="tune-max_error_percentage" inputmode="decimal"></label>
           <label>Droop (mV) <input id="tune-max_droop_mv" inputmode="numeric"></label>
-          <label title="The regulator shuts down with no retry at 30 A">Core current (A) <input id="tune-max_core_amps" inputmode="decimal"></label>
+          <label>Core current (A) <input id="tune-max_core_amps" inputmode="decimal"></label>
         </div>
       </div>
       <p id="tuner-error" class="form-error"></p>

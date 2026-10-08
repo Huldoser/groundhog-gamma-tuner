@@ -348,8 +348,8 @@ function renderNotice(data) {
     message = "No Reset to Baseline is recorded yet, so Since reset shows everything.";
   } else if (data.filters.period === "repaste" && !repasteKnown(data)) {
     message = data.filters.ip
-      ? "This miner has no repaste date, so Since repaste shows everything. Add it in Edit Miner Settings."
-      : "No miner has a repaste date yet, so Since repaste shows everything. Add one in Edit Miner Settings.";
+      ? "This miner has no hardware change date, so Since change shows everything. Add it in Edit Miner Settings."
+      : "No miner has a hardware change date yet, so Since change shows everything. Add one in Edit Miner Settings.";
   }
   if (!message) {
     notice.hidden = true;
@@ -586,7 +586,7 @@ function drawTrend(data, scale) {
     : `${meta.label} by miner over time`;
   const repasted = data.filters.ip ? (data.repastes || {})[data.filters.ip] : null;
   $("trend-sub").textContent = data.filters.ip
-    ? `${scale.unit}${meta.higher_is_better ? "" : ", lower is better"}${finite(repasted) ? ` · repasted ${formatDate(repasted)}` : ""}`
+    ? `${scale.unit}${meta.higher_is_better ? "" : ", lower is better"}${finite(repasted) ? ` · changed ${formatDate(repasted)}` : ""}`
     : `${scale.unit}${meta.higher_is_better ? "" : ", lower is better"} · click a name to show one miner`;
   if (!series.length || !data.first) {
     chartEmpty(trend, "Nothing recorded for this period yet.");

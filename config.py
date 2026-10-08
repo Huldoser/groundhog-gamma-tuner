@@ -2,16 +2,49 @@ import copy
 import ipaddress
 import json
 import os
+import sys
 import tempfile
 import threading
 
 import requests
 
+import modes
+from boards import GAMMA_601, board_for_info, board_for_record, board_list_note
+
 SYSTEM_INFO_TIMEOUT = 10
 # Addresses a network scan probes at the same time.
 SCAN_WORKERS = 32
 
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+APP_FOLDER = "Groundhog Gamma Tuner"
+
+
+def data_dir(frozen=None, system=None, environ=None, home=None):
+    """Where config.json and history.db live.
+
+    A source checkout keeps them beside the scripts, as it always has. A
+    packaged app (PyInstaller sets sys.frozen) cannot write inside itself, so
+    it uses the user's data folder: %APPDATA% on Windows, Application Support
+    on macOS, and $XDG_CONFIG_HOME (or ~/.config) on Linux.
+    """
+    frozen = getattr(sys, "frozen", False) if frozen is None else frozen
+    if not frozen:
+        return os.path.dirname(os.path.abspath(__file__))
+    system = system or sys.platform
+    environ = os.environ if environ is None else environ
+    home = home or os.path.expanduser("~")
+    if system == "win32":
+        base = environ.get("APPDATA") or os.path.join(home, "AppData", "Roaming")
+        return os.path.join(base, APP_FOLDER)
+    if system == "darwin":
+        return os.path.join(home, "Library", "Application Support", APP_FOLDER)
+    base = environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config")
+    return os.path.join(base, "groundhog-gamma-tuner")
+
+
+CONFIG_FILE = os.path.join(data_dir(), "config.json")
+if getattr(sys, "frozen", False):
+    # A packaged app's data folder may not exist on its first start.
+    os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
 CONFIG_CORRUPT_MESSAGE = (
     "config.json is damaged and was not loaded. "
     "Fix that file before saving. The empty defaults were not written over it."
@@ -20,25 +53,26 @@ _config_lock = threading.RLock()
 _last_good_config = None
 _config_corrupt = False
 
-# Gamma 601 hard range. The UI and the tuner both stay inside this.
-# 350 MHz is the lowest BM1370 clock in the AxeOS v2.15.1 preset list (Gamma Duo).
-# The Gamma list itself starts at 400. The API will store a lower number; this app will not.
-# Voltage stays at 1000 mV, the lowest BM1370 voltage preset. The tuner sheds voltage
-# only after frequency is already at its floor, so a lower voltage is not used to settle a weak chip.
-HARD_MIN_FREQ = 350
-HARD_MAX_FREQ = 1100
-HARD_MIN_VOLT = 1000
-HARD_MAX_VOLT = 1500
+# Gamma 601 hard range, from boards.VERIFIED_LIMITS. The UI and the tuner both
+# stay inside this. 350 MHz is the lowest BM1370 clock in the AxeOS preset
+# lists (GammaDuo); the Gamma list itself starts at 400. The API will store a
+# lower number; this app will not. Voltage stays at 1000 mV, the lowest BM1370
+# voltage preset. The tuner sheds voltage only after frequency is already at
+# its floor, so a lower voltage is not used to settle a weak chip.
+HARD_MIN_FREQ = GAMMA_601.limits.min_freq
+HARD_MAX_FREQ = GAMMA_601.limits.max_freq
+HARD_MIN_VOLT = GAMMA_601.limits.min_volt
+HARD_MAX_VOLT = GAMMA_601.limits.max_volt
 DEFAULT_MIN_INPUT_VOLTAGE = 4.9
-DEFAULT_MAX_ERROR_PERCENTAGE = 2.0
-DEFAULT_MAX_DROOP_MV = 40
+DEFAULT_MAX_ERROR_PERCENTAGE = modes.DEFAULT_MAX_ERROR_PERCENTAGE
+DEFAULT_MAX_DROOP_MV = modes.DEFAULT_MAX_DROOP_MV
 # Regulator output current. AxeOS sets the Gamma's TPS546 to warn at 25 A and
 # shut down with no retry at 30 A. The tuner stays at or under this cap, and a
 # saved cap is never above HARD_MAX_CORE_AMPS. 29 A leaves about 1 A for an
 # overshoot between polls; a trip stops mining until the tuner restarts it.
 # At 1.4 V, 29 A is also about 46 W at the 5 V plug.
 DEFAULT_MAX_CORE_AMPS = 29.0
-HARD_MAX_CORE_AMPS = 29.0
+HARD_MAX_CORE_AMPS = GAMMA_601.limits.max_core_amps
 # Settings and learned values an older version saved. Each session now starts
 # fresh, so they are dropped on load and save.
 RETIRED_GLOBAL_KEYS = (
@@ -68,19 +102,19 @@ AXEOS_LOW_INPUT_V = 4.745
 
 # The Gamma's TPS546 regulator as AxeOS v2.15.3 sets it up
 # (main/power/TPS546.c, TPS546_CONFIG_DEFAULT). Shown on the Limits screen.
-TPS546_VIN_ON_V = 4.8
-TPS546_VIN_OFF_V = 4.5
-TPS546_VIN_OV_FAULT_V = 6.5
-TPS546_VOUT_MIN_V = 1.0
-TPS546_VOUT_MAX_V = 2.0
-TPS546_IOUT_WARN_A = 25.0
-TPS546_IOUT_FAULT_A = 30.0
-TPS546_OT_WARN_C = 105
-TPS546_OT_FAULT_C = 145
+_GAMMA_REGULATOR = GAMMA_601.family.regulator
+TPS546_VIN_ON_V = _GAMMA_REGULATOR.vin_on
+TPS546_VIN_OFF_V = _GAMMA_REGULATOR.vin_off
+TPS546_VIN_OV_FAULT_V = _GAMMA_REGULATOR.vin_ov_fault
+TPS546_VOUT_MIN_V = _GAMMA_REGULATOR.vout_min
+TPS546_VOUT_MAX_V = _GAMMA_REGULATOR.vout_max
+TPS546_IOUT_WARN_A = _GAMMA_REGULATOR.iout_warn
+TPS546_IOUT_FAULT_A = _GAMMA_REGULATOR.iout_fault
+TPS546_OT_WARN_C = _GAMMA_REGULATOR.ot_warn
+TPS546_OT_FAULT_C = _GAMMA_REGULATOR.ot_fault
 
 # Gamma 601 clocks as they ship from the factory.
-STOCK_FREQ = 525
-STOCK_VOLT = 1150
+STOCK_FREQ, STOCK_VOLT = GAMMA_601.stock_clocks
 
 # Per-miner caps for a repasted, custom-cooled Gamma 601. Still editable per chip.
 # The tuner climbs while the ASIC is at or under 70°C and the regulator at or
@@ -107,11 +141,7 @@ GAMMA601_LIMITS = {
 
 def is_gamma_601(miner_info):
     """True only for a single-ASIC BM1370 on board version 601."""
-    if not isinstance(miner_info, dict):
-        return False
-    asic = str(miner_info.get("ASICModel") or "").strip().upper()
-    board = str(miner_info.get("boardVersion") or "").strip()
-    return asic == "BM1370" and board == "601"
+    return board_for_info(miner_info) is GAMMA_601
 
 
 def miner_type_from_info(miner_info):
@@ -161,7 +191,7 @@ def adopted_hostname(nickname, ip, miner_info):
 
 
 def detect_miners(start_ip, end_ip, on_progress=None, should_cancel=None):
-    """Scan a user-defined IP range and detect Bitaxe miners.
+    """Scan a user-defined IP range and save every board in the AxeOS board list.
 
     on_progress(index, total, ip) runs before each address.
     should_cancel() stops the scan before the next address. Miners already found are saved.
@@ -213,8 +243,8 @@ def detect_miners(start_ip, end_ip, on_progress=None, should_cancel=None):
             miner_info = response.json()
         except (requests.exceptions.RequestException, ValueError):
             return None
-        if not is_gamma_601(miner_info):
-            print(f"Skipping {ip_str}: not a Bitaxe Gamma 601.")
+        if board_for_info(miner_info) is None:
+            print(f"Skipping {ip_str}: {board_list_note(miner_info)}")
             return None
         return miner_info
 
@@ -230,7 +260,11 @@ def detect_miners(start_ip, end_ip, on_progress=None, should_cancel=None):
                 continue
             model = miner_type_from_info(miner_info)
             detected = new_miner_record(
-                model, ip_str, miner_name_from_info(miner_info, ip_str), config
+                model,
+                ip_str,
+                miner_name_from_info(miner_info, ip_str),
+                config,
+                board=board_for_info(miner_info),
             )
             with claim_lock:
                 found[index] = detected
@@ -312,7 +346,10 @@ def load_config():
             return default
 
         _drop_retired_keys(loaded)
-        if _raise_limits(loaded):
+        changed = _raise_limits(loaded)
+        if _record_boards(loaded):
+            changed = True
+        if changed:
             _write_config(loaded)
         _last_good_config = copy.deepcopy(loaded)
         _config_corrupt = False
@@ -394,6 +431,12 @@ def _raise_limits(config):
     for miner in config.get("miners") or []:
         if not isinstance(miner, dict):
             continue
+        # These steps are the 601 fleet's own history in Max mode.
+        if board_for_record(miner) is not GAMMA_601 or miner.get("mode") not in (
+            None,
+            modes.MAX_HASHRATE,
+        ):
+            continue
         for key, value in raises.items():
             try:
                 saved = float(miner.get(key))
@@ -402,6 +445,42 @@ def _raise_limits(config):
             if saved is None or saved < value:
                 miner[key] = value
     config["limits_version"] = LIMITS_VERSION
+    return True
+
+
+# Bumped when saved miner records gain a field older versions did not write.
+# 1: each miner records its board. 2: each miner records its mode, and a
+# config saved before the first-run setup existed counts as set up.
+CONFIG_VERSION = 2
+
+
+def _record_boards(config):
+    """Bring a config saved before `CONFIG_VERSION` up to it. True when it changed.
+
+    Before version 1 the app saved only Gamma 601s, so that is what they are.
+    Before version 2 every miner was tuned the Max hashrate way (a board added
+    in between got Balanced numbers), and the owner had set the app up by hand.
+    """
+    if not isinstance(config, dict):
+        return False
+    try:
+        version = int(config.get("config_version", 0))
+    except (TypeError, ValueError):
+        version = 0
+    if version >= CONFIG_VERSION:
+        return False
+    for miner in config.get("miners") or []:
+        if not isinstance(miner, dict):
+            continue
+        if version < 1 and not miner.get("board"):
+            miner["board"] = GAMMA_601.version
+        if version < 2 and modes.mode_named(miner.get("mode")) is None:
+            miner["mode"] = modes.default_mode_for(board_for_record(miner))
+    if version < 2:
+        config.setdefault("default_mode", modes.MAX_HASHRATE)
+        config.setdefault("setup_done", True)
+        config.setdefault("weather_enabled", True)
+    config["config_version"] = CONFIG_VERSION
     return True
 
 
@@ -436,6 +515,51 @@ def _write_config(config):
         raise
 
 
+def new_miner_mode(board, config=None, mode=None):
+    """The mode a new miner on `board` starts in.
+
+    An explicit `mode` wins, then the config's Mode for new miners, then the
+    board's own default (Max on a 601, Balanced elsewhere).
+    """
+    for key in (mode, (config or {}).get("default_mode")):
+        found = modes.mode_named(getattr(key, "key", key))
+        if found is not None:
+            return found
+    return modes.MODES[modes.default_mode_for(board or GAMMA_601)]
+
+
+def board_limits(board, config=None, mode=None):
+    """Caps for a new miner on this board in `mode` (see new_miner_mode).
+
+    Max on a 601 is the custom-cooled fleet's own preset. Every other preset
+    comes from modes.preset_limits and stays inside the board's AxeOS presets
+    when nobody has verified the board. A limit the board has no sensor for
+    is saved blank.
+    """
+    board = board or GAMMA_601
+    chosen = new_miner_mode(board, config, mode)
+    target = None if config is None else config.get("default_target_temp")
+    limits = modes.preset_limits(
+        chosen,
+        board,
+        gamma_601_max=gamma_601_limits(config),
+        default_target_temp=None if target in (None, "") else target,
+    )
+    supply = supply_watts(config)
+    if supply is not None:
+        limits["max_watts"] = supply
+    return limits
+
+
+def supply_watts(config):
+    """Watts the user's supply gives each miner (first-run setup), or None."""
+    try:
+        watts = float((config or {}).get("supply_watts"))
+    except (TypeError, ValueError):
+        return None
+    return watts if watts > 0 else None
+
+
 def gamma_601_limits(config=None):
     """Caps for a new Gamma 601. Max temp follows Default Max Temp when that is set."""
     limits = dict(GAMMA601_LIMITS)
@@ -444,11 +568,14 @@ def gamma_601_limits(config=None):
     return limits
 
 
-def new_miner_record(miner_type, ip, nickname, config=None):
-    """A new miner row. Limits are filled by gamma_601_limits."""
+def new_miner_record(miner_type, ip, nickname, config=None, board=None, mode=None):
+    """A new miner row. Limits are filled by board_limits for its mode."""
+    board = board or GAMMA_601
     record = {
         "nickname": nickname,
         "type": miner_type,
+        "board": board.version,
+        "mode": new_miner_mode(board, config, mode).key,
         "ip": ip,
         "enabled": True,
         "repasted_on": "",
@@ -456,7 +583,7 @@ def new_miner_record(miner_type, ip, nickname, config=None):
     for key in GAMMA601_LIMITS:
         record.setdefault(key, "")
     if config is not None:
-        record.update(gamma_601_limits(config))
+        record.update(board_limits(board, config, record["mode"]))
     return record
 
 
@@ -472,6 +599,12 @@ def get_default_config():
         "fast_start": True,
         "continue_from_live": True,
         "limits_version": LIMITS_VERSION,
+        "config_version": CONFIG_VERSION,
+        # The first-run setup sets these.
+        "default_mode": modes.DEFAULT_MODE,
+        "setup_done": False,
+        "weather_enabled": False,
+        "supply_watts": "",
         "flatline_detection_enabled": False,
         "flatline_hashrate_repeat_count": 5,
         "miners": [],

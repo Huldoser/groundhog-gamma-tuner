@@ -1,4 +1,4 @@
-"""Local dashboard window for the Gamma 601 tuner.
+"""Local dashboard window for the Bitaxe tuner.
 
 The page is a file inside a pywebview window. Python keeps the tuner threads
 and hands the page a snapshot to poll. Nothing listens on the network.
@@ -11,27 +11,21 @@ import platform
 import re
 import socket
 import sqlite3
-import subprocess
 import sys
 import threading
 import time
 from collections import deque
 from datetime import datetime
-from xml.sax.saxutils import escape as xml_escape
 
 import requests
 
 import history
+import modes
 import weather
 from autotune import (
-    BM1370_HASHRATE_PER_MHZ,
-    BOARD_POWER_W,
     HASHRATE_1M_SETTLE_SECONDS,
-    RAMP_CURRENT_HEADROOM_A,
     RAMP_HEADROOM_C,
     STARTUP_STAGGER_SECONDS,
-    STOCK_FREQ,
-    STOCK_VOLT,
     TRIP_GUARD_FREQUENCY_STEPS,
     TRIP_SAFE_MAX_TEMP,
     TRIP_SAFE_MAX_VR_TEMP,
@@ -50,48 +44,40 @@ from autotune import (
     normalize_input_voltage,
     overheat_ready_to_clear,
     patch_system,
+    ramp_headroom,
     reset_miners_to_baseline,
     restart_bitaxe,
     restart_miners,
     restart_was_accepted,
 )
+from boards import (
+    GAMMA_601,
+    TPS546,
+    asic_temp,
+    board_for_info,
+    board_for_record,
+    board_list_note,
+)
 from config import (
-    AXEOS_LOW_INPUT_V,
     CONFIG_CORRUPT_MESSAGE,
-    DEFAULT_MAX_CORE_AMPS,
     DEFAULT_MAX_DROOP_MV,
-    DEFAULT_MAX_ERROR_PERCENTAGE,
-    DEFAULT_MIN_INPUT_VOLTAGE,
     FIRMWARE_ASIC_TRIP_C,
     FIRMWARE_TRIP_MARGIN_C,
     FIRMWARE_VR_TRIP_C,
-    GAMMA601_LIMITS,
-    HARD_MAX_CORE_AMPS,
-    HARD_MAX_FREQ,
-    HARD_MAX_VOLT,
-    HARD_MIN_FREQ,
-    HARD_MIN_VOLT,
-    TPS546_IOUT_FAULT_A,
-    TPS546_IOUT_WARN_A,
-    TPS546_OT_FAULT_C,
-    TPS546_OT_WARN_C,
-    TPS546_VIN_OFF_V,
-    TPS546_VIN_ON_V,
-    TPS546_VIN_OV_FAULT_V,
-    TPS546_VOUT_MAX_V,
-    TPS546_VOUT_MIN_V,
     adopted_hostname,
+    board_limits,
     config_problem,
     detect_miners,
     get_miner_defaults,
     get_miners,
-    is_gamma_601,
     load_config,
     miner_type_from_info,
     modify_config,
+    new_miner_mode,
     remove_miner,
     update_miner,
 )
+from desktop import format_local_time, notify, snap_fullscreen_window
 
 STATUS_REFRESH_SECONDS = 5
 # Reads a miner may miss in a row before it shows as offline. A reboot or a
@@ -111,11 +97,6 @@ FIRMWARE_RELEASES_URL = (
 )
 _STABLE_TAG = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
 _INSTALLED_VERSION = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)")
-# Stratum V2 listeners. CK Pool is stratum.ckpool.org:3336. Public Pool solo is :23330.
-POOLS = (
-    ("stratum.ckpool.org", 3336),
-    ("public-pool.io", 23330),
-)
 
 FREQ_FIELDS = (("min_freq", "Min"), ("start_freq", "Start"), ("max_freq", "Max"))
 VOLT_FIELDS = (("min_volt", "Min"), ("start_volt", "Start"), ("max_volt", "Max"))
@@ -128,9 +109,9 @@ LIMIT_FIELDS = (
     ("max_droop_mv", "Droop (mV)"),
     ("max_core_amps", "Core current (A)"),
 )
-# Limits added after miners were already saved. A miner without one shows the
-# default instead of a blank, which Save would read as "turn this miner off".
-NEW_LIMIT_DEFAULTS = {"max_core_amps": DEFAULT_MAX_CORE_AMPS}
+# Limits added after miners were already saved. A miner without one shows its
+# board's default instead of a blank, which Save would read as "turn this miner off".
+NEW_LIMIT_FIELDS = ("max_core_amps",)
 ALL_AUTOTUNE_FIELDS = tuple(
     field for field, _label in (*FREQ_FIELDS, *VOLT_FIELDS, *LIMIT_FIELDS)
 )
@@ -153,6 +134,70 @@ START_REQUIRED_FIELDS = (
     "max_temp",
     "max_watts",
     "max_vr_temp",
+)
+
+
+def _cells(limits):
+    """Limits as the strings the AutoTuner form shows."""
+    return {
+        field: "" if limits.get(field) in (None, "") else str(limits.get(field))
+        for field in ALL_AUTOTUNE_FIELDS
+    }
+
+
+def _same_cells(fields, preset, board):
+    """True when every limit the board uses matches the preset."""
+    for field in required_fields({"board": board.version}):
+        if parse_display_number(fields.get(field)) != parse_display_number(
+            preset.get(field)
+        ):
+            return False
+    return True
+
+
+def required_fields(miner, fields=ALL_AUTOTUNE_FIELDS):
+    """The limit fields this miner needs. Its board's unused ones are left out."""
+    unused = board_for_record(miner).unused_limit_fields
+    return tuple(field for field in fields if field not in unused)
+
+
+def missing_start_fields(miner):
+    """Limits a miner still needs before it can start."""
+    return [
+        field
+        for field in required_fields(miner, START_REQUIRED_FIELDS)
+        if field not in miner or miner[field] == "" or miner[field] is None
+    ]
+
+
+def needs_experimental_ok(miner):
+    """True for a miner on an unverified board that has not been confirmed yet."""
+    return not board_for_record(miner).verified and not miner.get("experimental_ok")
+
+
+SETUP_COOLING = ("stock", "upgraded", "custom")
+SETUP_GOALS = ("hashrate", "balance", "efficiency")
+
+
+def setup_mode(cooling, goal, acknowledged=False):
+    """The new-miner mode for the first-run answers.
+
+    Max hashrate needs custom cooling and an explicit OK; otherwise the most
+    hashrate a stock or upgraded cooler should give is Balanced.
+    """
+    if goal == "efficiency":
+        return modes.MODES[modes.EFFICIENCY_MODE]
+    if goal == "hashrate" and cooling == "custom" and acknowledged:
+        return modes.MODES[modes.MAX_HASHRATE]
+    return modes.MODES[modes.BALANCED]
+
+
+EXPERIMENTAL_PROMPT = (
+    "Nobody has verified {boards} with this tuner yet.\n\n"
+    "{names} will tune inside their boards' AxeOS presets, with no voltage above "
+    "the top preset. Check their limits in AutoTuner Settings and watch the "
+    "first session.\n\n"
+    "Start anyway? You are asked once per miner."
 )
 
 
@@ -191,8 +236,8 @@ def replace_ips_with_names(message, names):
     return text
 
 
-def parse_autotuner_value(field, raw):
-    """Parse one AutoTuner cell. Frequency and voltage are clamped to the Gamma 601 range."""
+def parse_autotuner_value(field, raw, board=GAMMA_601):
+    """Parse one AutoTuner cell. Frequency and voltage are clamped to the board's range."""
     text = str(raw).strip()
     if text == "":
         return ""
@@ -209,14 +254,17 @@ def parse_autotuner_value(field, raw):
         "max_vr_temp",
     ):
         return value
+    hard = board.limits
     if field == "max_core_amps":
-        # The regulator shuts down with no retry at 30 A.
-        return max(1.0, min(HARD_MAX_CORE_AMPS, value))
+        # The regulator shuts down with no retry 1 A over the hard cap.
+        if hard.max_core_amps is None:
+            return value
+        return max(1.0, min(hard.max_core_amps, value))
     number = int(value)
     if field in ("min_freq", "max_freq", "start_freq"):
-        return max(HARD_MIN_FREQ, min(HARD_MAX_FREQ, number))
+        return max(hard.min_freq, min(hard.max_freq, number))
     if field in ("min_volt", "max_volt", "start_volt"):
-        return max(HARD_MIN_VOLT, min(HARD_MAX_VOLT, number))
+        return max(hard.min_volt, min(hard.max_volt, number))
     return number
 
 
@@ -258,15 +306,38 @@ _LIMIT_LABELS = {
 }
 
 
-def hardware_limits():
+# AxeOS shows "Danger: Low Voltage" under this share of the nominal input.
+AXEOS_LOW_INPUT_SHARE = 0.949
+
+
+def _mode_row(mode, board):
+    """One Modes row: name, key numbers on this board, and what it is for."""
+    preset = board_limits(board, mode=mode.key)
+    caps = f"{preset['max_temp']:g} °C ASIC"
+    if board.has_vr_temp:
+        caps += f" / {preset['max_vr_temp']:g} °C VR"
+    fan = "auto fan" if mode.auto_fan else "fan 100%"
+    return [mode.name, f"up to {preset['max_volt']} mV · {caps} · {fan}", mode.summary]
+
+
+def hardware_limits(board=GAMMA_601, mode=None):
     """Sections for the Limits screen: what the chip, regulator, firmware,
     and tuner allow. Tuner numbers come from the code, so the page cannot drift.
 
     Each section is `{"title", "intro", "rows"}`; each row is `[name, value, note]`.
     """
-    defaults = GAMMA601_LIMITS
-    full_push_watts = BOARD_POWER_W + HARD_MAX_CORE_AMPS * HARD_MAX_VOLT / 1000
-    return [
+    new_mode = new_miner_mode(board, mode=mode)
+    defaults = board_limits(board, mode=new_mode.key)
+    hard = board.limits
+    family = board.family
+    regulator = family.regulator
+    hashrate_per_mhz = board.hashrate_per_mhz
+    cores = board.asic.small_cores * family.asic_count
+    low_input = round(AXEOS_LOW_INPUT_SHARE * family.nominal_voltage, 3)
+    full_push_watts = board.board_power_w + (hard.max_core_amps or 0) * (
+        hard.max_volt * family.voltage_domains / 1000
+    )
+    sections = [
         {
             "title": "AxeOS firmware",
             "intro": "Built into AxeOS v2.15.3. The tuner cannot change these; it stays under them.",
@@ -283,151 +354,201 @@ def hardware_limits():
                 ],
                 [
                     "Low input warning",
-                    f"under {AXEOS_LOW_INPUT_V:g} V",
+                    f"under {low_input:g} V",
                     "Shown as Danger: Low Voltage on the AxeOS page.",
                 ],
                 [
                     "Board share of power",
-                    f"{BOARD_POWER_W:g} W",
+                    f"{board.board_power_w:g} W",
                     "AxeOS adds this to the regulator's output in the power reading.",
-                ],
-            ],
-        },
-        {
-            "title": "Voltage regulator (TPS546)",
-            "intro": "How AxeOS programs the Gamma's core regulator.",
-            "rows": [
-                [
-                    "Input on / off",
-                    f"{TPS546_VIN_ON_V:g} V / {TPS546_VIN_OFF_V:g} V",
-                    "Under the off voltage the core loses power and the ASIC stops.",
-                ],
-                [
-                    "Input over-voltage fault",
-                    f"{TPS546_VIN_OV_FAULT_V:g} V",
-                    "Highest supply voltage the board accepts.",
-                ],
-                [
-                    "Core voltage range",
-                    f"{TPS546_VOUT_MIN_V:.1f}–{TPS546_VOUT_MAX_V:.1f} V",
-                    "Anything outside is refused.",
-                ],
-                [
-                    "Core current warning",
-                    f"{TPS546_IOUT_WARN_A:g} A",
-                    "Flag only. Mining continues.",
-                ],
-                [
-                    "Core current shutdown",
-                    f"{TPS546_IOUT_FAULT_A:g} A",
-                    "Shuts down with no retry. Needs a restart.",
-                ],
-                [
-                    "Temperature warning / shutdown",
-                    f"{TPS546_OT_WARN_C} °C / {TPS546_OT_FAULT_C} °C",
-                    "Restarts by itself once it cools under the warning.",
-                ],
-            ],
-        },
-        {
-            "title": "BM1370 on the Gamma 601",
-            "intro": "",
-            "rows": [
-                [
-                    "Stock clocks",
-                    f"{STOCK_FREQ} MHz / {STOCK_VOLT} mV",
-                    "How the Gamma 601 ships.",
-                ],
-                [
-                    "Lowest presets",
-                    f"{HARD_MIN_FREQ} MHz / {HARD_MIN_VOLT} mV",
-                    "Lowest BM1370 clock and voltage in the AxeOS preset lists.",
-                ],
-                [
-                    "Hashrate per MHz",
-                    f"{BM1370_HASHRATE_PER_MHZ:g} GH/s",
-                    "2,040 small cores. 1,000 MHz is about 2 TH/s.",
-                ],
-            ],
-        },
-        {
-            "title": "Tuner hard limits",
-            "intro": "No setting goes past these.",
-            "rows": [
-                ["Frequency", f"{HARD_MIN_FREQ}–{HARD_MAX_FREQ} MHz", ""],
-                ["Core voltage", f"{HARD_MIN_VOLT}–{HARD_MAX_VOLT} mV", ""],
-                [
-                    "ASIC cap",
-                    f"up to {TRIP_SAFE_MAX_TEMP:g} °C",
-                    f"{FIRMWARE_TRIP_MARGIN_C:g} °C under the AxeOS cutoff. At it, the "
-                    f"tuner sheds {TRIP_GUARD_FREQUENCY_STEPS * 5} MHz and 10 mV at once.",
-                ],
-                [
-                    "Regulator cap",
-                    f"up to {TRIP_SAFE_MAX_VR_TEMP:g} °C",
-                    f"{FIRMWARE_TRIP_MARGIN_C:g} °C under the AxeOS cutoff.",
-                ],
-                [
-                    "Core current cap",
-                    f"up to {HARD_MAX_CORE_AMPS:g} A",
-                    f"Under the regulator's {TPS546_IOUT_FAULT_A:g} A shutdown.",
-                ],
-            ],
-        },
-        {
-            "title": "Defaults for a new miner",
-            "intro": "Per miner in AutoTuner Settings.",
-            "rows": [
-                [
-                    "Start clocks",
-                    f"{defaults['start_freq']} MHz / {defaults['start_volt']} mV",
-                    "Used when a miner is not already hashing inside its limits.",
-                ],
-                ["Max voltage", f"{defaults['max_volt']} mV", ""],
-                ["ASIC temperature", f"{defaults['max_temp']} °C", ""],
-                ["Regulator temperature", f"{defaults['max_vr_temp']} °C", ""],
-                [
-                    "Core current",
-                    f"{defaults['max_core_amps']:g} A",
-                    f"Fast start aims {RAMP_CURRENT_HEADROOM_A:g} A under it.",
-                ],
-                ["Power", f"{defaults['max_watts']} W", "A runaway guard."],
-                [
-                    "Input voltage floor",
-                    f"{DEFAULT_MIN_INPUT_VOLTAGE:g} V",
-                    "Steps down when the 5 V input sags under it.",
-                ],
-                ["Error budget", f"{DEFAULT_MAX_ERROR_PERCENTAGE:g}%", ""],
-                [
-                    "Fast start headroom",
-                    f"{RAMP_HEADROOM_C:g} °C",
-                    "Jumps aim this far under both temperature caps.",
-                ],
-            ],
-        },
-        {
-            "title": "5 V supply and wiring",
-            "intro": "Where heat collects outside the board.",
-            "rows": [
-                [
-                    "Board at full push",
-                    f"about {full_push_watts:.0f} W",
-                    f"{HARD_MAX_CORE_AMPS:g} A at {HARD_MAX_VOLT} mV, plus the board. "
-                    f"About {full_push_watts / 5:.0f} A through the 5 V plug.",
-                ],
-                [
-                    "5.5 × 2.1 mm barrel plug",
-                    "often rated 5 A",
-                    "The hottest point at full push. Too hot to hold means lower that miner's Watts.",
-                ],
-                [
-                    "Wire",
-                    "18 AWG or thicker",
-                    "Short runs, one cable per miner, tight terminals.",
+                ]
+                if board.vr_chip == TPS546
+                else [
+                    "Power reading",
+                    "at the input",
+                    "The INA260 measures the whole board. `current` is input current.",
                 ],
             ],
         },
     ]
+    if board.vr_chip == TPS546:
+        sections.append(
+            {
+                "title": "Voltage regulator (TPS546)",
+                "intro": f"How AxeOS programs the {family.name}'s core regulator.",
+                "rows": [
+                    [
+                        "Input on / off",
+                        f"{regulator.vin_on:g} V / {regulator.vin_off:g} V",
+                        "Under the off voltage the core loses power and the ASIC stops.",
+                    ],
+                    [
+                        "Input over-voltage fault",
+                        f"{regulator.vin_ov_fault:g} V",
+                        "Highest supply voltage the board accepts.",
+                    ],
+                    [
+                        "Core voltage range",
+                        f"{regulator.vout_min:.1f}–{regulator.vout_max:.1f} V",
+                        "Anything outside is refused.",
+                    ],
+                    [
+                        "Core current warning",
+                        f"{regulator.iout_warn:g} A",
+                        "Flag only. Mining continues.",
+                    ],
+                    [
+                        "Core current shutdown",
+                        f"{regulator.iout_fault:g} A",
+                        "Shuts down with no retry. Needs a restart.",
+                    ],
+                    [
+                        "Temperature warning / shutdown",
+                        f"{regulator.ot_warn} °C / {regulator.ot_fault} °C",
+                        "Restarts by itself once it cools under the warning.",
+                    ],
+                ],
+            }
+        )
+    sections.append(
+        {
+            "title": f"{board.asic.model} on the {board.name}",
+            "intro": "",
+            "rows": [
+                [
+                    "Stock clocks",
+                    f"{board.asic.stock_freq} MHz / {board.asic.stock_volt} mV",
+                    f"How the {board.name} ships.",
+                ],
+                [
+                    "Lowest presets",
+                    f"{hard.min_freq} MHz / {hard.min_volt} mV",
+                    f"Lowest {board.asic.model} clock and voltage in the AxeOS preset lists.",
+                ],
+                [
+                    "Hashrate per MHz",
+                    f"{hashrate_per_mhz:g} GH/s",
+                    f"{cores:,} small cores. 1,000 MHz is about "
+                    f"{round(hashrate_per_mhz, 1):g} TH/s.",
+                ],
+            ],
+        }
+    )
+    tuner_rows = [
+        ["Frequency", f"{hard.min_freq}–{hard.max_freq} MHz", ""],
+        ["Core voltage", f"{hard.min_volt}–{hard.max_volt} mV", ""],
+        [
+            "ASIC cap",
+            f"up to {TRIP_SAFE_MAX_TEMP:g} °C",
+            f"{FIRMWARE_TRIP_MARGIN_C:g} °C under the AxeOS cutoff. At it, the "
+            f"tuner sheds {TRIP_GUARD_FREQUENCY_STEPS * 5} MHz and 10 mV at once.",
+        ],
+        [
+            "Regulator cap",
+            f"up to {TRIP_SAFE_MAX_VR_TEMP:g} °C",
+            f"{FIRMWARE_TRIP_MARGIN_C:g} °C under the AxeOS cutoff.",
+        ],
+    ]
+    if hard.max_core_amps is not None:
+        tuner_rows.append(
+            [
+                "Core current cap",
+                f"up to {hard.max_core_amps:g} A",
+                f"Under the regulator's {regulator.iout_fault:g} A shutdown.",
+            ]
+        )
+    sections.append(
+        {
+            "title": "Tuner hard limits",
+            "intro": "No setting goes past these.",
+            "rows": tuner_rows,
+        }
+    )
+    default_rows = [
+        [
+            "Start clocks",
+            f"{defaults['start_freq']} MHz / {defaults['start_volt']} mV",
+            "Used when a miner is not already hashing inside its limits.",
+        ],
+        ["Max voltage", f"{defaults['max_volt']} mV", ""],
+        ["ASIC temperature", f"{defaults['max_temp']} °C", ""],
+    ]
+    if board.has_vr_temp:
+        default_rows.append(
+            ["Regulator temperature", f"{defaults['max_vr_temp']} °C", ""]
+        )
+    if board.has_core_current:
+        default_rows.append(
+            [
+                "Core current",
+                f"{defaults['max_core_amps']:g} A",
+                f"Fast start aims {ramp_headroom(board)[1]:g} A under it.",
+            ]
+        )
+    default_rows += [
+        ["Power", f"{defaults['max_watts']} W", "A runaway guard."],
+        [
+            "Input voltage floor",
+            f"{defaults['min_input_voltage']:g} V",
+            f"Steps down when the {family.nominal_voltage} V input sags under it.",
+        ],
+        ["Error budget", f"{defaults['max_error_percentage']:g}%", ""],
+        [
+            "Fast start headroom",
+            f"{RAMP_HEADROOM_C:g} °C",
+            "Jumps aim this far under both temperature caps.",
+        ],
+    ]
+    intro = f"{new_mode.name} mode. Per miner in AutoTuner Settings."
+    if new_mode.key == modes.MAX_HASHRATE and board is GAMMA_601:
+        intro = "Per miner in AutoTuner Settings."
+    if not board.verified:
+        intro += (
+            " Nobody has verified this board with the tuner yet, so it stays "
+            "inside its AxeOS presets."
+        )
+    sections.append(
+        {"title": "Defaults for a new miner", "intro": intro, "rows": default_rows}
+    )
+    sections.append(
+        {
+            "title": "Modes",
+            "intro": "Pick one per miner in AutoTuner Settings. It fills in the "
+            "limits; you can still change them.",
+            "rows": [_mode_row(modes.MODES[key], board) for key in modes.MODE_ORDER],
+        }
+    )
+    if family.name != "Gamma" or hard.max_core_amps is None:
+        # The barrel-plug notes below are the Gamma's.
+        return sections
+    sections.extend(
+        [
+            {
+                "title": "5 V supply and wiring",
+                "intro": "Where heat collects outside the board.",
+                "rows": [
+                    [
+                        "Board at full push",
+                        f"about {full_push_watts:.0f} W",
+                        f"{hard.max_core_amps:g} A at {hard.max_volt} mV, plus the board. "
+                        f"About {full_push_watts / family.nominal_voltage:.0f} A through "
+                        f"the {family.nominal_voltage} V plug.",
+                    ],
+                    [
+                        "5.5 × 2.1 mm barrel plug",
+                        "often rated 5 A",
+                        "The hottest point at full push. Too hot to hold means lower that miner's Watts.",
+                    ],
+                    [
+                        "Wire",
+                        "18 AWG or thicker",
+                        "Short runs, one cable per miner, tight terminals.",
+                    ],
+                ],
+            },
+        ]
+    )
+    return sections
 
 
 def live_limit(status):
@@ -901,43 +1022,6 @@ def alert_message(name, kind):
     return ""
 
 
-def show_windows_toast(title, message):
-    """A local Windows toast. Other systems do nothing."""
-    if platform.system() != "Windows":
-        return
-    heading = xml_escape(
-        str(title or "Groundhog Gamma Tuner").replace("\r", " ").replace("\n", " ")
-    )
-    body = xml_escape(str(message or "").replace("\r", " ").replace("\n", " "))
-    toast_xml = (
-        '<toast><visual><binding template="ToastGeneric">'
-        f"<text>{heading}</text><text>{body}</text>"
-        "</binding></visual></toast>"
-    )
-    script = (
-        """
-[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
-[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null
-$xml = New-Object Windows.Data.Xml.Dom.XmlDocument
-$xml.LoadXml(@'
-%s
-'@)
-$toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
-$app = '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe'
-[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($app).Show($toast)
-"""
-        % toast_xml
-    )
-    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    subprocess.Popen(
-        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        creationflags=flags,
-    )
-
-
 def stratum_port_open(host, port, timeout=8, connect=None):
     """True when a Stratum port accepts a TCP connection."""
     opener = socket.create_connection if connect is None else connect
@@ -954,8 +1038,30 @@ def stratum_port_open(host, port, timeout=8, connect=None):
     return True
 
 
-def read_network_status(get=None, connect=None):
-    """Current block difficulty, and whether the two Stratum V2 ports answer."""
+def pool_targets(info):
+    """(host, port) for the primary and fallback pools a miner reports."""
+    if not isinstance(info, dict):
+        return []
+    targets = []
+    for url_key, port_key in (
+        ("stratumURL", "stratumPort"),
+        ("fallbackStratumURL", "fallbackStratumPort"),
+    ):
+        text = str(info.get(url_key) or "").strip()
+        if "://" in text:
+            text = text.split("://", 1)[1]
+        host = text.split("/")[0].split(":")[0].strip()
+        port = coerce_limit(info.get(port_key))
+        if host and port and (host, port) not in targets:
+            targets.append((host, port))
+    return targets
+
+
+def read_network_status(get=None, connect=None, pools=()):
+    """Current block difficulty, and whether each pool's Stratum port answers.
+
+    `pools` is the (host, port) list the miners report.
+    """
     getter = requests.get if get is None else get
     difficulty = None
     try:
@@ -964,15 +1070,15 @@ def read_network_status(get=None, connect=None):
         difficulty = response.json().get("currentDifficulty")
     except Exception:
         difficulty = None
-    pools = []
-    for host, port in POOLS:
-        pools.append(
+    results = []
+    for host, port in pools:
+        results.append(
             {
                 "name": host,
                 "online": stratum_port_open(host, port, connect=connect),
             }
         )
-    return {"difficulty": difficulty, "pools": pools}
+    return {"difficulty": difficulty, "pools": results}
 
 
 def parse_firmware_version(text):
@@ -1082,14 +1188,20 @@ def limit_level(value, limit, tolerance=0):
 
 
 def _cap_or_default(stored, key):
-    """A saved miner cap, or the Gamma 601 default when the cell is empty."""
+    """A saved miner cap, or its board's default when the cell is empty.
+
+    None when the board has no sensor for that cap.
+    """
     raw = (stored or {}).get(key)
     if key in ("max_temp", "max_watts", "max_vr_temp"):
         value = coerce_real_limit(raw)
     else:
         value = coerce_limit(raw)
     if value is None:
-        return GAMMA601_LIMITS[key]
+        board = board_for_record(stored)
+        mode = modes.mode_for_record(stored, board)
+        default = board_limits(board, mode=mode.key).get(key)
+        return None if default == "" else default
     return value
 
 
@@ -1172,14 +1284,38 @@ def blank_miner_row(nickname, ip):
     }
 
 
-BASELINE_PROMPT = (
-    f"Set every miner to the Gamma 601 stock clocks ({STOCK_FREQ} MHz / {STOCK_VOLT} mV) "
-    "and make those its start clocks?\n\n"
-    "The next Start Autotuner tunes every miner up from there."
-)
-# {miner} is replaced on the page with the selected miner's name and address.
+def stock_text(board):
+    """A board's factory clocks, as the page and the log show them."""
+    freq, volt = board.stock_clocks
+    return f"{freq} MHz / {volt} mV"
+
+
+def fleet_stock(miners):
+    """(board name, stock text) shared by every saved miner, or None when they differ."""
+    found = {board_for_record(miner) for miner in miners or []} or {GAMMA_601}
+    if len(found) != 1:
+        return None
+    board = found.pop()
+    return board.name, stock_text(board)
+
+
+def baseline_prompt(miners):
+    """The Reset All question for the saved miners."""
+    shared = fleet_stock(miners)
+    target = (
+        "its board's stock clocks"
+        if shared is None
+        else f"the {shared[0]} stock clocks ({shared[1]})"
+    )
+    return (
+        f"Set every miner to {target} and make those its start clocks?\n\n"
+        "The next Start Autotuner tunes every miner up from there."
+    )
+
+
+# The page replaces {miner}, {board}, and {stock} from the selected row.
 MINER_BASELINE_PROMPT = (
-    f"Set {{miner}} to the Gamma 601 stock clocks ({STOCK_FREQ} MHz / {STOCK_VOLT} mV) "
+    "Set {miner} to the {board} stock clocks ({stock}) "
     "and make those its start clocks?\n\n"
     "History marks the reset, so Since reset can start there."
 )
@@ -1197,261 +1333,6 @@ def _notice(level, title, message):
 
 def _fail(message, title="Error", level="error"):
     return {"ok": False, "message": message, "notice": _notice(level, title, message)}
-
-
-def format_local_time(moment=None):
-    """Short time in the Windows clock format. Other systems keep HH:MM:SS."""
-    moment = moment or datetime.now()
-    if platform.system() != "Windows":
-        return moment.strftime("%H:%M:%S")
-    try:
-        formatted = _windows_short_time(moment)
-    except (OSError, AttributeError):
-        formatted = ""
-    return formatted or moment.strftime("%H:%M:%S")
-
-
-def _windows_short_time(moment):
-    """User short time via GetTimeFormatEx. TIME_NOSECONDS matches the taskbar clock."""
-    import ctypes
-    from ctypes import wintypes
-
-    class SystemTime(ctypes.Structure):
-        _fields_ = [
-            ("wYear", wintypes.WORD),
-            ("wMonth", wintypes.WORD),
-            ("wDayOfWeek", wintypes.WORD),
-            ("wDay", wintypes.WORD),
-            ("wHour", wintypes.WORD),
-            ("wMinute", wintypes.WORD),
-            ("wSecond", wintypes.WORD),
-            ("wMilliseconds", wintypes.WORD),
-        ]
-
-    system_time = SystemTime(
-        moment.year,
-        moment.month,
-        (moment.weekday() + 1) % 7,
-        moment.day,
-        moment.hour,
-        moment.minute,
-        moment.second,
-        moment.microsecond // 1000,
-    )
-    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-    get_time = kernel.GetTimeFormatEx
-    get_time.argtypes = [
-        wintypes.LPCWSTR,
-        wintypes.DWORD,
-        ctypes.POINTER(SystemTime),
-        wintypes.LPCWSTR,
-        wintypes.LPWSTR,
-        ctypes.c_int,
-    ]
-    get_time.restype = ctypes.c_int
-    buffer = ctypes.create_unicode_buffer(64)
-    # TIME_NOSECONDS: the taskbar short time, without a forced seconds field.
-    written = get_time(
-        None, 0x00000002, ctypes.byref(system_time), None, buffer, len(buffer)
-    )
-    if written <= 0:
-        return ""
-    return buffer.value
-
-
-def rect_covering_monitor(monitor, inset):
-    """(x, y, width, height) whose visible frame covers the monitor.
-
-    ``monitor`` is (left, top, right, bottom). ``inset`` is the invisible
-    frame on (left, top, right, bottom).
-    """
-    left, top, right, bottom = monitor
-    inset_left, inset_top, inset_right, inset_bottom = inset
-    return (
-        left - inset_left,
-        top - inset_top,
-        (right - left) + inset_left + inset_right,
-        (bottom - top) + inset_top + inset_bottom,
-    )
-
-
-def frame_inset(window_rect, visible_rect):
-    """Invisible frame on each edge, as (left, top, right, bottom)."""
-    left, top, right, bottom = window_rect
-    visible_left, visible_top, visible_right, visible_bottom = visible_rect
-    return (
-        visible_left - left,
-        visible_top - top,
-        right - visible_right,
-        bottom - visible_bottom,
-    )
-
-
-def _snap_fullscreen_window(window):
-    """Size the borderless window to the monitor. A failure leaves fullscreen on."""
-    try:
-        native = window.native
-
-        def place():
-            _place_on_monitor(native)
-
-        _run_on_window_thread(native, place)
-    except Exception:
-        return
-
-
-def _run_on_window_thread(native, action):
-    if getattr(native, "InvokeRequired", False):
-        from System import Func, Type
-
-        native.Invoke(Func[Type](action))
-        return
-    action()
-
-
-def _window_handle(native):
-    handle = native.Handle
-    to_int64 = getattr(handle, "ToInt64", None)
-    if callable(to_int64):
-        return to_int64()
-    return int(handle)
-
-
-def _place_on_monitor(native):
-    """Drop the maximized inset, then cover the monitor with square corners."""
-    from System.Windows.Forms import FormWindowState
-
-    native.WindowState = FormWindowState.Normal
-    hwnd = _window_handle(native)
-    user32, dwmapi, rect_type, monitor_info = _win32()
-    monitor = _monitor_rect(user32, hwnd, monitor_info)
-    _move_window(user32, hwnd, rect_covering_monitor(monitor, (0, 0, 0, 0)))
-    _set_square_frame(dwmapi, hwnd)
-    visible = _extended_frame(dwmapi, hwnd, rect_type)
-    if visible is None:
-        return
-    window_rect = _window_rect(user32, hwnd, rect_type)
-    inset = tuple(max(0, edge) for edge in frame_inset(window_rect, visible))
-    if any(inset):
-        _move_window(user32, hwnd, rect_covering_monitor(monitor, inset))
-        _set_square_frame(dwmapi, hwnd)
-
-
-def _win32():
-    import ctypes
-    from ctypes import wintypes
-
-    class Rect(ctypes.Structure):
-        _fields_ = [
-            ("left", ctypes.c_long),
-            ("top", ctypes.c_long),
-            ("right", ctypes.c_long),
-            ("bottom", ctypes.c_long),
-        ]
-
-    class MonitorInfo(ctypes.Structure):
-        _fields_ = [
-            ("cbSize", wintypes.DWORD),
-            ("rcMonitor", Rect),
-            ("rcWork", Rect),
-            ("dwFlags", wintypes.DWORD),
-        ]
-
-    user32 = ctypes.WinDLL("user32", use_last_error=True)
-    user32.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
-    user32.MonitorFromWindow.restype = wintypes.HMONITOR
-    user32.GetMonitorInfoW.argtypes = [wintypes.HMONITOR, ctypes.POINTER(MonitorInfo)]
-    user32.GetMonitorInfoW.restype = wintypes.BOOL
-    user32.SetWindowPos.argtypes = [
-        wintypes.HWND,
-        wintypes.HWND,
-        ctypes.c_int,
-        ctypes.c_int,
-        ctypes.c_int,
-        ctypes.c_int,
-        wintypes.UINT,
-    ]
-    user32.SetWindowPos.restype = wintypes.BOOL
-    user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(Rect)]
-    user32.GetWindowRect.restype = wintypes.BOOL
-
-    dwmapi = ctypes.WinDLL("dwmapi", use_last_error=True)
-    attribute_args = [
-        wintypes.HWND,
-        wintypes.DWORD,
-        ctypes.c_void_p,
-        wintypes.DWORD,
-    ]
-    dwmapi.DwmSetWindowAttribute.argtypes = attribute_args
-    dwmapi.DwmSetWindowAttribute.restype = ctypes.c_long
-    dwmapi.DwmGetWindowAttribute.argtypes = attribute_args
-    dwmapi.DwmGetWindowAttribute.restype = ctypes.c_long
-    return user32, dwmapi, Rect, MonitorInfo
-
-
-def _monitor_rect(user32, hwnd, monitor_info):
-    import ctypes
-
-    monitor = user32.MonitorFromWindow(hwnd, 2)
-    if not monitor:
-        raise OSError("The fullscreen window has no monitor.")
-    info = monitor_info()
-    info.cbSize = ctypes.sizeof(info)
-    if not user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
-        raise OSError("GetMonitorInfoW failed.")
-    rect = info.rcMonitor
-    return (rect.left, rect.top, rect.right, rect.bottom)
-
-
-def _move_window(user32, hwnd, placed):
-    import ctypes
-
-    x, y, width, height = placed
-    # SWP_FRAMECHANGED | SWP_SHOWWINDOW. HWND_TOP is 0.
-    moved = user32.SetWindowPos(
-        hwnd, 0, int(x), int(y), int(width), int(height), 0x0060
-    )
-    if not moved:
-        raise ctypes.WinError(ctypes.get_last_error())
-
-
-def _set_square_frame(dwmapi, hwnd):
-    # 33 is DWMWA_WINDOW_CORNER_PREFERENCE, 1 is DWMWCP_DONOTROUND.
-    # 34 is DWMWA_BORDER_COLOR, 0xFFFFFFFE is DWMWA_COLOR_NONE.
-    _set_dwm_dword(dwmapi, hwnd, 33, 1)
-    _set_dwm_dword(dwmapi, hwnd, 34, 0xFFFFFFFE)
-
-
-def _set_dwm_dword(dwmapi, hwnd, attribute, value):
-    import ctypes
-
-    packed = ctypes.c_uint(value)
-    dwmapi.DwmSetWindowAttribute(
-        hwnd, attribute, ctypes.byref(packed), ctypes.sizeof(packed)
-    )
-
-
-def _window_rect(user32, hwnd, rect_type):
-    import ctypes
-
-    rect = rect_type()
-    if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
-        raise OSError("GetWindowRect failed.")
-    return (rect.left, rect.top, rect.right, rect.bottom)
-
-
-def _extended_frame(dwmapi, hwnd, rect_type):
-    """Visible frame from DWM, or None when the attribute is unavailable."""
-    import ctypes
-
-    rect = rect_type()
-    # DWMWA_EXTENDED_FRAME_BOUNDS
-    code = dwmapi.DwmGetWindowAttribute(
-        hwnd, 9, ctypes.byref(rect), ctypes.sizeof(rect)
-    )
-    if code != 0:
-        return None
-    return (rect.left, rect.top, rect.right, rect.bottom)
 
 
 class TunerDashboard:
@@ -1476,7 +1357,7 @@ class TunerDashboard:
             "difficulty": "-",
             "difficulty_title": "",
             "difficulty_value": None,
-            "pools": [{"name": host, "online": None} for host, _port in POOLS],
+            "pools": [],
         }
         self._latest_firmware = ""
         self._firmware_checked = None
@@ -1499,6 +1380,8 @@ class TunerDashboard:
         self._weather_now = None
         self._weather_checked = 0.0
         self._location_detect_tried = False
+        # (host, port) pools each miner reported last, for the network panel.
+        self._pool_targets = {}
 
     def run(self):
         """Open the local dashboard window and block until it closes."""
@@ -1530,7 +1413,8 @@ class TunerDashboard:
         webview.start(self._on_ready)
 
     def _on_ready(self):
-        if platform.system() != "Windows" or self._window is None:
+        """Open maximized. Every pywebview backend (WebView2, Cocoa, GTK, Qt) can."""
+        if self._window is None:
             return
         try:
             self._window.maximize()
@@ -1563,6 +1447,8 @@ class TunerDashboard:
                 miner["ip"],
                 miner.get("nickname") or f"Miner-{miner['ip']}",
                 str(miner.get("repasted_on") or ""),
+                board_for_record(miner),
+                modes.mode_for_record(miner, board_for_record(miner)),
             )
             for miner in get_miners()
         ]
@@ -1571,13 +1457,17 @@ class TunerDashboard:
             # or an edit does not blank the table until the next refresh.
             current = {row["ip"]: row for row in self._rows}
             rows = []
-            for ip, nickname, repasted_on in saved:
+            for ip, nickname, repasted_on, board, mode in saved:
                 row = current.get(ip)
                 if row is None:
                     row = blank_miner_row(nickname, ip)
                 else:
                     row["name"] = nickname
                 row["repasted_on"] = repasted_on
+                row["board"] = board.name
+                row["board_version"] = board.version
+                row["mode"] = mode.name
+                row["stock"] = stock_text(board)
                 rows.append(row)
             self._rows = rows
             kept = {row["ip"] for row in rows}
@@ -1638,7 +1528,9 @@ class TunerDashboard:
                 "scan": None if self._scan is None else dict(self._scan),
                 "controls": self._controls_locked(),
                 "prompts": {
-                    "baseline": BASELINE_PROMPT,
+                    "baseline": baseline_prompt(
+                        [{"board": row.get("board_version")} for row in self._rows]
+                    ),
                     "miner_baseline": MINER_BASELINE_PROMPT,
                 },
                 "network": self._network_locked(),
@@ -1666,7 +1558,11 @@ class TunerDashboard:
         }
 
     def _refresh_network(self):
-        status = read_network_status()
+        with self._lock:
+            pools = []
+            for targets in self._pool_targets.values():
+                pools.extend(target for target in targets if target not in pools)
+        status = read_network_status(pools=pools)
         number = _plain_number(status.get("difficulty"))
         with self._lock:
             if number is not None:
@@ -1762,7 +1658,10 @@ class TunerDashboard:
             ):
                 return
             self._weather_checked = now
-        place = weather.normalize_location(load_config().get("location"))
+        settings = load_config()
+        if not settings.get("weather_enabled", True):
+            return
+        place = weather.normalize_location(settings.get("location"))
         if place is None:
             place = self._auto_detect_location()
         if place is None:
@@ -1826,8 +1725,12 @@ class TunerDashboard:
                     "warning",
                 )
 
-    def start_autotuner(self):
-        """Start one tuner thread per enabled miner that has the required limits."""
+    def start_autotuner(self, confirmed=False):
+        """Start one tuner thread per enabled miner that has the required limits.
+
+        A miner on an unverified board needs one confirmation. Without
+        `confirmed`, the reply asks the page for it and nothing starts.
+        """
         with self._lock:
             self._reap_threads_locked()
             if self._baseline_reset_running:
@@ -1882,11 +1785,7 @@ class TunerDashboard:
             ready_miners = []
             missing_settings = []
             for miner in enabled_miners:
-                missing = [
-                    field
-                    for field in START_REQUIRED_FIELDS
-                    if field not in miner or miner[field] == "" or miner[field] is None
-                ]
+                missing = missing_start_fields(miner)
                 if missing:
                     for field in missing:
                         missing_settings.append((miner["ip"], field))
@@ -1897,6 +1796,34 @@ class TunerDashboard:
                 message = "No miners are enabled for AutoTuning. Please enable at least one miner in settings."
                 self.log_message(message, "error")
                 return _fail(message, "No Miners Enabled", "warning")
+
+            unconfirmed = [m for m in ready_miners if needs_experimental_ok(m)]
+            names = ", ".join(m.get("nickname") or m["ip"] for m in unconfirmed)
+            if unconfirmed and not confirmed:
+                boards = sorted({board_for_record(m).name for m in unconfirmed})
+                return {
+                    "ok": False,
+                    "confirm": {
+                        "title": "Unverified Boards",
+                        "message": EXPERIMENTAL_PROMPT.format(
+                            boards=" and ".join(boards), names=names
+                        ),
+                        "confirmLabel": "Start",
+                    },
+                }
+            if unconfirmed:
+                confirmed_ips = {m["ip"] for m in unconfirmed}
+
+                def mark_confirmed(config):
+                    for saved in config.get("miners", []):
+                        if saved.get("ip") in confirmed_ips:
+                            saved["experimental_ok"] = True
+
+                if modify_config(mark_confirmed) is False:
+                    return _fail(CONFIG_CORRUPT_MESSAGE, "Config file damaged", "error")
+                self.log_message(
+                    f"Confirmed tuning on unverified boards: {names}.", "warning"
+                )
 
             if missing_settings:
                 error_message = "These miners are missing AutoTuner settings and will be skipped:\n\n"
@@ -2019,9 +1946,9 @@ class TunerDashboard:
                 "warning",
             )
 
-        self.log_message(
-            f"Resetting miners to {STOCK_FREQ} MHz / {STOCK_VOLT} mV.", "info"
-        )
+        shared = fleet_stock(miners)
+        target = "their stock clocks" if shared is None else shared[1]
+        self.log_message(f"Resetting miners to {target}.", "info")
 
         def work():
             failed = 0
@@ -2037,13 +1964,13 @@ class TunerDashboard:
                     self.log_message(
                         "Baseline reset finished with "
                         f"{failed} miner(s) that did not accept "
-                        f"{STOCK_FREQ} MHz / {STOCK_VOLT} mV. "
+                        f"{target}. "
                         "Learned setpoints were cleared.",
                         "error",
                     )
                 else:
                     self.log_message(
-                        f"Baseline reset finished. Start Autotuner to tune from {STOCK_FREQ} MHz / {STOCK_VOLT} mV.",
+                        f"Baseline reset finished. Start Autotuner to tune from {target}.",
                         "success",
                     )
 
@@ -2053,7 +1980,7 @@ class TunerDashboard:
             "notice": _notice(
                 "info",
                 "Baseline Reset Started",
-                f"Setting {len(miners)} miner(s) to {STOCK_FREQ} MHz / {STOCK_VOLT} mV. "
+                f"Setting {len(miners)} miner(s) to {target}. "
                 "The log shows when it finishes.",
             ),
         }
@@ -2112,9 +2039,8 @@ class TunerDashboard:
                 "Autotuner Running",
                 "warning",
             )
-        self.log_message(
-            f"Resetting {ip} to {STOCK_FREQ} MHz / {STOCK_VOLT} mV.", "info"
-        )
+        stock = stock_text(board_for_record(miner))
+        self.log_message(f"Resetting {ip} to {stock}.", "info")
         try:
             failed = reset_miners_to_baseline([miner], self.log_message)
         finally:
@@ -2124,17 +2050,66 @@ class TunerDashboard:
         name = miner.get("nickname") or ip
         if failed:
             message = (
-                f"{name} did not accept {STOCK_FREQ} MHz / {STOCK_VOLT} mV. "
+                f"{name} did not accept {stock}. "
                 "Its start clocks were still set to them."
             )
             self.log_message(message, "error")
             return _fail(message, "Reset Failed")
-        message = (
-            f"{name} is at {STOCK_FREQ} MHz / {STOCK_VOLT} mV, "
-            "and Start Autotuner tunes it from there."
-        )
+        message = f"{name} is at {stock}, and Start Autotuner tunes it from there."
         self.log_message(message, "success")
         return {"ok": True, "message": message}
+
+    def get_setup_state(self):
+        """Whether the first-run setup still has to run, and what it offers."""
+        config = load_config()
+        return {
+            "ok": True,
+            "setup_done": bool(config.get("setup_done", True)),
+            "modes": [
+                {"key": mode.key, "name": mode.name, "summary": mode.summary}
+                for mode in (modes.MODES[key] for key in modes.MODE_ORDER)
+            ],
+            "scan_range": dict(self._scan_range),
+        }
+
+    def complete_setup(self, answers):
+        """Save the first-run answers: cooling and goal pick the new-miner mode."""
+        if not isinstance(answers, dict):
+            return _fail("Pick your cooling and what you want most.")
+        cooling = str(answers.get("cooling") or "").strip()
+        goal = str(answers.get("goal") or "").strip()
+        if cooling not in SETUP_COOLING or goal not in SETUP_GOALS:
+            return _fail("Pick your cooling and what you want most.")
+        raw_supply = str(answers.get("supply_watts") or "").strip()
+        supply = ""
+        if raw_supply:
+            try:
+                supply = float(raw_supply)
+            except ValueError:
+                supply = None
+            if supply is None or not math.isfinite(supply) or supply <= 0:
+                return _fail(
+                    "Enter the watts per miner as a number, or leave it blank."
+                )
+        mode = setup_mode(cooling, goal, _as_bool(answers.get("acknowledged")))
+        weather_on = _as_bool(answers.get("weather"))
+
+        def mutate(config):
+            config["default_mode"] = mode.key
+            config["setup_done"] = True
+            config["weather_enabled"] = weather_on
+            config["supply_watts"] = supply
+
+        if modify_config(mutate) is False:
+            return _fail(CONFIG_CORRUPT_MESSAGE, "Config file damaged", "error")
+        self.log_message(
+            f"Setup saved. New miners start in {mode.name} mode.", "success"
+        )
+        if weather_on:
+            with self._lock:
+                self._weather_checked = 0.0
+            self._wake.set()
+        return {"ok": True, "mode": mode.key, "mode_name": mode.name}
 
     def get_location(self):
         """The saved weather location and the latest outdoor reading."""
@@ -2183,8 +2158,28 @@ class TunerDashboard:
         return {"ok": True, "location": place}
 
     def get_hardware_limits(self):
-        """Chip, regulator, firmware, and tuner limits for the Limits screen."""
-        return {"ok": True, "sections": hardware_limits()}
+        """Chip, regulator, firmware, and tuner limits for the Limits screen.
+
+        One set per board in the saved fleet. With more than one board, each
+        section title names its board.
+        """
+        config = load_config()
+        mode = config.get("default_mode")
+        boards = []
+        for miner in config.get("miners", []):
+            board = board_for_record(miner)
+            if board not in boards:
+                boards.append(board)
+        if len(boards) <= 1:
+            board = boards[0] if boards else GAMMA_601
+            return {"ok": True, "sections": hardware_limits(board, mode)}
+        sections = []
+        for board in boards:
+            for section in hardware_limits(board, mode):
+                sections.append(
+                    dict(section, title=f"{board.name}: {section['title']}")
+                )
+        return {"ok": True, "sections": sections}
 
     def get_history(self, filters=None):
         """Saved samples, summarized for the History screen."""
@@ -2304,7 +2299,7 @@ class TunerDashboard:
         return {"ok": True}
 
     def start_scan(self, start_ip, end_ip):
-        """Scan an inclusive IPv4 range. Only a Gamma 601 is saved."""
+        """Scan an inclusive IPv4 range. Only boards on the AxeOS board list are saved."""
         start_ip = str(start_ip or "").strip()
         end_ip = str(end_ip or "").strip()
         try:
@@ -2399,7 +2394,7 @@ class TunerDashboard:
         return {"ok": True}
 
     def edit_miner(self, current_ip, nickname, new_ip, repasted_on=None):
-        """Save a nickname and repaste date. A new address must still be a Gamma 601.
+        """Save a nickname and repaste date. A new address must be a board on the list.
 
         `repasted_on` is `YYYY-MM-DD`, blank to clear it, or None to keep it.
         """
@@ -2419,23 +2414,22 @@ class TunerDashboard:
         if new_ip != current_ip and any(miner["ip"] == new_ip for miner in miners):
             return _fail(f"Miner with IP {new_ip} already exists.")
 
+        new_board = None
         if new_ip == current_ip:
             miner_type = self._miner_type(current_ip)
         else:
             info = get_system_info(new_ip)
             if isinstance(info, str):
                 return _fail(info)
-            if not is_gamma_601(info):
-                return _fail(
-                    f"{new_ip} is not a Bitaxe Gamma 601 (BM1370, board 601).",
-                    "Not a Gamma 601",
-                )
+            new_board = board_for_info(info)
+            if new_board is None:
+                return _fail(f"{new_ip}: {board_list_note(info)}", "Unsupported Board")
             miner_type = miner_type_from_info(info)
             self._signal_miner_stop(current_ip)
 
         if (
             self._apply_miner_edit(
-                current_ip, nickname, new_ip, miner_type, repasted_on
+                current_ip, nickname, new_ip, miner_type, repasted_on, new_board
             )
             is False
         ):
@@ -2523,6 +2517,11 @@ class TunerDashboard:
         settings = {key: config.get(key, "") for key in GLOBAL_INT_FIELDS}
         settings["fast_start"] = fast_start_enabled(config)
         settings["continue_from_live"] = continue_from_live_enabled(config)
+        settings["default_mode"] = new_miner_mode(None, config).key
+        settings["weather_enabled"] = bool(config.get("weather_enabled", True))
+        settings["modes"] = [
+            {"key": key, "name": modes.MODES[key].name} for key in modes.MODE_ORDER
+        ]
         settings["flatline_detection_enabled"] = bool(
             config.get("flatline_detection_enabled", False)
         )
@@ -2542,6 +2541,12 @@ class TunerDashboard:
             new_settings["continue_from_live"] = _as_bool(
                 settings.get("continue_from_live", True)
             )
+            # A page that does not know the field leaves the saved mode alone.
+            chosen = modes.mode_named(settings.get("default_mode"))
+            if chosen is not None:
+                new_settings["default_mode"] = chosen.key
+            if "weather_enabled" in settings:
+                new_settings["weather_enabled"] = _as_bool(settings["weather_enabled"])
             new_settings["flatline_detection_enabled"] = _as_bool(
                 settings.get("flatline_detection_enabled")
             )
@@ -2575,38 +2580,82 @@ class TunerDashboard:
                 "No Miners Found",
                 "warning",
             )
+        config = load_config()
         rows = []
         for miner in miners:
+            board = board_for_record(miner)
+            mode = modes.mode_for_record(miner, board)
+            presets = {
+                key: _cells(board_limits(board, config, key))
+                for key in modes.MODE_ORDER
+            }
+            defaults = presets[mode.key]
             fields = {}
             for field in ALL_AUTOTUNE_FIELDS:
-                display = miner.get(field, NEW_LIMIT_DEFAULTS.get(field, ""))
+                fallback = defaults.get(field, "") if field in NEW_LIMIT_FIELDS else ""
+                display = miner.get(field, fallback)
                 fields[field] = "" if display is None else str(display)
             nickname = miner.get("nickname") or miner["ip"]
+            hard = board.limits
+            amps = hard.max_core_amps
+            model = board.asic.model
             rows.append(
                 {
                     "ip": miner["ip"],
                     "name": nickname,
-                    "label": f"{nickname} ({miner['ip']})",
+                    "label": f"{nickname} ({miner['ip']}) · {board.name}",
                     "enabled": bool(miner.get("enabled", False)),
                     "fields": fields,
+                    "board": board.name,
+                    "mode": mode.key,
+                    "presets": presets,
+                    "custom": not _same_cells(fields, defaults, board),
+                    "experimental": not board.verified,
+                    "unused": list(board.unused_limit_fields),
+                    "freq_hint": (
+                        f"Frequency stays {hard.min_freq}–{hard.max_freq} MHz on this "
+                        f"board. {hard.min_freq} is the lowest {model} preset in AxeOS."
+                    ),
+                    "volt_hint": (
+                        f"Voltage stays {hard.min_volt}–{hard.max_volt} mV. "
+                        f"{hard.min_volt} is the lowest {model} voltage preset."
+                    ),
+                    "amps_note": (
+                        ""
+                        if amps is None
+                        else f"At most {amps:g} A. The regulator shuts down with no "
+                        f"retry at {board.family.regulator.iout_fault:g} A."
+                    ),
                 }
             )
-        return {"ok": True, "miners": rows}
+        return {
+            "ok": True,
+            "miners": rows,
+            "modes": [
+                {"key": mode.key, "name": mode.name, "summary": mode.summary}
+                for mode in (modes.MODES[key] for key in modes.MODE_ORDER)
+            ],
+        }
 
     def save_autotuner_settings(self, rows):
         """Save every miner's limits. A blank cell turns that miner off."""
         if not isinstance(rows, list):
             return _fail("Enter a number for each limit.")
+        boards = {miner.get("ip"): board_for_record(miner) for miner in get_miners()}
         parsed = []
         for row in rows:
             if not isinstance(row, dict):
                 return _fail("Enter a number for each limit.")
             incoming = row.get("fields") if isinstance(row.get("fields"), dict) else row
+            board = boards.get(row.get("ip"), GAMMA_601)
             fields = {}
             for field in ALL_AUTOTUNE_FIELDS:
+                if field in board.unused_limit_fields:
+                    fields[field] = ""
+                    continue
                 try:
                     fields[field] = parse_autotuner_value(
-                        field, incoming.get(field, "")
+                        field, incoming.get(field, ""), board
                     )
                 except (TypeError, ValueError):
                     return _fail(
@@ -2621,6 +2670,7 @@ class TunerDashboard:
 
         stopped = []
         enabled = []
+        mode_changed = set()
 
         def mutate(config):
             by_ip = {miner["ip"]: miner for miner in config.get("miners", [])}
@@ -2629,7 +2679,15 @@ class TunerDashboard:
                 if miner is None:
                     continue
                 miner.update(fields)
-                if any(miner[field] == "" for field in ALL_AUTOTUNE_FIELDS):
+                chosen = modes.mode_named(row.get("mode"))
+                if chosen is not None:
+                    if (
+                        modes.mode_for_record(miner, board_for_record(miner))
+                        is not chosen
+                    ):
+                        mode_changed.add(miner["ip"])
+                    miner["mode"] = chosen.key
+                if any(miner[field] == "" for field in required_fields(miner)):
                     miner["enabled"] = False
                 else:
                     miner["enabled"] = _as_bool(row.get("enabled"))
@@ -2640,7 +2698,9 @@ class TunerDashboard:
 
         if modify_config(mutate) is False:
             return _fail(CONFIG_CORRUPT_MESSAGE, "Config file damaged", "error")
-        for ip in stopped:
+        # A running tuner reads its mode once, so a miner whose mode changed
+        # starts over in the new one.
+        for ip in [*stopped, *(ip for ip in enabled if ip in mode_changed)]:
             self._signal_miner_stop(ip)
         self._start_miners_if_running(enabled)
         self.log_message("Updated AutoTuner settings for all miners.", "success")
@@ -2660,7 +2720,7 @@ class TunerDashboard:
             except Exception as exc:
                 return _fail(str(exc))
             if enabled and platform.system() == "Windows":
-                _snap_fullscreen_window(window)
+                snap_fullscreen_window(window)
         self._fullscreen = enabled
         return {"ok": True, "fullscreen": enabled}
 
@@ -2715,6 +2775,8 @@ class TunerDashboard:
                 row = by_ip.get(ip)
                 if row is None:
                     continue
+                if isinstance(miner_data, dict):
+                    self._pool_targets[ip] = pool_targets(miner_data)
                 self._apply_one_locked(row, ip, miner_data)
                 message = self._note_alert_locked(row)
                 if message:
@@ -2760,8 +2822,11 @@ class TunerDashboard:
             miner_data.get("frequency"), miner_data.get("coreVoltage"), stored
         )
         row["vin"] = format_input_voltage(miner_data.get("voltage"))
-        row["asic"] = format_number(miner_data.get("temp"), 1)
-        row["vr"] = format_number(miner_data.get("vrTemp"), 1)
+        board = board_for_record(stored)
+        row["asic"] = format_number(asic_temp(miner_data), 1)
+        row["vr"] = (
+            format_number(miner_data.get("vrTemp"), 1) if board.has_vr_temp else "-"
+        )
         row["hash"] = format_minute_hashrate(miner_data)
         row["hash_title"] = format_hash_title(miner_data)
         row["watts"] = format_number(miner_data.get("power"), 2)
@@ -2801,18 +2866,22 @@ class TunerDashboard:
         row["best_exact"] = _plain_number(miner_data.get("bestDiff"))
         settings = load_config()
         row["asic_level"] = limit_level(
-            miner_data.get("temp"),
+            asic_temp(miner_data),
             stored.get("max_temp"),
             _configured_tolerance(settings, "temp_tolerance"),
         )
-        row["vr_level"] = limit_level(
-            miner_data.get("vrTemp"),
-            stored.get("max_vr_temp"),
-            _configured_tolerance(settings, "vr_temp_tolerance"),
+        row["vr_level"] = (
+            limit_level(
+                miner_data.get("vrTemp"),
+                stored.get("max_vr_temp"),
+                _configured_tolerance(settings, "vr_temp_tolerance"),
+            )
+            if board.has_vr_temp
+            else ""
         )
         row["error_alert"] = over_limit(error, stored.get("max_error_percentage"))
-        amps = core_current_amps(miner_data)
-        amps_cap = core_amps_cap(stored)
+        amps = core_current_amps(miner_data, board)
+        amps_cap = core_amps_cap(stored, board)
         row["watts_alert"] = over_limit(
             miner_data.get("power"), stored.get("max_watts")
         )
@@ -2836,6 +2905,7 @@ class TunerDashboard:
             row["tag"] = "alert"
 
     def _drop_miner_runtime_locked(self, ip):
+        self._pool_targets.pop(ip, None)
         self._alerts.pop(ip, None)
         self._misses.pop(ip, None)
         self._droop_reads.pop(ip, None)
@@ -2862,6 +2932,8 @@ class TunerDashboard:
                 miner_data,
                 _cap_or_default(stored, "max_temp"),
                 _cap_or_default(stored, "max_vr_temp"),
+                board_for_record(stored).limits.asic_off_watts,
+                board_for_record(stored).has_vr_temp,
             ):
                 continue
             with self._lock:
@@ -2894,7 +2966,7 @@ class TunerDashboard:
     def _deliver_alerts(self, messages):
         for message in messages:
             try:
-                show_windows_toast("Groundhog Gamma Tuner", message)
+                notify("Groundhog Gamma Tuner", message)
             except Exception:
                 pass
 
@@ -2909,7 +2981,7 @@ class TunerDashboard:
         row["name"] = hostname
 
     def _apply_miner_edit(
-        self, current_ip, nickname, new_ip, miner_type, repasted_on=None
+        self, current_ip, nickname, new_ip, miner_type, repasted_on=None, board=None
     ):
         def mutate(config):
             for miner in config.get("miners", []):
@@ -2917,6 +2989,8 @@ class TunerDashboard:
                     miner["nickname"] = nickname
                     miner["type"] = miner_type
                     miner["ip"] = new_ip
+                    if board is not None:
+                        miner["board"] = board.version
                     if repasted_on is not None:
                         miner["repasted_on"] = repasted_on
                     break
@@ -3015,10 +3089,14 @@ class TunerDashboard:
             ip = miner.get("ip")
             if ip not in ips or not miner.get("enabled") or ip in alive:
                 continue
-            if any(
-                field not in miner or miner[field] == "" or miner[field] is None
-                for field in START_REQUIRED_FIELDS
-            ):
+            if missing_start_fields(miner):
+                continue
+            if needs_experimental_ok(miner):
+                self.log_message(
+                    f"{ip} -> Not started: {board_for_record(miner).name} is not "
+                    "verified yet. Stop and Start the autotuner to confirm it.",
+                    "warning",
+                )
                 continue
             ready.append(miner)
         if not ready:
@@ -3184,8 +3262,8 @@ class DashboardApi:
     def get_snapshot(self, since_log_id=0, focused=None):
         return self._dashboard.get_snapshot(since_log_id, focused)
 
-    def start_autotuner(self):
-        return self._dashboard.start_autotuner()
+    def start_autotuner(self, confirmed=False):
+        return self._dashboard.start_autotuner(bool(confirmed))
 
     def stop_autotuner(self):
         return self._dashboard.stop_autotuner()
@@ -3201,6 +3279,12 @@ class DashboardApi:
 
     def get_history(self, filters=None):
         return self._dashboard.get_history(filters)
+
+    def get_setup_state(self):
+        return self._dashboard.get_setup_state()
+
+    def complete_setup(self, answers):
+        return self._dashboard.complete_setup(answers)
 
     def get_location(self):
         return self._dashboard.get_location()

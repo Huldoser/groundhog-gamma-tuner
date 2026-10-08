@@ -10,7 +10,7 @@ Writes go through `save_config` / `_write_config`: hold `_config_lock`, write a 
 
 A `JSONDecodeError` keeps `_last_good_config`. `_drop_retired_keys` removes `RETIRED_GLOBAL_KEYS` and each miner's `RETIRED_MINER_KEYS` (learned setpoints from older versions) on load and save. Each tuning session starts fresh from the miner's start clocks; nothing learned is saved.
 
-`detect_miners` checks `is_gamma_601` before `new_miner_record`. `add_miner` does not perform that check. `config.json` stays gitignored.
+`detect_miners` checks `boards.board_for_info` before `new_miner_record`, and the record saves that board's version as `board`. `board_limits(board, config)` fills a new record: the 601 gets `GAMMA601_LIMITS`, other boards get preset-bound caps (65°C / 85°C, the regulator's warning current, the family's `maxPower`), and a limit the board has no sensor for (`Board.unused_limit_fields`) is saved blank. A miner on an unverified board gets `experimental_ok` once its first Start is confirmed. `_record_boards` brings an older config up to `CONFIG_VERSION` once: version 1 gives each miner its board ("601" before boards were recorded), version 2 its mode (Max hashrate on a 601) and marks an existing config `setup_done` with weather on. A fresh config has `default_mode` Balanced, `setup_done` false, `weather_enabled` false, and a blank `supply_watts` until the first-run setup sets them. `config.data_dir()` puts the file beside the scripts, or in the user's data folder for a packaged build. `add_miner` does not perform that check. `config.json` stays gitignored.
 
 ```python
 # BAD

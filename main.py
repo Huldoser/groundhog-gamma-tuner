@@ -1,7 +1,8 @@
-"""Start the Gamma 601 tuner window.
+"""Start the tuner window on Windows, macOS, or Linux.
 
-The window process has to be 64-bit Python. pywebview's .NET helper does
-not load in the ARM64 build, so an ARM64 process restarts in the 64-bit one.
+On Windows the window process has to be 64-bit Python. pywebview's .NET
+helper does not load in the ARM64 build, so an ARM64 process restarts in the
+64-bit one. macOS and Linux start the window directly.
 """
 
 import glob

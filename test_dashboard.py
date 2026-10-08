@@ -9,6 +9,7 @@ from unittest import mock
 
 import config
 import dashboard
+import desktop
 import history
 from dashboard import (
     ALL_AUTOTUNE_FIELDS,
@@ -98,8 +99,8 @@ class DisplayHelperTests(unittest.TestCase):
 
     def test_updated_stamp_uses_the_local_clock(self):
         moment = datetime(2026, 9, 22, 16, 45, 3)
-        with mock.patch("dashboard.platform.system", return_value="Linux"):
-            self.assertEqual(dashboard.format_local_time(moment), "16:45:03")
+        with mock.patch("desktop.platform.system", return_value="Linux"):
+            self.assertEqual(desktop.format_local_time(moment), "16:45:03")
 
         kernel = mock.Mock()
 
@@ -112,18 +113,18 @@ class DisplayHelperTests(unittest.TestCase):
 
         kernel.GetTimeFormatEx.side_effect = get_time
         with (
-            mock.patch("dashboard.platform.system", return_value="Windows"),
+            mock.patch("desktop.platform.system", return_value="Windows"),
             mock.patch("ctypes.WinDLL", return_value=kernel, create=True),
         ):
-            self.assertEqual(dashboard.format_local_time(moment), "4:45 PM")
+            self.assertEqual(desktop.format_local_time(moment), "4:45 PM")
 
         kernel.GetTimeFormatEx.side_effect = None
         kernel.GetTimeFormatEx.return_value = 0
         with (
-            mock.patch("dashboard.platform.system", return_value="Windows"),
+            mock.patch("desktop.platform.system", return_value="Windows"),
             mock.patch("ctypes.WinDLL", return_value=kernel, create=True),
         ):
-            self.assertEqual(dashboard.format_local_time(moment), "16:45:03")
+            self.assertEqual(desktop.format_local_time(moment), "16:45:03")
 
         app = TunerDashboard()
         app._rows = [{"ip": "10.0.0.8"}]
@@ -167,7 +168,11 @@ class DisplayHelperTests(unittest.TestCase):
 
             return Sock()
 
-        status = read_network_status(fake_get, fake_connect)
+        status = read_network_status(
+            fake_get,
+            fake_connect,
+            [("stratum.ckpool.org", 3336), ("public-pool.io", 23330)],
+        )
         self.assertEqual(status["difficulty"], 132757073449487.5)
         self.assertEqual(
             status["pools"],
@@ -883,7 +888,7 @@ class SnapshotTests(unittest.TestCase):
             )
             self.assertTrue(saved["ok"])
             stored = config.get_miners()[0]
-            self.assertEqual(stored["max_freq"], dashboard.HARD_MAX_FREQ)
+            self.assertEqual(stored["max_freq"], config.HARD_MAX_FREQ)
             self.assertEqual(stored["max_droop_mv"], 10)
             self.assertEqual(stored["max_temp"], 68.5)
             self.assertEqual(stored["max_watts"], 50.25)
@@ -937,7 +942,9 @@ class SnapshotTests(unittest.TestCase):
         miner = config.new_miner_record(
             "BM1370 601", "10.0.0.8", "Alpha", config.get_default_config()
         )
+        # Saved before core current and modes existed: a 601 in Max mode.
         miner.pop("max_core_amps")
+        miner.pop("mode")
         with temp_config([miner]):
             app = TunerDashboard()
             row = app.get_autotuner_settings()["miners"][0]
@@ -1595,20 +1602,20 @@ class SnapshotTests(unittest.TestCase):
         stored = {"nickname": "Alpha"}
         # A reboot or Wi-Fi blip misses a read or two. That is not offline yet.
         with (
-            mock.patch("dashboard.show_windows_toast") as toast,
+            mock.patch("dashboard.notify") as toast,
             mock.patch("dashboard.get_system_info", return_value="timed out"),
         ):
             for _ in range(dashboard.OFFLINE_AFTER_MISSES - 1):
                 app.refresh_once()
         toast.assert_not_called()
         with (
-            mock.patch("dashboard.show_windows_toast") as toast,
+            mock.patch("dashboard.notify") as toast,
             mock.patch("dashboard.get_system_info", return_value="timed out"),
         ):
             app.refresh_once()
         toast.assert_called_once_with("Groundhog Gamma Tuner", "Alpha is offline.")
         with (
-            mock.patch("dashboard.show_windows_toast") as toast,
+            mock.patch("dashboard.notify") as toast,
             mock.patch("dashboard.get_system_info", return_value="timed out"),
         ):
             app.refresh_once()
@@ -1616,7 +1623,7 @@ class SnapshotTests(unittest.TestCase):
 
         fault = {"power_fault": "UV", "temp": 40, "hashRate_1m": 10, "frequency": 500}
         with (
-            mock.patch("dashboard.show_windows_toast") as toast,
+            mock.patch("dashboard.notify") as toast,
             mock.patch("dashboard.get_system_info", return_value=fault),
             mock.patch("dashboard.get_miner_status", return_value={"phase": "hold"}),
             mock.patch("dashboard.get_miner_defaults", return_value=stored),
@@ -1639,7 +1646,7 @@ class SnapshotTests(unittest.TestCase):
             "frequency": 500,
         }
         with (
-            mock.patch("dashboard.show_windows_toast") as toast,
+            mock.patch("dashboard.notify") as toast,
             mock.patch("dashboard.get_system_info", return_value=hot),
             mock.patch("dashboard.get_miner_status", return_value={"phase": "hold"}),
             mock.patch("dashboard.get_miner_defaults", return_value=stored),
@@ -1653,7 +1660,7 @@ class SnapshotTests(unittest.TestCase):
 
         app._focused = True
         with (
-            mock.patch("dashboard.show_windows_toast") as toast,
+            mock.patch("dashboard.notify") as toast,
             mock.patch("dashboard.get_system_info", return_value="timed out"),
         ):
             for _ in range(dashboard.OFFLINE_AFTER_MISSES):
@@ -2040,7 +2047,9 @@ class WeatherLocationTests(unittest.TestCase):
 
     def test_weather_refresh_uses_the_saved_place_and_backfills(self):
         with temp_config():
-            config.modify_config(lambda saved: saved.update(location=MOOSE_JAW))
+            config.modify_config(
+                lambda saved: saved.update(location=MOOSE_JAW, weather_enabled=True)
+            )
             history.record_samples([{"ts": 1_799_999_400, "ip": "10.0.0.8"}])
             app = TunerDashboard()
             current = {"outdoor_temp": 3.5, "weather_code": 71}
@@ -2067,6 +2076,7 @@ class WeatherLocationTests(unittest.TestCase):
 
     def test_no_saved_place_tries_the_device_once(self):
         with temp_config():
+            config.modify_config(lambda saved: saved.update(weather_enabled=True))
             app = TunerDashboard()
             with mock.patch(
                 "dashboard.weather.detect_device_location",
@@ -2081,19 +2091,102 @@ class WeatherLocationTests(unittest.TestCase):
             )
 
 
+class SetupAndPoolTests(unittest.TestCase):
+    def test_pools_come_from_what_the_miners_report(self):
+        info = {
+            "stratumURL": "stratum+tcp://solo.ckpool.org:3333/x",
+            "stratumPort": 3333,
+            "fallbackStratumURL": "public-pool.io",
+            "fallbackStratumPort": "21496",
+        }
+        self.assertEqual(
+            dashboard.pool_targets(info),
+            [("solo.ckpool.org", 3333), ("public-pool.io", 21496)],
+        )
+        self.assertEqual(dashboard.pool_targets({"stratumURL": ""}), [])
+        app = TunerDashboard()
+        app._rows = [blank_miner_row("Alpha", "10.0.0.8")]
+        with (
+            mock.patch("dashboard.get_miner_defaults", return_value={}),
+            mock.patch("dashboard.load_config", return_value={}),
+            mock.patch("dashboard.get_miner_status", return_value={}),
+        ):
+            app._apply_results([("10.0.0.8", info)])
+        with mock.patch(
+            "dashboard.read_network_status",
+            return_value={"difficulty": None, "pools": []},
+        ) as read:
+            app._refresh_network()
+        self.assertEqual(
+            read.call_args.kwargs["pools"],
+            [("solo.ckpool.org", 3333), ("public-pool.io", 21496)],
+        )
+
+    def test_weather_stays_off_until_turned_on(self):
+        with temp_config():
+            app = TunerDashboard()
+            with mock.patch("dashboard.weather.read_current_weather") as read:
+                app._refresh_weather_if_due(now=1000.0, force=True)
+            read.assert_not_called()
+
+    def test_setup_answers_pick_the_mode(self):
+        self.assertEqual(dashboard.setup_mode("stock", "hashrate").key, "balanced")
+        self.assertEqual(
+            dashboard.setup_mode("custom", "hashrate", acknowledged=False).key,
+            "balanced",
+        )
+        self.assertEqual(
+            dashboard.setup_mode("custom", "hashrate", acknowledged=True).key,
+            "max_hashrate",
+        )
+        self.assertEqual(dashboard.setup_mode("stock", "balance").key, "balanced")
+        self.assertEqual(
+            dashboard.setup_mode("upgraded", "efficiency").key, "efficiency"
+        )
+
+    def test_first_run_setup_saves_once(self):
+        with temp_config():
+            app = TunerDashboard()
+            self.assertFalse(app.get_setup_state()["setup_done"])
+            refused = app.complete_setup({"cooling": "stock"})
+            self.assertFalse(refused["ok"])
+            bad_watts = app.complete_setup(
+                {"cooling": "stock", "goal": "balance", "supply_watts": "lots"}
+            )
+            self.assertFalse(bad_watts["ok"])
+            done = app.complete_setup(
+                {
+                    "cooling": "upgraded",
+                    "goal": "efficiency",
+                    "supply_watts": "30",
+                    "weather": True,
+                }
+            )
+            self.assertEqual(
+                done, {"ok": True, "mode": "efficiency", "mode_name": "Efficiency"}
+            )
+            saved = config.load_config()
+            self.assertTrue(saved["setup_done"])
+            self.assertTrue(saved["weather_enabled"])
+            self.assertEqual(saved["default_mode"], "efficiency")
+            self.assertTrue(app.get_setup_state()["setup_done"])
+            new = config.new_miner_record("x", "1.2.3.4", "n", saved)
+            self.assertEqual((new["max_watts"], new["max_volt"]), (30.0, 1150))
+
+
 class FullscreenTests(unittest.TestCase):
     def test_monitor_rect_covers_the_frame_inset(self):
         monitor = (0, 0, 1920, 1080)
         self.assertEqual(
-            dashboard.rect_covering_monitor(monitor, (0, 0, 0, 0)),
+            desktop.rect_covering_monitor(monitor, (0, 0, 0, 0)),
             (0, 0, 1920, 1080),
         )
         self.assertEqual(
-            dashboard.rect_covering_monitor(monitor, (8, 8, 8, 8)),
+            desktop.rect_covering_monitor(monitor, (8, 8, 8, 8)),
             (-8, -8, 1936, 1096),
         )
         self.assertEqual(
-            dashboard.frame_inset((0, 0, 1920, 1080), (8, 8, 1912, 1072)),
+            desktop.frame_inset((0, 0, 1920, 1080), (8, 8, 1912, 1072)),
             (8, 8, 8, 8),
         )
 
@@ -2103,7 +2196,7 @@ class FullscreenTests(unittest.TestCase):
         app._window = window
         with (
             mock.patch("dashboard.platform.system", return_value="Windows"),
-            mock.patch("dashboard._snap_fullscreen_window") as snap,
+            mock.patch("dashboard.snap_fullscreen_window") as snap,
         ):
             entered = app.set_fullscreen(True)
             self.assertEqual(entered, {"ok": True, "fullscreen": True})
@@ -2125,7 +2218,7 @@ class FullscreenTests(unittest.TestCase):
         window.toggle_fullscreen.reset_mock()
         with (
             mock.patch("dashboard.platform.system", return_value="Linux"),
-            mock.patch("dashboard._snap_fullscreen_window") as snap,
+            mock.patch("dashboard.snap_fullscreen_window") as snap,
         ):
             entered = app.set_fullscreen(True)
         self.assertEqual(entered, {"ok": True, "fullscreen": True})
