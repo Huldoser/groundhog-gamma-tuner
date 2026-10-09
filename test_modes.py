@@ -371,7 +371,7 @@ class ModeSessionTests(unittest.TestCase):
                     max_volt=1150,
                     max_temp=60,
                 )
-                thread.join(3)
+                thread.join(30)
         self.assertFalse(thread.is_alive())
         return state
 

@@ -30,6 +30,17 @@ class SessionEventTests(unittest.TestCase):
         self.assertTrue(fresh.is_set())
 
 
+class WaitTests(unittest.TestCase):
+    # Session tests run on simulated time (patched_io), so the real wait is here.
+    def test_a_wait_ends_early_on_stop_and_reads_it_without_a_delay(self):
+        stop = threading.Event()
+        self.assertFalse(autotune._wait(stop, 0.01))
+        self.assertFalse(autotune._wait(stop, 0))
+        stop.set()
+        self.assertTrue(autotune._wait(stop, 30))
+        self.assertTrue(autotune._wait(stop, None))
+
+
 class BaselineTests(unittest.TestCase):
     def test_a_miner_without_an_address_is_not_a_failure(self):
         self.assertTrue(autotune._reset_one_miner_to_baseline({}, print))

@@ -477,7 +477,7 @@ class CapabilityTests(unittest.TestCase):
                 start_freq=400,
                 max_vr_temp="",
             )
-            thread.join(3)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertEqual(state["calls"][-1], (420, 1100), logs)
 

@@ -148,9 +148,28 @@ def fake_clock(seconds):
         yield clock
 
 
+# Sessions started by _start_miner, as (thread, stop_event).
+_SESSIONS = []
+
+
+def _stop_sessions(started):
+    """Stop and join every session started after the first `started` ones."""
+    while len(_SESSIONS) > started:
+        thread, stop_event = _SESSIONS.pop()
+        stop_event.set()
+        thread.join(30)
+
+
 @contextmanager
-def patched_io(get_info, set_settings, restart=None, runtime_config=None):
+def patched_io(get_info, set_settings, restart=None, runtime_config=None, seconds=600):
+    """Fake the miner and the config, and run sessions on simulated time.
+
+    A session stops itself after `seconds` of simulated time (see fake_clock).
+    Sessions still running at the end are stopped before the fakes go away,
+    so a session can never poll the next test's miner or move its clock.
+    """
     runtime_config = runtime_config or FAST_CONFIG
+    started = len(_SESSIONS)
 
     def load_config():
         return dict(runtime_config)
@@ -165,8 +184,12 @@ def patched_io(get_info, set_settings, restart=None, runtime_config=None):
             "restart_bitaxe",
             restart or (lambda ip: f"{ip} -> Restart initiated."),
         ),
+        fake_clock(seconds) as clock,
     ):
-        yield
+        try:
+            yield clock
+        finally:
+            _stop_sessions(started)
 
 
 def _start_miner(ip, stop_event, log, startup_delay=0, **limit_overrides):
@@ -202,6 +225,7 @@ def _start_miner(ip, stop_event, log, startup_delay=0, **limit_overrides):
         kwargs={"stop_event": stop_event, "startup_delay": startup_delay},
         daemon=True,
     )
+    _SESSIONS.append((thread, stop_event))
     thread.start()
     return thread
 
@@ -1919,13 +1943,13 @@ class SessionTests(unittest.TestCase):
         with patched_io(get_info, set_settings):
             bad = _start_miner("bad", stop_event, log, max_vr_temp=None)
             good = _start_miner("good", stop_event, log)
-            self.assertTrue(good_entered.wait(2))
-            bad.join(1)
+            self.assertTrue(good_entered.wait(30))
+            bad.join(30)
             self.assertFalse(bad.is_alive())
             self.assertTrue(good.is_alive())
             self.assertFalse(stop_event.is_set())
             stop_event.set()
-            good.join(2)
+            good.join(30)
             self.assertFalse(good.is_alive())
         self.assertTrue(any("Skipping tuning" in message for message in logs))
 
@@ -1952,19 +1976,19 @@ class SessionTests(unittest.TestCase):
             phase["event"] = old_event
             phase["entered"] = threading.Event()
             first = _start_miner("miner", old_event, log)
-            self.assertTrue(phase["entered"].wait(2))
+            self.assertTrue(phase["entered"].wait(30))
             old_event.set()
-            first.join(2)
+            first.join(30)
             self.assertFalse(first.is_alive())
 
             phase["event"] = new_event
             phase["entered"] = threading.Event()
             second = _start_miner("miner", new_event, log)
-            self.assertTrue(phase["entered"].wait(2))
+            self.assertTrue(phase["entered"].wait(30))
             self.assertTrue(second.is_alive())
             self.assertTrue(old_event.is_set())
             new_event.set()
-            second.join(2)
+            second.join(30)
             self.assertFalse(second.is_alive())
 
     def test_stopped_during_stagger_does_not_write_settings(self):
@@ -1982,7 +2006,7 @@ class SessionTests(unittest.TestCase):
             thread = _start_miner(
                 "miner", stop_event, lambda *args: None, startup_delay=5
             )
-            thread.join(1)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertEqual(calls, [])
 
@@ -2009,7 +2033,7 @@ class SessionTests(unittest.TestCase):
 
         with patched_io(get_info, set_settings):
             thread = _start_miner("miner", stop_event, lambda *args: None)
-            thread.join(3)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertIn((405, 1100), state["calls"])
         self.assertGreaterEqual(state["calls"].count((405, 1100)), 2)
@@ -2055,9 +2079,9 @@ class SessionTests(unittest.TestCase):
                 start_freq=400,
                 start_volt=1100,
             )
-            thread.join(2)
+            thread.join(30)
             stop_event.set()
-            thread.join(2)
+            thread.join(30)
         self.assertEqual(restarts, ["miner"])
 
         restarts.clear()
@@ -2082,9 +2106,9 @@ class SessionTests(unittest.TestCase):
             runtime,
         ):
             thread = _start_miner("miner", idle, log)
-            self.assertTrue(idle.wait(2))
+            self.assertTrue(idle.wait(30))
             idle.set()
-            thread.join(2)
+            thread.join(30)
         self.assertEqual(restarts, ["miner"])
         self.assertTrue(any("0 GH/s after settle" in message for message in logs))
         self.assertTrue(
@@ -2114,7 +2138,10 @@ class SessionTests(unittest.TestCase):
             restarts.append(ip)
             return f"{ip} -> Restart initiated."
 
-        with patched_io(get_info, lambda ip, volt, freq: "", restart, runtime):
+        # Two simulated minutes: twice what a 1-minute rate needs to settle.
+        with patched_io(
+            get_info, lambda ip, volt, freq: "", restart, runtime, seconds=120
+        ):
             thread = _start_miner(
                 "miner",
                 stop_event,
@@ -2124,9 +2151,8 @@ class SessionTests(unittest.TestCase):
                 start_freq=400,
                 start_volt=1100,
             )
-            self.assertFalse(stop_event.wait(0.6))
-            stop_event.set()
-            thread.join(2)
+            thread.join(30)
+        self.assertFalse(thread.is_alive())
         self.assertEqual(restarts, [])
 
     def test_flatline_ignores_a_sticky_minute_rate_inside_one_minute(self):
@@ -2140,6 +2166,7 @@ class SessionTests(unittest.TestCase):
             restarts.append(ip)
             return f"{ip} -> Restart initiated."
 
+        # 50 simulated seconds: less than the minute a 1-minute rate needs to settle.
         with patched_io(
             lambda ip: _info(
                 hashRate=100,
@@ -2152,6 +2179,7 @@ class SessionTests(unittest.TestCase):
             lambda ip, volt, freq: "",
             restart,
             runtime,
+            seconds=50,
         ):
             thread = _start_miner(
                 "miner",
@@ -2162,9 +2190,8 @@ class SessionTests(unittest.TestCase):
                 start_freq=400,
                 start_volt=1100,
             )
-            self.assertFalse(stop_event.wait(0.6))
-            stop_event.set()
-            thread.join(2)
+            thread.join(30)
+        self.assertFalse(thread.is_alive())
         self.assertEqual(restarts, [])
 
     def test_flatline_ignores_a_minute_rate_while_the_live_rate_moves(self):
@@ -2191,7 +2218,9 @@ class SessionTests(unittest.TestCase):
             return f"{ip} -> Restart initiated."
 
         with (
-            patched_io(get_info, lambda ip, volt, freq: "", restart, runtime),
+            patched_io(
+                get_info, lambda ip, volt, freq: "", restart, runtime, seconds=120
+            ),
             mock.patch.object(autotune, "FLATLINE_STILL_SECONDS", 0),
         ):
             thread = _start_miner(
@@ -2203,9 +2232,8 @@ class SessionTests(unittest.TestCase):
                 start_freq=400,
                 start_volt=1100,
             )
-            self.assertFalse(stop_event.wait(0.6))
-            stop_event.set()
-            thread.join(2)
+            thread.join(30)
+        self.assertFalse(thread.is_alive())
         self.assertEqual(restarts, [])
 
     def test_flatline_stays_off_when_the_setting_is_missing(self):
@@ -2219,6 +2247,7 @@ class SessionTests(unittest.TestCase):
             restarts.append(ip)
             return f"{ip} -> Restart initiated."
 
+        # Two simulated minutes: twice what a 1-minute rate needs to settle.
         with patched_io(
             lambda ip: _info(
                 hashRate=100,
@@ -2231,6 +2260,7 @@ class SessionTests(unittest.TestCase):
             lambda ip, volt, freq: "",
             restart,
             runtime,
+            seconds=120,
         ):
             thread = _start_miner(
                 "miner",
@@ -2241,9 +2271,8 @@ class SessionTests(unittest.TestCase):
                 start_freq=400,
                 start_volt=1100,
             )
-            self.assertFalse(stop_event.wait(0.6))
-            stop_event.set()
-            thread.join(2)
+            thread.join(30)
+        self.assertFalse(thread.is_alive())
         self.assertEqual(restarts, [])
 
     def test_flatline_restarts_once_then_holds(self):
@@ -2290,9 +2319,9 @@ class SessionTests(unittest.TestCase):
                 start_freq=400,
                 start_volt=1100,
             )
-            self.assertTrue(stop_event.wait(2))
+            self.assertTrue(stop_event.wait(30))
             stop_event.set()
-            thread.join(2)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertEqual(restarts, ["miner"])
 
@@ -2312,7 +2341,7 @@ class SessionTests(unittest.TestCase):
             thread = _start_miner(
                 "miner", stop_event, lambda message, level="info": logs.append(message)
             )
-            thread.join(2)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertEqual(calls, [])
         self.assertTrue(any("board list" in message for message in logs))
@@ -2326,7 +2355,7 @@ class SessionTests(unittest.TestCase):
             thread = _start_miner(
                 "miner", idle, lambda message, level="info": logs.append(message)
             )
-            thread.join(2)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertEqual(calls, [])
         self.assertTrue(any("errorPercentage" in message for message in logs))
@@ -2351,7 +2380,7 @@ class SessionTests(unittest.TestCase):
             mock.patch.object(autotune, "update_miner", update),
         ):
             thread = _start_miner("miner", stop_event, lambda *args: None)
-            thread.join(2)
+            thread.join(30)
 
         self.assertFalse(thread.is_alive())
         self.assertEqual(updates, [])
@@ -2381,13 +2410,12 @@ class SessionTests(unittest.TestCase):
 
         runtime = dict(FAST_CONFIG)
         runtime["refresh_interval"] = 30
-        with patched_io(get_info, set_settings, runtime_config=runtime):
+        # 25 simulated seconds: the session ends inside the 30 s refresh.
+        with patched_io(get_info, set_settings, runtime_config=runtime, seconds=25):
             thread = _start_miner(
                 "miner", stop_event, lambda *args: None, start_freq=500, start_volt=1100
             )
-            self.assertFalse(stop_event.wait(0.4))
-            stop_event.set()
-            thread.join(2)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertEqual(calls, [(450, 1090)])
 
@@ -2422,7 +2450,7 @@ class SessionTests(unittest.TestCase):
             thread = _start_miner(
                 "miner", stop_event, lambda *args: None, start_freq=500, start_volt=1100
             )
-            thread.join(2)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertEqual(calls[0], (450, 1090))
         self.assertEqual(calls[1], (400, 1080))
@@ -2477,7 +2505,7 @@ class SessionTests(unittest.TestCase):
                 start_freq=500,
                 start_volt=1100,
             )
-            thread.join(3)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertTrue(state["calls"])
         opening = state["calls"][0][0]
@@ -2518,7 +2546,7 @@ class SessionTests(unittest.TestCase):
                 start_volt=1100,
                 max_temp=60,
             )
-            thread.join(2)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertGreaterEqual(len(calls), 2)
         self.assertEqual(calls[0], (500, 1100))
@@ -2537,13 +2565,16 @@ class SessionTests(unittest.TestCase):
 
         runtime = dict(FAST_CONFIG)
         runtime["refresh_interval"] = 30
+        # 25 simulated seconds: the session ends inside the 30 s refresh.
         with patched_io(
-            lambda ip: _info(temp=40, vrTemp=30), set_settings, runtime_config=runtime
+            lambda ip: _info(temp=40, vrTemp=30),
+            set_settings,
+            runtime_config=runtime,
+            seconds=25,
         ):
             thread = _start_miner("miner", stop_event, lambda *args: None)
-            self.assertFalse(stop_event.wait(0.4))
-            stop_event.set()
-            thread.join(2)
+            thread.join(30)
+        self.assertFalse(thread.is_alive())
         self.assertEqual(calls, [(400, 1100)])
 
     def test_frequency_step_stays_when_good_hashrate_rises(self):
@@ -2579,7 +2610,7 @@ class SessionTests(unittest.TestCase):
 
         with patched_io(get_info, set_settings):
             thread = _start_miner("miner", stop_event, lambda *args: None)
-            thread.join(3)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertEqual(state["calls"][0], (400, 1100))
         self.assertIn((405, 1100), state["calls"])
@@ -2616,7 +2647,7 @@ class SessionTests(unittest.TestCase):
 
         with patched_io(get_info, set_settings):
             thread = _start_miner("miner", stop_event, lambda *args: None)
-            thread.join(3)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertIn((405, 1100), state["calls"])
         self.assertIn((410, 1100), state["calls"])
@@ -2654,7 +2685,7 @@ class SessionTests(unittest.TestCase):
 
         with patched_io(get_info, set_settings):
             thread = _start_miner("miner", stop_event, lambda *args: None)
-            thread.join(3)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertIn((405, 1100), state["calls"])
         self.assertIn((405, 1110), state["calls"])
@@ -2699,7 +2730,7 @@ class SessionTests(unittest.TestCase):
                 start_volt=1400,
                 max_volt=1400,
             )
-            thread.join(3)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertIn((405, 1400), state["calls"])
         self.assertIn((400, 1400), state["calls"])
@@ -2740,7 +2771,7 @@ class SessionTests(unittest.TestCase):
 
         with patched_io(get_info, set_settings):
             thread = _start_miner("miner", stop_event, lambda *args: None)
-            thread.join(3)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertEqual(state["calls"][:3], [(400, 1100), (405, 1100), (400, 1100)])
 
@@ -2778,7 +2809,7 @@ class SessionTests(unittest.TestCase):
 
         with patched_io(get_info, set_settings):
             thread = _start_miner("miner", stop_event, lambda *args: None)
-            thread.join(3)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertIn((405, 1100), state["calls"])
         self.assertIn((410, 1100), state["calls"])
@@ -2815,7 +2846,7 @@ class SessionTests(unittest.TestCase):
 
         with patched_io(get_info, set_settings):
             thread = _start_miner("miner", stop_event, lambda *args: None)
-            thread.join(3)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertEqual(state["calls"][0], (400, 1100))
         self.assertEqual(state["calls"][1], (405, 1100))
@@ -2865,7 +2896,7 @@ class SessionTests(unittest.TestCase):
                         start_freq=requested,
                         start_volt=1100,
                     )
-                    thread.join(3)
+                    thread.join(30)
                 self.assertFalse(thread.is_alive())
                 self.assertGreater(state["calls"][-1][1], 1100)
                 self.assertTrue(
@@ -2911,7 +2942,7 @@ class SessionTests(unittest.TestCase):
                 start_freq=501,
                 start_volt=1100,
             )
-            thread.join(3)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertIn((501, 1090), state["calls"])
         self.assertNotIn((500, 1090), state["calls"])
@@ -2958,7 +2989,7 @@ class SessionTests(unittest.TestCase):
                 start_freq=450,
                 start_volt=1150,
             )
-            thread.join(3)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertIn((453, 1150), state["calls"])
         self.assertTrue(all(volt == 1150 for _freq, volt in state["calls"]))
@@ -3007,7 +3038,7 @@ class SessionTests(unittest.TestCase):
                 start_volt=1100,
                 max_freq=800,
             )
-            thread.join(3)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertIn((405, 1100), state["calls"])
         self.assertTrue(
@@ -3047,7 +3078,7 @@ class SessionTests(unittest.TestCase):
             thread = _start_miner(
                 "miner", stop_event, lambda *args: None, start_freq=400
             )
-            thread.join(3)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertEqual(state["calls"][-1], (420, 1100))
 
@@ -3092,7 +3123,7 @@ class SessionTests(unittest.TestCase):
                 lambda message, *args: logs.append(message),
                 start_freq=400,
             )
-            thread.join(3)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertEqual(state["calls"][-3:], [(420, 1100), (400, 1100), (405, 1100)])
         self.assertTrue(any("one step at a time" in line for line in logs))
@@ -3150,7 +3181,7 @@ class SessionTests(unittest.TestCase):
                 start_freq=500,
                 start_volt=1100,
             )
-            thread.join(3)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertIn((505, 1100), state["calls"])
         self.assertTrue(any(freq < 505 for freq, _volt in state["calls"]))
@@ -3188,10 +3219,7 @@ class SessionTests(unittest.TestCase):
         runtime["refresh_interval"] = 0.25
         runtime["monitor_interval"] = 0.02
         # Simulated time: a settle holds exactly as many polls on any machine.
-        with (
-            patched_io(get_info, set_settings, runtime_config=runtime),
-            fake_clock(3),
-        ):
+        with patched_io(get_info, set_settings, runtime_config=runtime, seconds=3):
             thread = _start_miner("miner", stop_event, lambda *args: None)
             thread.join(30)
         self.assertFalse(thread.is_alive())
@@ -3236,7 +3264,7 @@ class SessionTests(unittest.TestCase):
 
         with patched_io(get_info, set_settings):
             thread = _start_miner("miner", stop_event, lambda *args: None)
-            thread.join(3)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertIn((405, 1100), state["calls"])
         self.assertFalse(any(freq < 400 for freq, _volt in state["calls"]))
@@ -3278,7 +3306,7 @@ class SessionTests(unittest.TestCase):
 
         with patched_io(get_info, set_settings):
             thread = _start_miner("miner", stop_event, lambda *args: None, max_freq=400)
-            thread.join(3)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertIn((400, 1090), state["calls"])
         self.assertIn((400, 1100), state["calls"])
@@ -3326,7 +3354,7 @@ class SessionTests(unittest.TestCase):
                 start_volt=1400,
                 max_volt=1400,
             )
-            thread.join(3)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertTrue(any(freq < 500 for freq, _volt in state["calls"]))
         self.assertFalse(
@@ -3377,7 +3405,7 @@ class SessionTests(unittest.TestCase):
                 start_volt=1400,
                 max_volt=1400,
             )
-            thread.join(3)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertIn((495, 1400), state["calls"])
         self.assertTrue(
@@ -3433,7 +3461,7 @@ class SessionTests(unittest.TestCase):
             ),
         ):
             thread = _start_miner("miner", stop_event, lambda *args: None)
-            thread.join(3)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertEqual(state["calls"][0], (400, 1100))
         self.assertEqual(updates, [])
@@ -3481,7 +3509,7 @@ class SessionTests(unittest.TestCase):
                 min_volt=1100,
                 max_volt=1400,
             )
-            thread.join(3)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertIn((495, 1100), state["calls"])
         self.assertIn((490, 1100), state["calls"])
@@ -3507,7 +3535,7 @@ class SessionTests(unittest.TestCase):
             thread = _start_miner(
                 "miner", stop_event, lambda message, level="info": logs.append(message)
             )
-            thread.join(3)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         return calls[0], logs
 
@@ -3590,7 +3618,7 @@ class SessionTests(unittest.TestCase):
         caps.update(limits)
         with patched_io(get_info, set_settings, runtime_config=runtime):
             thread = _start_miner("miner", stop_event, log, **caps)
-            thread.join(5)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         return state["calls"], logs
 
@@ -3671,7 +3699,7 @@ class SessionTests(unittest.TestCase):
                 min_volt=1100,
                 max_volt=1400,
             )
-            thread.join(3)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertIn((495, 1100), state["calls"])
         self.assertEqual(state["calls"][-1], (495, 1110))
@@ -3744,7 +3772,7 @@ class SessionTests(unittest.TestCase):
                 max_freq=520,
                 max_temp=60,
             )
-            thread.join(3)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertIsNotNone(state["stepped_from"])
         after_drop = [freq for freq, _volt in state["calls"][state["drop_at"] + 1 :]]
@@ -3804,7 +3832,7 @@ class SessionTests(unittest.TestCase):
                 start_freq=500,
                 start_volt=1100,
             )
-            thread.join(3)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         peak = max(freq for freq, _volt in state["calls"])
         peak_at = max(
@@ -3847,7 +3875,7 @@ class SessionTests(unittest.TestCase):
             mock.patch.object(autotune, "HASHRATE_10M_SETTLE_SECONDS", 0),
         ):
             thread = _start_miner("miner", stop_event, lambda *args: None)
-            thread.join(3)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertEqual(calls[0], (400, 1100))
         self.assertEqual(calls[1][0], 400)
@@ -3871,11 +3899,10 @@ class SessionTests(unittest.TestCase):
             info.pop("hashRate_1m", None)
             return info
 
-        with patched_io(get_info, set_settings):
+        with patched_io(get_info, set_settings, seconds=60):
             thread = _start_miner("miner", stop_event, lambda *args: None)
-            self.assertFalse(stop_event.wait(0.4))
-            stop_event.set()
-            thread.join(2)
+            thread.join(30)
+        self.assertFalse(thread.is_alive())
         self.assertEqual(calls, [(400, 1100)])
 
     def test_hold_leaves_the_fan_at_full_speed(self):
@@ -3908,7 +3935,7 @@ class SessionTests(unittest.TestCase):
                     start_freq=400,
                     start_volt=1100,
                 )
-                thread.join(2)
+                thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertTrue(fan_calls)
         self.assertTrue(
@@ -4144,13 +4171,12 @@ class SessionTests(unittest.TestCase):
 
         runtime = dict(FAST_CONFIG)
         runtime["refresh_interval"] = 30
-        with patched_io(get_info, set_settings, runtime_config=runtime):
+        # 25 simulated seconds: the session ends inside the 30 s refresh.
+        with patched_io(get_info, set_settings, runtime_config=runtime, seconds=25):
             thread = _start_miner(
                 "miner", stop_event, lambda *args: None, start_freq=500, start_volt=1100
             )
-            self.assertFalse(stop_event.wait(0.4))
-            stop_event.set()
-            thread.join(2)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertEqual(calls, [(495, 1100)])
 
@@ -4208,7 +4234,7 @@ class SessionTests(unittest.TestCase):
                 start_freq=500,
                 start_volt=1100,
             )
-            thread.join(3)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertEqual(state["calls"][1], (505, 1100))
         self.assertEqual(state["calls"][2], (500, 1100))
@@ -4263,7 +4289,7 @@ class SessionTests(unittest.TestCase):
                 start_freq=400,
                 start_volt=1100,
             )
-            thread.join(3)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertEqual(state["calls"][:3], [(400, 1100), (405, 1100), (400, 1100)])
         self.assertEqual(restarts, ["miner"])
@@ -4320,7 +4346,7 @@ class SessionTests(unittest.TestCase):
                 start_freq=400,
                 start_volt=1100,
             )
-            thread.join(3)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertEqual(state["calls"], [(400, 1100), (405, 1100)])
         self.assertEqual(restarts, [])
@@ -4370,7 +4396,7 @@ class SessionTests(unittest.TestCase):
                 start_volt=1100,
                 max_freq=800,
             )
-            thread.join(3)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertTrue(any(freq >= 410 for freq, _volt in state["calls"]))
         self.assertTrue(all(volt == 1100 for _freq, volt in state["calls"]))
@@ -4417,7 +4443,7 @@ class SessionTests(unittest.TestCase):
                 start_freq=400,
                 start_volt=1100,
             )
-            thread.join(3)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertTrue(any(volt > 1100 for _freq, volt in state["calls"]))
         self.assertFalse(
@@ -4465,7 +4491,7 @@ class SessionTests(unittest.TestCase):
                 start_volt=1400,
                 max_volt=1400,
             )
-            thread.join(3)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertGreaterEqual(state["calls"].count((405, 1400)), 2)
         self.assertIn((410, 1400), state["calls"])
@@ -4508,7 +4534,7 @@ class SessionTests(unittest.TestCase):
                 start_volt=1400,
                 max_volt=1400,
             )
-            thread.join(3)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertEqual(state["calls"].count((405, 1400)), 2)
         self.assertFalse(any(freq > 405 for freq, _volt in state["calls"]))
@@ -4530,7 +4556,8 @@ class SessionTests(unittest.TestCase):
         def set_settings(ip, volt, freq):
             freq = int(freq)
             volt = int(volt)
-            now = time.time()
+            # The session's simulated clock (patched_io).
+            now = autotune.time.time()
             state["calls"].append((freq, volt))
             if volt > 1100 and state["raised_at"] is None:
                 state["raised_at"] = now
@@ -4565,7 +4592,7 @@ class SessionTests(unittest.TestCase):
                 start_freq=500,
                 start_volt=1100,
             )
-            thread.join(3)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertIsNotNone(state["raised_at"])
         self.assertIsNotNone(state["dropped_at"])
@@ -4619,7 +4646,7 @@ class SessionTests(unittest.TestCase):
                 start_volt=1100,
                 max_freq=500,
             )
-            thread.join(3)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertEqual(restarts, ["miner"])
         self.assertTrue(state["calls"])
@@ -4636,7 +4663,10 @@ class SessionTests(unittest.TestCase):
 
             runtime = dict(FAST_CONFIG)
             runtime["refresh_interval"] = 30
-            with patched_io(lambda ip: info, set_settings, runtime_config=runtime):
+            # 25 simulated seconds: the session ends inside the 30 s refresh.
+            with patched_io(
+                lambda ip: info, set_settings, runtime_config=runtime, seconds=25
+            ):
                 thread = _start_miner(
                     "miner",
                     stop_event,
@@ -4644,9 +4674,8 @@ class SessionTests(unittest.TestCase):
                     start_freq=500,
                     start_volt=1100,
                 )
-                self.assertFalse(stop_event.wait(0.4))
-                stop_event.set()
-                thread.join(2)
+                thread.join(30)
+            self.assertFalse(thread.is_alive())
             return calls
 
         at_cap = run_case(
@@ -4692,7 +4721,7 @@ class SessionTests(unittest.TestCase):
             thread = _start_miner(
                 "miner", stop_event, lambda *args: None, start_freq=500, start_volt=1100
             )
-            thread.join(2)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertEqual(calls, [(500, 1100), (400, 1090)])
 
@@ -4727,7 +4756,7 @@ class SessionTests(unittest.TestCase):
                     lambda message, level="info": logs.append(message),
                     **limits,
                 )
-                thread.join(1)
+                thread.join(30)
             self.assertFalse(thread.is_alive())
             self.assertEqual(calls, [])
             self.assertTrue(any("reversed" in message for message in logs))
@@ -4755,7 +4784,7 @@ class SessionTests(unittest.TestCase):
                 max_freq=500,
                 start_freq=100,
             )
-            thread.join(2)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertEqual(calls[0], (350, 1100))
         self.assertFalse(any("reversed" in message for message in logs))
@@ -4779,11 +4808,10 @@ class SessionTests(unittest.TestCase):
 
         runtime = dict(FAST_CONFIG)
         runtime["refresh_interval"] = 0.05
-        with patched_io(get_info, set_settings, runtime_config=runtime):
+        with patched_io(get_info, set_settings, runtime_config=runtime, seconds=60):
             thread = _start_miner("miner", stop_event, lambda *args: None)
-            self.assertFalse(stop_event.wait(0.4))
-            stop_event.set()
-            thread.join(2)
+            thread.join(30)
+        self.assertFalse(thread.is_alive())
         self.assertEqual(calls, [(400, 1100)])
 
     def test_missing_regulator_temperature_still_steps_down_when_the_chip_is_hot(self):
@@ -4813,13 +4841,12 @@ class SessionTests(unittest.TestCase):
 
         runtime = dict(FAST_CONFIG)
         runtime["refresh_interval"] = 30
-        with patched_io(get_info, set_settings, runtime_config=runtime):
+        # 25 simulated seconds: the session ends inside the 30 s refresh.
+        with patched_io(get_info, set_settings, runtime_config=runtime, seconds=25):
             thread = _start_miner(
                 "miner", stop_event, lambda *args: None, start_freq=500, start_volt=1100
             )
-            self.assertFalse(stop_event.wait(0.4))
-            stop_event.set()
-            thread.join(2)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertEqual(calls, [(450, 1090)])
 
@@ -4849,7 +4876,7 @@ class SessionTests(unittest.TestCase):
             thread = _start_miner(
                 "miner", stop_event, log, start_freq=400, start_volt=1100
             )
-            thread.join(2)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         # 390 MHz is under the 400 MHz floor, so the floor may be written again.
         # Nothing goes above it.
@@ -4885,7 +4912,7 @@ class SessionTests(unittest.TestCase):
         with patched_io(get_info, set_settings):
             with mock.patch.object(autotune, "patch_system", patch):
                 thread = _start_miner("miner", stop_event, log)
-                thread.join(2)
+                thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertEqual(calls, [])
         self.assertTrue(any("Fan update failed" in message for message in logs))
@@ -4914,9 +4941,9 @@ class SessionTests(unittest.TestCase):
             ),
         ):
             thread = _start_miner("miner", stop_event, log)
-            self.assertTrue(continued.wait(2))
+            self.assertTrue(continued.wait(30))
             stop_event.set()
-            thread.join(2)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertTrue(
             any(
@@ -4965,7 +4992,7 @@ class SessionTests(unittest.TestCase):
                 start_freq=400,
                 start_volt=1100,
             )
-            thread.join(3)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertIn((400, 1090), state["calls"])
         self.assertFalse(any(freq > 400 for freq, _volt in state["calls"]))
@@ -4982,8 +5009,10 @@ class SessionTests(unittest.TestCase):
             )
 
         def log(message, level="info"):
-            if "Holding 400 MHz" in message:
+            if "Holding 400 MHz" in message and not held.is_set():
                 held.set()
+                # Run 0.15 simulated seconds more, inside the 0.4 s refresh.
+                clock.end = clock.now + 0.15
 
         def get_info(ip):
             return _info(
@@ -5000,7 +5029,7 @@ class SessionTests(unittest.TestCase):
         runtime = dict(FAST_CONFIG)
         runtime["refresh_interval"] = 0.4
         runtime["monitor_interval"] = 0.02
-        with patched_io(get_info, set_settings, runtime_config=runtime):
+        with patched_io(get_info, set_settings, runtime_config=runtime) as clock:
             thread = _start_miner(
                 "miner",
                 stop_event,
@@ -5011,11 +5040,9 @@ class SessionTests(unittest.TestCase):
                 start_freq=400,
                 start_volt=1100,
             )
-            self.assertTrue(held.wait(2))
-            time.sleep(0.15)
-            stop_event.set()
-            thread.join(2)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
+        self.assertTrue(held.is_set())
         self.assertEqual(calls, [(400, 1100)])
 
     def test_clean_reject_sample_allows_the_frequency_back(self):
@@ -5081,7 +5108,7 @@ class SessionTests(unittest.TestCase):
                 start_volt=1100,
                 max_freq=520,
             )
-            thread.join(3)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertIsNotNone(state["stepped_from"])
         self.assertTrue(
@@ -5129,7 +5156,7 @@ class SessionTests(unittest.TestCase):
                 start_volt=1100,
                 max_temp=80,
             )
-            thread.join(2)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertGreaterEqual(len(calls), 2)
         self.assertEqual(calls[0], (500, 1100))
@@ -5168,7 +5195,7 @@ class SessionTests(unittest.TestCase):
                 start_freq=450,
                 start_volt=1050,
             )
-            thread.join(2)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertEqual(calls[0], (450, 1050))
         self.assertIn((400, 1000), calls)
@@ -5207,14 +5234,12 @@ class SessionTests(unittest.TestCase):
             )
 
         with (
-            patched_io(get_info, set_settings, restart=restart),
+            patched_io(get_info, set_settings, restart=restart, seconds=0.5),
             mock.patch.object(autotune, "patch_system", patch),
             mock.patch.object(autotune, "OVERHEAT_LATCH_SECONDS", 0.05),
         ):
             thread = _start_miner("miner", stop_event, lambda *args: None)
-            time.sleep(0.5)
-            stop_event.set()
-            thread.join(2)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertEqual(restarts, ["miner"])
         self.assertIn({"overheat_mode": 0}, patches)
@@ -5250,14 +5275,12 @@ class SessionTests(unittest.TestCase):
             )
 
         with (
-            patched_io(get_info, set_settings, restart=restart),
+            patched_io(get_info, set_settings, restart=restart, seconds=0.5),
             mock.patch.object(autotune, "patch_system", patch),
             mock.patch.object(autotune, "OVERHEAT_LATCH_SECONDS", 0.05),
         ):
             thread = _start_miner("miner", stop_event, lambda *args: None)
-            time.sleep(0.5)
-            stop_event.set()
-            thread.join(2)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertEqual(restarts, ["miner"])
         self.assertIn({"overheat_mode": 0}, patches)
@@ -5292,14 +5315,12 @@ class SessionTests(unittest.TestCase):
             )
 
         with (
-            patched_io(get_info, set_settings, restart=restart),
+            patched_io(get_info, set_settings, restart=restart, seconds=0.5),
             mock.patch.object(autotune, "patch_system", patch),
             mock.patch.object(autotune, "OVERHEAT_LATCH_SECONDS", 0.05),
         ):
             thread = _start_miner("miner", stop_event, lambda *args: None)
-            time.sleep(0.5)
-            stop_event.set()
-            thread.join(2)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertEqual(restarts, ["miner"])
         self.assertIn({"overheat_mode": 0}, patches)
@@ -5321,13 +5342,11 @@ class SessionTests(unittest.TestCase):
             return _info(power=5.0, hashRate=0, temp=21)
 
         with (
-            patched_io(get_info, set_settings, restart=restart),
+            patched_io(get_info, set_settings, restart=restart, seconds=0.5),
             mock.patch.object(autotune, "ASIC_OFF_RESTART_SECONDS", 0.05),
         ):
             thread = _start_miner("miner", stop_event, lambda *args: None)
-            time.sleep(0.5)
-            stop_event.set()
-            thread.join(2)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertEqual(restarts, ["miner"])
 
@@ -5348,13 +5367,11 @@ class SessionTests(unittest.TestCase):
             return _info(power=5.0, hashRate=0, miningPaused=True)
 
         with (
-            patched_io(get_info, set_settings, restart=restart),
+            patched_io(get_info, set_settings, restart=restart, seconds=0.4),
             mock.patch.object(autotune, "ASIC_OFF_RESTART_SECONDS", 0.05),
         ):
             thread = _start_miner("miner", stop_event, lambda *args: None)
-            time.sleep(0.4)
-            stop_event.set()
-            thread.join(2)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertEqual(restarts, [])
 
@@ -5382,11 +5399,9 @@ class SessionTests(unittest.TestCase):
         def log(message, level="info"):
             logs.append(message)
 
-        with patched_io(get_info, set_settings, restart=restart):
+        with patched_io(get_info, set_settings, restart=restart, seconds=0.4):
             thread = _start_miner("miner", stop_event, log)
-            time.sleep(0.4)
-            stop_event.set()
-            thread.join(2)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertEqual(restarts, ["miner"])
         self.assertTrue(any("Fan Control Failed" in line for line in logs))
@@ -5424,10 +5439,7 @@ class SessionTests(unittest.TestCase):
                 hashRate=0,
             )
 
-        with (
-            patched_io(get_info, set_settings, restart=restart),
-            fake_clock(2),
-        ):
+        with patched_io(get_info, set_settings, restart=restart, seconds=2):
             thread = _start_miner("miner", stop_event, lambda *args: None)
             thread.join(30)
         self.assertFalse(thread.is_alive())
@@ -5472,7 +5484,7 @@ class SessionTests(unittest.TestCase):
                 start_volt=1100,
                 max_temp=68,
             )
-            thread.join(2)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertEqual(len(calls), 2)
         self.assertLess(calls[1][0], calls[0][0])
@@ -5509,7 +5521,7 @@ class SessionTests(unittest.TestCase):
                 expectedHashrate=state["frequency"] * 2.04,
             )
 
-        with patched_io(get_info, set_settings, restart=restart):
+        with patched_io(get_info, set_settings, restart=restart, seconds=0.6):
             thread = _start_miner(
                 "miner",
                 stop_event,
@@ -5518,9 +5530,7 @@ class SessionTests(unittest.TestCase):
                 start_volt=1120,
                 min_freq=400,
             )
-            time.sleep(0.6)
-            stop_event.set()
-            thread.join(2)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertEqual(len(restarts), 1)
         # The floor went on before the restart, so the reboot does not replay 250 MHz.
@@ -5576,7 +5586,7 @@ class SessionTests(unittest.TestCase):
                 start_volt=1100,
                 max_volt=1100,
             )
-            thread.join(4)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertTrue(state["cool"])
         self.assertTrue(any("Climbing again" in message for message in logs))
@@ -5599,7 +5609,7 @@ class SessionTests(unittest.TestCase):
                 lambda message, level="info": logs.append(message),
                 max_temp=80,
             )
-            thread.join(2)
+            thread.join(30)
         self.assertFalse(thread.is_alive())
         self.assertTrue(any("71°C ASIC" in message for message in logs))
 

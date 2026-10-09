@@ -12,7 +12,7 @@ import unittest
 from unittest import mock
 
 import autotune
-from test_autotune import FAST_CONFIG, _info, _start_miner, fake_clock, patched_io
+from test_autotune import FAST_CONFIG, _info, _start_miner, patched_io
 
 # A reply field set to MISSING is left out of the reply.
 MISSING = object()
@@ -92,9 +92,13 @@ def run_session(
 
     with contextlib.ExitStack() as stack:
         stack.enter_context(
-            patched_io(miner.get_info, miner.set_settings, runtime_config=runtime)
+            patched_io(
+                miner.get_info,
+                miner.set_settings,
+                runtime_config=runtime,
+                seconds=seconds,
+            )
         )
-        stack.enter_context(fake_clock(seconds))
         clock_wait = autotune._wait
 
         def wait(event, delay):
@@ -111,8 +115,6 @@ def run_session(
         # The session stops itself when simulated time runs out. The real
         # timeout only guards against a session that never waits.
         thread.join(30)
-        stop.set()
-        thread.join(2)
     test.assertFalse(thread.is_alive())
     return run
 
@@ -135,7 +137,7 @@ class OpeningTests(unittest.TestCase):
             patched_io(miner.get_info, miner.set_settings),
             mock.patch.object(autotune, "_wait", wait),
         ):
-            _start_miner("miner", stop, lambda m, level="info": logs.append(m)).join(2)
+            _start_miner("miner", stop, lambda m, level="info": logs.append(m)).join(30)
         self.assertEqual(miner.polls, 0)
         self.assertTrue(logs[-1].endswith("Autotuning stopped."))
 

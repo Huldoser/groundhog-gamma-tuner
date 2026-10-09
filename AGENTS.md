@@ -61,7 +61,7 @@ Privacy matters most to the owner.
 - A failure in a file you did not change can be another agent's in-progress edit. Leave that file alone. Do not revert it, reformat it, or weaken the check to make the run green.
 - New code needs tests for every branch. Reach Windows and macOS code with mocks (fake `ctypes.WinDLL`, a patched `sys.platform`), not a real system. Only a branch that cannot run gets `# pragma: no branch` or `# pragma: no cover`, with a comment saying why.
 - Tests use `unittest.TestCase` and `unittest.mock`, not pytest. Keep them free of OS-specific paths and calls, and leave the network and live miners out.
-- Session tests patch miner I/O with `patched_io` in `test_autotune.py`. `FakeMiner` and `run_session` in `test_autotune_session_paths.py` script a miner and can stop a session at the wait after a given status or log line.
+- Session tests patch miner I/O with `patched_io` in `test_autotune.py`. It runs the session on simulated time and ends it after `seconds` of that time, so a test sets `seconds=` instead of sleeping or waiting in real time. `FakeMiner` and `run_session` in `test_autotune_session_paths.py` script a miner and can stop a session at the wait after a given status or log line.
 - Upgrade tests in `test_upgrade.py` load `config.json` as each older version saved it.
 
 ## Tuning decisions
