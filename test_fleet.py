@@ -3,7 +3,7 @@
 Support for other boards, modes, and systems must not change how these
 miners are tuned. FLEET_DECISIONS_SHA256 is the fingerprint of the tuner's
 answers over a fixed grid of Gamma 601 readings, taken from the code before
-any of that existed (commit 0241f61). A change that moves it changes the
+any of that existed (commit 986fb10). A change that moves it changes the
 fleet's tuning; update the fingerprint only when that is the point.
 """
 
