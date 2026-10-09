@@ -11,6 +11,7 @@ import config
 import dashboard
 import desktop
 import history
+from boards import board_named
 from dashboard import (
     ALL_AUTOTUNE_FIELDS,
     LOG_LIMIT,
@@ -69,6 +70,56 @@ class DisplayHelperTests(unittest.TestCase):
         self.assertFalse(dashboard.over_limit("n/a", 2))
         self.assertFalse(dashboard.over_limit(None, 2))
 
+    def test_a_supply_wall_names_the_reading_and_what_to_check(self):
+        status = {"wall_type": "input", "wall_input_v": 4.89, "wall_watts": 18.2}
+        # The live reading has recovered since; the wall reading explains the hold.
+        live = {"voltage": 4930, "power": 16}
+        text, hover = dashboard.limit_text(
+            status, live, {"min_input_voltage": 4.9}, board_named("601")
+        )
+        self.assertEqual(text, "the supply: 4.89\u00a0V\u00a0at\u00a018\u00a0W")
+        self.assertIn(
+            "The 5 V input fell under this miner's 4.9 V floor at 18 W", hover
+        )
+        self.assertIn("the limit, not the chip", hover)
+        self.assertIn("18 AWG or thicker", hover)
+        self.assertIn("shuts off at 4.5 V and needs 4.8 V to start again", hover)
+
+    def test_a_supply_wall_without_its_reading_uses_the_live_one(self):
+        gamma = board_named("601")
+        text, hover = dashboard.limit_text(
+            {"wall_type": "input"}, {"voltage": 4910, "power": 17.6}, {}, gamma
+        )
+        self.assertEqual(text, "the supply: 4.91\u00a0V\u00a0at\u00a018\u00a0W")
+        # A blank floor is the board's.
+        self.assertIn("4.9 V floor at 18 W, so", hover)
+        text, hover = dashboard.limit_text({"wall_type": "input"}, {}, {}, gamma)
+        self.assertEqual(text, "the supply")
+        self.assertIn("4.9 V floor, so", hover)
+
+    def test_a_12_volt_board_names_its_own_input_and_regulator(self):
+        text, hover = dashboard.limit_text(
+            {"wall_type": "input", "wall_input_v": 11.7, "wall_watts": 60},
+            {},
+            {},
+            board_named("302"),
+        )
+        self.assertEqual(text, "the supply: 11.70\u00a0V\u00a0at\u00a060\u00a0W")
+        self.assertIn("The 12 V input fell under this miner's 11.76 V floor", hover)
+        self.assertIn("shuts off at 11 V and needs 11.5 V", hover)
+
+    def test_droop_explains_itself_and_other_walls_keep_their_label(self):
+        gamma = board_named("601")
+        self.assertEqual(
+            dashboard.limit_text({"wall_type": "droop"}, {}, {}, gamma),
+            ("core voltage droop", dashboard.DROOP_ADVICE),
+        )
+        self.assertEqual(
+            dashboard.limit_text({"wall_type": "thermal"}, {}, {}, gamma),
+            ("temperature", ""),
+        )
+        self.assertEqual(dashboard.limit_text(None, {}, {}, gamma), ("", ""))
+
     def test_format_number_and_live_limit(self):
         self.assertEqual(format_number(None, 0), "-")
         self.assertEqual(format_number("12.3%", 1), "12.3")
@@ -79,8 +130,9 @@ class DisplayHelperTests(unittest.TestCase):
             ("thermal", "temperature"),
             ("power", "power"),
             ("reject", "rejected shares"),
-            ("input", "input sag"),
+            ("input", "the supply"),
             ("current", "core current"),
+            ("droop", "core voltage droop"),
         ):
             self.assertEqual(live_limit({"wall_type": wall}), label)
         self.assertEqual(live_limit({}), "")
@@ -519,7 +571,9 @@ class SnapshotTests(unittest.TestCase):
         self.assertFalse(row["vin_alert"])
         self.assertEqual(row["freq"], "640")
         self.assertEqual(row["mv"], "1200")
-        self.assertEqual(row["mv_title"], "Measured 1144 mV, droop 56 mV")
+        self.assertEqual(
+            row["mv_title"], "Measured 1144 mV, droop 56 mV\n" + dashboard.DROOP_ADVICE
+        )
         self.assertTrue(row["mv_alert"])
         self.assertEqual(row["vin"], "5.09")
         self.assertEqual(row["asic"], "61.2")
@@ -638,6 +692,11 @@ class SnapshotTests(unittest.TestCase):
         self.assertTrue(row["watts_alert"])
         self.assertTrue(row["error_alert"])
         self.assertTrue(row["vin_alert"])
+        self.assertEqual(
+            row["watts_title"],
+            "Input 4.80 V is under this miner's 4.9 V floor. "
+            "Check the supply and its wiring.",
+        )
 
         info.update(
             {
@@ -661,6 +720,7 @@ class SnapshotTests(unittest.TestCase):
         self.assertFalse(clear["watts_alert"])
         self.assertFalse(clear["error_alert"])
         self.assertFalse(clear["vin_alert"])
+        self.assertEqual(clear["watts_title"], "")
 
     def test_row_flags_clocks_under_the_saved_floor(self):
         app = TunerDashboard()

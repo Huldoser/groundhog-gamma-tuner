@@ -1,6 +1,6 @@
 # Roadmap
 
-What comes next for Groundhog Tuner, as of 2026-10-08. Items are sorted by priority, then by size:
+What comes next for Groundhog Tuner, as of 2026-10-09. Items are sorted by priority, then by size:
 
 - **S:** a few days.
 - **M:** about a week.
@@ -17,7 +17,6 @@ The app tunes boards running **official AxeOS**, which today means the Bitaxe fa
 
 | Item | Size | Why |
 | --- | --- | --- |
-| **Power check** | S | A weak or sagging 5 V supply is the most common Bitaxe problem: the regulator needs 4.8 V to start and shuts off at 4.5 V. The tuner already stops climbing at the input floor and marks it "input sag", but does not say that the supply or the cable, not the chip, is the limit, or what to check. It should say so in plain words ("held back by the supply: 4.89 V at 18 W"), and flag a large gap between the core voltage set and the one measured. |
 | **Flatline watchdog** | M | The "Flatline of Death" is the most-discussed open AxeOS bug ([ESP-Miner #1053](https://github.com/bitaxeorg/ESP-Miner/issues/1053)): the hashrate freezes and no shares arrive until a restart. The tuner can already detect it and restart the miner once, but that is off by default and only works while a miner is being tuned. It should be on for new installs, also watch miners that are not being tuned, show a notice, and count flatlines in History. |
 | **First release** | M | The release workflow builds Windows, macOS, and Linux apps, but has never run on a tag. Without a download, only people who use git and Python can run the app. Each build needs a test on its system first. |
 | **Board report export** | M | Only the Gamma 601 is verified, out of about 25 board versions. One click should copy what the [board report](../.github/ISSUE_TEMPLATE/board-report.md) asks for: board, firmware, mode, the clocks it settled at, temperatures, and trips. It should leave out the IP address, hostname, Wi-Fi name, MAC address, and pool user, which people now have to delete by hand. |

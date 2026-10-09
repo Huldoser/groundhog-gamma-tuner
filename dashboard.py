@@ -304,9 +304,17 @@ _LIMIT_LABELS = {
     "thermal": "temperature",
     "power": "power",
     "reject": "rejected shares",
-    "input": "input sag",
+    "input": "the supply",
     "current": "core current",
+    "droop": "core voltage droop",
 }
+
+# What a core voltage droop means, for the status and core voltage hovers.
+DROOP_ADVICE = (
+    "The regulator is not holding the set core voltage under load. That is most "
+    "often the input sagging or the regulator near its current limit, not the "
+    "chip, so check the supply and its wiring first."
+)
 
 
 # AxeOS shows "Danger: Low Voltage" under this share of the nominal input.
@@ -558,6 +566,48 @@ def live_limit(status):
     """The plain limit that stopped this session's climb, or ""."""
     wall = str((status or {}).get("wall_type") or "").strip().lower()
     return _LIMIT_LABELS.get(wall, "")
+
+
+def input_floor_volts(stored, board):
+    """This miner's input floor in volts: its saved setting, else the board's."""
+    floor = parse_display_number((stored or {}).get("min_input_voltage"))
+    return board.default_min_input_voltage if floor is None else floor
+
+
+def limit_text(status, miner_data, stored, board):
+    """(text, hover) for the limit that stopped this session's climb.
+
+    The supply names the input reading that stopped the climb, or the live
+    one when the session recorded none, and says what to check.
+    """
+    label = live_limit(status)
+    wall = str((status or {}).get("wall_type") or "").strip().lower()
+    if wall == "droop":
+        return label, DROOP_ADVICE
+    if wall != "input":
+        return label, ""
+    volts = parse_display_number(status.get("wall_input_v"))
+    watts = parse_display_number(status.get("wall_watts"))
+    if volts is None:
+        volts = normalize_input_voltage(miner_data.get("voltage"))
+        watts = parse_display_number(miner_data.get("power"))
+    at = "" if watts is None else f" at {format_number(watts, 0)} W"
+    # Non-breaking spaces keep the reading on one line in the narrow column.
+    reading = "" if volts is None else f"{volts:.2f} V{at}".replace(" ", " ")
+    text = f"{label}: {reading}" if reading else label
+    regulator = board.family.regulator
+    hover = "\n".join(
+        [
+            f"The {board.family.nominal_voltage} V input fell under this miner's "
+            f"{input_floor_volts(stored, board):g} V floor{at}, so the tuner "
+            "stopped climbing. The supply or its wiring is the limit, not the chip.",
+            "Check the supply's output trim if it has one, a shorter or thicker "
+            "cable (18 AWG or thicker), tight terminals, and one cable per miner.",
+            f"The regulator shuts off at {regulator.vin_off:g} V and needs "
+            f"{regulator.vin_on:g} V to start again.",
+        ]
+    )
+    return text, hover
 
 
 def parse_repaste_date(value, today=None):
@@ -1260,6 +1310,7 @@ def blank_miner_row(nickname, ip):
         "phase": "-",
         "error": "-",
         "limit": "",
+        "limit_title": "",
         "tag": "idle",
         "up_seconds": None,
         "mv_alert": False,
@@ -2848,6 +2899,8 @@ class TunerDashboard:
         reads = self._droop_reads.get(ip, 0) + 1 if drooping else 0
         self._droop_reads[ip] = reads
         row["mv_alert"] = reads >= DROOP_ALERT_READS
+        if row["mv_alert"]:
+            row["mv_title"] += "\n" + DROOP_ADVICE
         row["floor_alert"] = below_floor(
             miner_data.get("frequency"), miner_data.get("coreVoltage"), stored
         )
@@ -2877,7 +2930,7 @@ class TunerDashboard:
         row["phase"] = status.get("phase") or "-"
         error = miner_data.get("errorPercentage", status.get("error_percentage"))
         row["error"] = "-" if error in (None, "") else f"{format_number(error, 2)}%"
-        row["limit"] = live_limit(status)
+        row["limit"], row["limit_title"] = limit_text(status, miner_data, stored, board)
         row["reason"] = str(status.get("reason") or "").strip()
         row["power_fault"] = _power_fault_set(miner_data.get("power_fault"))
         row["overheat"] = _overheat_mode_set(miner_data.get("overheat_mode"))
@@ -2924,6 +2977,13 @@ class TunerDashboard:
             normalize_input_voltage(miner_data.get("voltage")),
             stored.get("min_input_voltage"),
         )
+        if row["vin_alert"]:
+            note = (
+                f"Input {row['vin']} V is under this miner's "
+                f"{input_floor_volts(stored, board):g} V floor. "
+                "Check the supply and its wiring."
+            )
+            row["watts_title"] = "\n".join(filter(None, [row["watts_title"], note]))
         row["tag"] = row_state_tag(
             row["phase"],
             row["asic"],

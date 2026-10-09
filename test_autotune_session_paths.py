@@ -603,6 +603,35 @@ class EfficiencyTrimTests(unittest.TestCase):
         self.assertTrue(_said(run, "Miner rejected the change"))
 
 
+class SupplyWallTests(unittest.TestCase):
+    def test_an_input_sag_retreat_records_the_reading_that_stopped_it(self):
+        # AxeOS reports the input in millivolts; the floor is 4.9 V.
+        miner = FakeMiner(
+            frequency=500,
+            voltage=1100,
+            reading=lambda miner: {"voltage": 4850, "power": 18},
+        )
+        run = run_session(self, miner, start_freq=500, start_volt=1100)
+        sag = [status for status in run.statuses if "wall_input_v" in status]
+        self.assertTrue(sag)
+        self.assertEqual(sag[0]["wall_type"], "input")
+        self.assertEqual(sag[0]["wall_input_v"], 4.85)
+        self.assertEqual(sag[0]["wall_watts"], 18.0)
+        self.assertLess(miner.writes[-1][0], 500)
+
+    def test_other_retreats_record_no_supply_reading(self):
+        miner = FakeMiner(
+            frequency=500,
+            voltage=1100,
+            reading=lambda miner: {"power": 40},
+        )
+        run = run_session(self, miner, start_freq=500, start_volt=1100)
+        self.assertTrue(
+            any(status.get("wall_type") == "power" for status in run.statuses)
+        )
+        self.assertFalse(any("wall_input_v" in status for status in run.statuses))
+
+
 class LateProbeTests(unittest.TestCase):
     def test_a_heat_wall_trim_that_stops_hashing_is_put_back(self):
         def reading(miner):

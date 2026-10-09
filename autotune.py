@@ -353,7 +353,9 @@ def wall_type_from_reason(reason):
         return "silicon"
     if "current limit" in text:
         return "current"
-    if "power limit" in text or "power fault" in text or "droop" in text:
+    if "droop" in text:
+        return "droop"
+    if "power limit" in text or "power fault" in text:
         return "power"
     if "frequency cap" in text:
         return ""
@@ -1241,8 +1243,13 @@ def safety_hold_cleared(
 
 
 def _safety_hold_kind(reason):
-    """'power' or 'input' when this retreat should block the next climb."""
+    """'power', 'input' or 'current' when this retreat should block the next climb.
+
+    Core voltage droop holds like power; only the dashboard tells them apart.
+    """
     wall = wall_type_from_reason(reason)
+    if wall == "droop":
+        return "power"
     if wall in ("power", "input", "current"):
         return wall
     return ""
@@ -4600,6 +4607,13 @@ def monitor_and_adjust(
             hold_kind = _safety_hold_kind(reason)
             if hold_kind:
                 safety_hold = hold_kind
+            # The dashboard names the reading that stopped the climb on the supply.
+            wall_reading = {}
+            if wall == "input":
+                wall_reading = {
+                    "wall_input_v": normalize_input_voltage(info.get("voltage")),
+                    "wall_watts": _as_float(info.get("power")),
+                }
             log_callback(f"{bitaxe_ip} -> {reason}.", "info")
             _publish_status(
                 bitaxe_ip,
@@ -4607,6 +4621,7 @@ def monitor_and_adjust(
                 wall_type=limit_wall,
                 error_percentage=error_percentage,
                 reason=reason,
+                **wall_reading,
             )
 
             if not clocks_unchanged:

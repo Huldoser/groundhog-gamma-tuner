@@ -397,7 +397,8 @@ function renderCell(miner, column) {
     pill.textContent = value;
     cell.appendChild(pill);
     if (shown(miner.reason)) addLine(cell, miner.reason, "muted reason");
-    if (shown(miner.limit)) addLine(cell, `held by ${miner.limit}`, "muted reason");
+    if (shown(miner.limit)) addLine(cell, `held back by ${miner.limit}`, "muted reason");
+    setTitle(cell, miner.limit_title);
     return cell;
   }
   if (column === "up") cell.className = "quiet";

@@ -1141,7 +1141,12 @@ class DecisionTests(unittest.TestCase):
         self.assertEqual(autotune.wall_type_from_reason(sag[2]), "input")
         self.assertEqual(autotune.wall_type_from_reason(silicon[2]), "silicon")
         self.assertEqual(autotune.wall_type_from_reason(power[2]), "power")
-        self.assertEqual(autotune.wall_type_from_reason(droop[2]), "power")
+        self.assertEqual(autotune.wall_type_from_reason(droop[2]), "droop")
+        # Droop shows as its own wall but holds the climb like power.
+        self.assertEqual(autotune._safety_hold_kind(droop[2]), "power")
+        self.assertEqual(autotune._safety_hold_kind(power[2]), "power")
+        self.assertEqual(autotune._safety_hold_kind(sag[2]), "input")
+        self.assertEqual(autotune._safety_hold_kind(thermal[2]), "")
         self.assertEqual(autotune.wall_type_from_reason(thermal[2]), "thermal")
         self.assertEqual(autotune.wall_type_from_reason("increase frequency"), "")
         self.assertEqual(
@@ -5966,6 +5971,7 @@ class InstallAndConfigTests(unittest.TestCase):
                 "phase": "-",
                 "error": "-",
                 "limit": "",
+                "limit_title": "",
                 "tag": "idle",
                 "up_seconds": None,
                 "mv_alert": False,
